@@ -8274,7 +8274,8 @@ fn run_cli_search(
         } else {
             None
         });
-    let field_mask = resolve_field_mask(&fields, effective_robot, display_format);
+    let field_mask =
+        resolve_field_mask(&fields, max_content_length, effective_robot, display_format);
 
     // Parse aggregate fields if provided
     let agg_fields = aggregate
@@ -8947,6 +8948,7 @@ fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
 
 fn resolve_field_mask(
     fields: &Option<Vec<String>>,
+    max_content_length: Option<usize>,
     format: Option<RobotFormat>,
     display_format: Option<DisplayFormat>,
 ) -> crate::search::query::FieldMask {
@@ -8984,7 +8986,13 @@ fn resolve_field_mask(
 
     let needs_content = wants_content || wants_snippet;
     let allows_cache = needs_content;
+    let preview_content_limit = if needs_content {
+        max_content_length.filter(|max_chars| *max_chars <= 400)
+    } else {
+        None
+    };
     FieldMask::new(needs_content, wants_snippet, wants_title, allows_cache)
+        .with_preview_content_limit(preview_content_limit)
 }
 
 /// Filter a search hit to only include the requested fields

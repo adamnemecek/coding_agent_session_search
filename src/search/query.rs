@@ -1095,6 +1095,7 @@ impl QuerySuggestion {
 #[derive(Debug, Clone, Copy)]
 pub struct FieldMask {
     flags: u8,
+    preview_content_chars: Option<usize>,
 }
 
 impl FieldMask {
@@ -1105,6 +1106,7 @@ impl FieldMask {
 
     pub const FULL: Self = Self {
         flags: Self::CONTENT | Self::SNIPPET | Self::TITLE | Self::CACHE,
+        preview_content_chars: None,
     };
 
     pub fn new(
@@ -1126,7 +1128,18 @@ impl FieldMask {
         if allows_cache {
             flags |= Self::CACHE;
         }
-        Self { flags }
+        Self {
+            flags,
+            preview_content_chars: None,
+        }
+    }
+
+    pub fn with_preview_content_limit(mut self, max_chars: Option<usize>) -> Self {
+        self.preview_content_chars = max_chars;
+        if max_chars.is_some() {
+            self.flags &= !Self::CACHE;
+        }
+        self
     }
 
     pub fn needs_content(self) -> bool {
@@ -1143,6 +1156,10 @@ impl FieldMask {
 
     pub fn allows_cache(self) -> bool {
         self.flags & Self::CACHE != 0
+    }
+
+    pub fn preview_content_limit(self) -> Option<usize> {
+        self.preview_content_chars
     }
 }
 
@@ -5566,11 +5583,14 @@ impl SearchClient {
                 origin_host.as_deref(),
             );
 
+            let preview_satisfies_bounded_content =
+                field_mask.preview_content_limit().is_some() && !stored_preview.is_empty();
             if needs_content
                 && let Some(line_idx) = line_number
                     .and_then(|line| line.checked_sub(1))
                     .and_then(|line| i64::try_from(line).ok())
                 && stored_content.is_empty()
+                && !preview_satisfies_bounded_content
             {
                 if let Some(conversation_id) = conversation_id {
                     missing_exact_content_keys.push((conversation_id, line_idx));
@@ -5633,6 +5653,10 @@ impl SearchClient {
                 });
             let effective_content = if !pending.stored_content.is_empty() {
                 pending.stored_content.clone()
+            } else if field_mask.preview_content_limit().is_some()
+                && !pending.stored_preview.is_empty()
+            {
+                pending.stored_preview.clone()
             } else if let Some(content) = hydrated_content {
                 content
             } else {
@@ -13612,6 +13636,26 @@ mod tests {
         assert!(
             hits[0].snippet.to_lowercase().contains("needle"),
             "snippet should still be rendered from hydrated content"
+        );
+
+        let bounded_hits = client.search(
+            "needle",
+            SearchFilters::default(),
+            5,
+            0,
+            FieldMask::FULL.with_preview_content_limit(Some(200)),
+        )?;
+
+        assert_eq!(bounded_hits.len(), 1, "expected one lexical hit");
+        assert!(
+            bounded_hits[0].content.starts_with("padding padding"),
+            "bounded content may be served from the stored preview prefix"
+        );
+        assert!(
+            !bounded_hits[0]
+                .content
+                .contains("needle appears past the preview boundary"),
+            "bounded preview content should not hydrate the full sqlite row"
         );
 
         Ok(())
