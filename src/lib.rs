@@ -7939,6 +7939,18 @@ mod search_dry_run_meta_tests {
     }
 }
 
+fn sparse_threshold_for_visible_limit(
+    sparse_threshold: usize,
+    visible_limit: usize,
+    has_aggregation: bool,
+) -> usize {
+    if has_aggregation || visible_limit == 0 {
+        sparse_threshold
+    } else {
+        sparse_threshold.min(visible_limit)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -8322,6 +8334,8 @@ fn run_cli_search(
     } else {
         (limit_val.saturating_add(1), offset_val)
     };
+    let search_sparse_threshold =
+        sparse_threshold_for_visible_limit(sparse_threshold, limit_val, has_aggregation);
 
     // Check if we're already past timeout before starting search
     let timeout_duration = timeout_ms.map(Duration::from_millis);
@@ -8368,7 +8382,7 @@ fn run_cli_search(
                 filters.clone(),
                 search_limit,
                 search_offset,
-                sparse_threshold,
+                search_sparse_threshold,
                 field_mask,
             )
             .map_err(|e| CliError {
@@ -8438,7 +8452,7 @@ fn run_cli_search(
             filters.clone(),
             search_limit,
             search_offset,
-            sparse_threshold,
+            search_sparse_threshold,
             field_mask,
             approximate,
         ) {
@@ -8455,7 +8469,7 @@ fn run_cli_search(
                             filters.clone(),
                             search_limit,
                             search_offset,
-                            sparse_threshold,
+                            search_sparse_threshold,
                             field_mask,
                         )
                         .map_err(|fallback_err| CliError {
@@ -30131,6 +30145,15 @@ mod subcommand_robot_output_tests {
         assert!(default_hybrid.fail_open_on_semantic_unavailable());
         assert!(explicit_hybrid.fail_open_on_semantic_unavailable());
         assert!(!explicit_semantic.fail_open_on_semantic_unavailable());
+    }
+
+    #[test]
+    fn sparse_fallback_threshold_tracks_visible_search_limit_not_cursor_probe() {
+        assert_eq!(sparse_threshold_for_visible_limit(3, 1, false), 1);
+        assert_eq!(sparse_threshold_for_visible_limit(3, 2, false), 2);
+        assert_eq!(sparse_threshold_for_visible_limit(3, 10, false), 3);
+        assert_eq!(sparse_threshold_for_visible_limit(3, 0, false), 3);
+        assert_eq!(sparse_threshold_for_visible_limit(3, 1, true), 3);
     }
 
     #[test]
