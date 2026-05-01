@@ -10427,14 +10427,14 @@ mod tests {
         )?;
 
         for idx in 0..8 {
-            conn.execute_with_params(
-                "INSERT INTO messages(conversation_id, idx, content) VALUES(?1, ?2, ?3)",
-                params![1_i64, idx, format!("conversation one row {idx}")],
-            )?;
+            conn.execute(&format!(
+                "INSERT INTO messages(conversation_id, idx, content)
+                 VALUES(1, {idx}, 'conversation one row {idx}')"
+            ))?;
         }
-        conn.execute_with_params(
-            "INSERT INTO messages(conversation_id, idx, content) VALUES(?1, ?2, ?3)",
-            params![2_i64, 0_i64, "conversation two row 0"],
+        conn.execute(
+            "INSERT INTO messages(conversation_id, idx, content)
+             VALUES(2, 0, 'conversation two row 0')",
         )?;
 
         let hydrated =
