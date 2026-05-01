@@ -4925,7 +4925,6 @@ enum PendingConversationKey {
         source_id: String,
         agent_id: i64,
         external_id: String,
-        lookup_key: String,
     },
     SourcePath {
         source_id: String,
@@ -4935,21 +4934,18 @@ enum PendingConversationKey {
     },
 }
 
-impl PendingConversationKey {
-    fn external_lookup_key(&self) -> Option<&str> {
-        match self {
-            PendingConversationKey::External { lookup_key, .. } => Some(lookup_key.as_str()),
-            PendingConversationKey::SourcePath { .. } => None,
-        }
-    }
-}
-
 fn conversation_external_lookup_key(source_id: &str, agent_id: i64, external_id: &str) -> String {
     format!(
         "{}:{source_id}:{agent_id}:{}:{external_id}",
         source_id.chars().count(),
         external_id.chars().count()
     )
+}
+
+fn conversation_external_lookup_key_for_conv(agent_id: i64, conv: &Conversation) -> Option<String> {
+    conv.external_id
+        .as_deref()
+        .map(|external_id| conversation_external_lookup_key(&conv.source_id, agent_id, external_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -5217,8 +5213,14 @@ fn franken_find_existing_conversation_with_tail_by_key(
     key: &PendingConversationKey,
     conv: Option<&Conversation>,
 ) -> Result<Option<ExistingConversationWithTail>> {
-    if let PendingConversationKey::External { lookup_key, .. } = key {
-        if let Some(existing) = franken_find_external_conversation_tail_lookup(tx, lookup_key)? {
+    if let PendingConversationKey::External {
+        source_id,
+        agent_id,
+        external_id,
+    } = key
+    {
+        let lookup_key = conversation_external_lookup_key(source_id, *agent_id, external_id);
+        if let Some(existing) = franken_find_external_conversation_tail_lookup(tx, &lookup_key)? {
             return Ok(Some(existing));
         }
         return Ok(None);
@@ -5473,12 +5475,10 @@ fn timestamps_within_tolerance(left: Option<i64>, right: Option<i64>, tolerance_
 
 fn conversation_merge_key(agent_id: i64, conv: &Conversation) -> PendingConversationKey {
     if let Some(external_id) = conv.external_id.clone() {
-        let lookup_key = conversation_external_lookup_key(&conv.source_id, agent_id, &external_id);
         PendingConversationKey::External {
             source_id: conv.source_id.clone(),
             agent_id,
             external_id,
-            lookup_key,
         }
     } else {
         PendingConversationKey::SourcePath {
@@ -7471,9 +7471,9 @@ impl FrankenStorage {
         if let Some(existing) = existing {
             let outcome = self.franken_append_messages_with_tail_in_tx(
                 &tx,
+                agent_id,
                 existing.id,
                 conv,
-                conversation_key.external_lookup_key(),
                 existing.tail_state,
                 defer_lexical_updates,
                 defer_analytics_updates,
@@ -7563,10 +7563,11 @@ impl FrankenStorage {
                     inserted_last_idx,
                     inserted_last_created_at,
                 )?;
-                if let Some(lookup_key) = conversation_key.external_lookup_key() {
+                if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
+                {
                     franken_update_external_conversation_tail_lookup_key(
                         &tx,
-                        lookup_key,
+                        &lookup_key,
                         conv_last_ts,
                         inserted_last_idx,
                         inserted_last_created_at,
@@ -8047,7 +8048,7 @@ impl FrankenStorage {
         }
         franken_update_external_conversation_tail_after_append(
             &tx,
-            conversation_key.external_lookup_key(),
+            agent_id,
             conv,
             used_append_tail_plan,
             exact_append_tail_set,
@@ -8093,9 +8094,9 @@ impl FrankenStorage {
     fn franken_append_messages_with_tail_in_tx(
         &self,
         tx: &FrankenTransaction<'_>,
+        agent_id: i64,
         conversation_id: i64,
         conv: &Conversation,
-        external_lookup_key: Option<&str>,
         append_tail_state: Option<ExistingConversationTailState>,
         defer_lexical_updates: bool,
         defer_analytics_updates: bool,
@@ -8214,7 +8215,7 @@ impl FrankenStorage {
         }
         franken_update_external_conversation_tail_after_append(
             tx,
-            external_lookup_key,
+            agent_id,
             conv,
             used_append_tail_plan,
             exact_append_tail_set,
@@ -9149,10 +9150,11 @@ impl FrankenStorage {
                     inserted_last_idx,
                     inserted_last_created_at,
                 )?;
-                if let Some(lookup_key) = conversation_key.external_lookup_key() {
+                if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
+                {
                     franken_update_external_conversation_tail_lookup_key(
                         &tx,
-                        lookup_key,
+                        &lookup_key,
                         conv_last_ts,
                         inserted_last_idx,
                         inserted_last_created_at,
@@ -9288,10 +9290,12 @@ impl FrankenStorage {
                             inserted_last_idx,
                             inserted_last_created_at,
                         )?;
-                        if let Some(lookup_key) = conversation_key.external_lookup_key() {
+                        if let Some(lookup_key) =
+                            conversation_external_lookup_key_for_conv(agent_id, conv)
+                        {
                             franken_update_external_conversation_tail_lookup_key(
                                 &tx,
-                                lookup_key,
+                                &lookup_key,
                                 conv_last_ts,
                                 inserted_last_idx,
                                 inserted_last_created_at,
@@ -10007,14 +10011,14 @@ fn franken_set_external_conversation_tail_lookup_after_append(
 
 fn franken_update_external_conversation_tail_after_append(
     tx: &FrankenTransaction<'_>,
-    lookup_key: Option<&str>,
+    agent_id: i64,
     conv: &Conversation,
     used_append_tail_plan: bool,
     exact_append_set: bool,
     inserted_last_idx: Option<i64>,
     inserted_last_created_at: Option<i64>,
 ) -> Result<()> {
-    let Some(lookup_key) = lookup_key else {
+    let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) else {
         return Ok(());
     };
 
@@ -10038,7 +10042,7 @@ fn franken_update_external_conversation_tail_after_append(
     };
     franken_update_external_conversation_tail_lookup_key(
         tx,
-        lookup_key,
+        &lookup_key,
         ended_at_candidate,
         inserted_last_idx,
         inserted_last_created_at,
@@ -10072,9 +10076,9 @@ fn franken_find_existing_conversation_by_key_impl(
             source_id,
             agent_id,
             external_id,
-            lookup_key,
         } => {
-            if let Some(existing_id) = franken_find_external_conversation_lookup(tx, lookup_key)? {
+            let lookup_key = conversation_external_lookup_key(source_id, *agent_id, external_id);
+            if let Some(existing_id) = franken_find_external_conversation_lookup(tx, &lookup_key)? {
                 return Ok(Some(existing_id));
             }
             if !allow_legacy_external_scan {
@@ -10094,7 +10098,7 @@ fn franken_find_existing_conversation_by_key_impl(
                 let tail_state = franken_existing_conversation_append_tail_state(tx, existing_id)?;
                 franken_insert_external_conversation_tail_lookup_key(
                     tx,
-                    lookup_key,
+                    &lookup_key,
                     existing_id,
                     tail_state.and_then(|state| state.ended_at),
                     tail_state.map(|state| state.last_message_idx),
