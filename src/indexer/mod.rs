@@ -1323,6 +1323,37 @@ fn matching_lexical_rebuild_state_status(
     })
 }
 
+fn nonresumable_pending_lexical_rebuild_status_without_fingerprint(
+    index_path: &Path,
+    db_path: &Path,
+    total_conversations: usize,
+) -> Result<Option<MatchingLexicalRebuildStateStatus>> {
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(None);
+    };
+    if !state.is_incomplete()
+        || !state.execution_mode.requires_restart_from_zero_on_resume()
+        || state.version != LEXICAL_REBUILD_STATE_VERSION
+        || state.schema_hash != crate::search::tantivy::SCHEMA_HASH
+        || !lexical_rebuild_page_size_is_compatible(state.page_size)
+        || state.db.total_conversations != total_conversations
+    {
+        return Ok(None);
+    }
+
+    let normalized_db_path = crate::normalize_path_identity(db_path)
+        .to_string_lossy()
+        .into_owned();
+    if !lexical_rebuild_db_paths_match(&state.db.db_path, &normalized_db_path) {
+        return Ok(None);
+    }
+
+    Ok(Some(MatchingLexicalRebuildStateStatus {
+        has_pending_resume: true,
+        ..MatchingLexicalRebuildStateStatus::default()
+    }))
+}
+
 fn should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
     full_rebuild: bool,
     resume_lexical_rebuild: bool,
@@ -9050,13 +9081,23 @@ pub fn run_index(
     let canonical_only_full_rebuild =
         opts.force_rebuild && initial_canonical_sessions_before_salvage > 0;
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
+    let mut restart_pending_lexical_rebuild_from_zero = false;
     let resume_lexical_rebuild = if opts.force_rebuild {
         // force_rebuild always starts from scratch; never resume a stale checkpoint.
         false
     } else if initial_canonical_sessions_before_salvage > 0 {
-        let db_state = lexical_rebuild_db_state(&storage, &opts.db_path)?;
-        initial_matching_lexical_checkpoint =
-            matching_lexical_rebuild_state_status(&index_path, &db_state)?;
+        if let Some(status) = nonresumable_pending_lexical_rebuild_status_without_fingerprint(
+            &index_path,
+            &opts.db_path,
+            initial_canonical_sessions_before_salvage,
+        )? {
+            initial_matching_lexical_checkpoint = status;
+            restart_pending_lexical_rebuild_from_zero = true;
+        } else {
+            let db_state = lexical_rebuild_db_state(&storage, &opts.db_path)?;
+            initial_matching_lexical_checkpoint =
+                matching_lexical_rebuild_state_status(&index_path, &db_state)?;
+        }
         initial_matching_lexical_checkpoint.has_pending_resume
     } else {
         false
@@ -9241,12 +9282,21 @@ pub fn run_index(
             reason = "resume_incomplete_authoritative_db_rebuild_from_checkpoint",
             "selected_lexical_population_strategy"
         );
-        let rebuild = rebuild_tantivy_from_db(
-            &opts.db_path,
-            &opts.data_dir,
-            initial_canonical_sessions_before_salvage,
-            opts.progress.clone(),
-        )?;
+        let rebuild = if restart_pending_lexical_rebuild_from_zero {
+            rebuild_tantivy_from_db_deferred_startup(
+                &opts.db_path,
+                &opts.data_dir,
+                initial_canonical_sessions_before_salvage,
+                opts.progress.clone(),
+            )?
+        } else {
+            rebuild_tantivy_from_db(
+                &opts.db_path,
+                &opts.data_dir,
+                initial_canonical_sessions_before_salvage,
+                opts.progress.clone(),
+            )?
+        };
         exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
         // Populate stats for resumed lexical rebuild path
         if let Some(p) = &opts.progress
@@ -32261,6 +32311,51 @@ mod tests {
         assert!(status.has_completed_checkpoint);
         assert_eq!(status.completed_indexed_docs, Some(0));
         assert_eq!(status.completed_exact_totals, Some((0, 0)));
+    }
+
+    #[test]
+    fn nonresumable_staged_checkpoint_can_restart_without_current_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        fs::write(&db_path, b"db").unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+
+        let checkpoint_db_state = LexicalRebuildDbState {
+            db_path: db_path.to_string_lossy().into_owned(),
+            total_conversations: 400,
+            total_messages: 0,
+            storage_fingerprint: "content-v1:400:1200:4800".to_string(),
+        };
+        let mut state =
+            LexicalRebuildState::new(checkpoint_db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+        state.set_execution_mode(LexicalRebuildExecutionMode::StagedShardBuild);
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        let status = nonresumable_pending_lexical_rebuild_status_without_fingerprint(
+            &index_path,
+            &db_path,
+            400,
+        )
+        .unwrap()
+        .expect("staged checkpoint should route to restart without exact fingerprint");
+        assert!(status.has_pending_resume);
+        assert!(!status.has_completed_checkpoint);
+
+        let shared_index_path = tmp.path().join("shared-index");
+        fs::create_dir_all(&shared_index_path).unwrap();
+        let shared_state = LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        persist_lexical_rebuild_state(&shared_index_path, &shared_state).unwrap();
+        assert!(
+            nonresumable_pending_lexical_rebuild_status_without_fingerprint(
+                &shared_index_path,
+                &db_path,
+                400,
+            )
+            .unwrap()
+            .is_none(),
+            "shared-writer checkpoints still require the exact fingerprint path"
+        );
     }
 
     #[test]
