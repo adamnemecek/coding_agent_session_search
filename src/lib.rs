@@ -10358,6 +10358,26 @@ fn source_filter_where_clause(
     }
 }
 
+fn stats_message_count_sql(source_where: &str) -> String {
+    if source_where.is_empty() {
+        "SELECT COUNT(*) FROM messages".to_string()
+    } else {
+        format!(
+            "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
+        )
+    }
+}
+
+fn stats_workspace_count_sql(source_where: &str) -> String {
+    if source_where.is_empty() {
+        "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC".to_string()
+    } else {
+        format!(
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC"
+        )
+    }
+}
+
 fn append_source_filter_condition(
     sql: &mut String,
     params: &mut Vec<frankensqlite::compat::ParamValue>,
@@ -10425,9 +10445,7 @@ fn run_stats(
     // Get counts and statistics with source filter
     let params = make_params(&source_param);
     let conversation_sql = format!("SELECT COUNT(*) FROM conversations c{source_where}");
-    let message_sql = format!(
-        "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
-    );
+    let message_sql = stats_message_count_sql(&source_where);
 
     let mut conversation_count: i64 =
         franken_query_row_map_retry(&conn, &conversation_sql, &params, |r| r.get_typed(0))
@@ -10456,27 +10474,56 @@ fn run_stats(
         .unwrap_or(0);
     }
 
-    // Get per-agent breakdown with source filter.  LEFT JOIN + COALESCE so
-    // legacy NULL-agent conversations aren't silently excluded from the
-    // breakdown (they collapse into a single 'unknown' bucket instead).
-    let agent_sql = format!(
-        "SELECT COALESCE(a.slug, 'unknown'), COUNT(*) FROM conversations c LEFT JOIN agents a ON c.agent_id = a.id{source_where} GROUP BY COALESCE(a.slug, 'unknown') ORDER BY COUNT(*) DESC"
-    );
-    let agent_rows: Vec<(String, i64)> =
-        franken_query_map_collect_retry(&conn, &agent_sql, &params, |r| {
-            Ok((r.get_typed::<String>(0)?, r.get_typed::<i64>(1)?))
+    let agent_lookup: HashMap<i64, String> =
+        franken_query_map_collect_retry(&conn, "SELECT id, slug FROM agents", &[], |r| {
+            Ok((r.get_typed::<i64>(0)?, r.get_typed::<String>(1)?))
         })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?;
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+        .into_iter()
+        .collect();
 
-    // Get workspace breakdown with source filter (top 10)
-    let ws_sql = format!(
-        "SELECT w.path, COUNT(*) FROM conversations c JOIN workspaces w ON c.workspace_id = w.id{source_where} GROUP BY w.path ORDER BY COUNT(*) DESC LIMIT 10"
+    let agent_sql = format!(
+        "SELECT c.agent_id, COUNT(*) FROM conversations c{source_where} GROUP BY c.agent_id ORDER BY COUNT(*) DESC"
     );
-    let ws_rows: Vec<(String, i64)> =
-        franken_query_map_collect_retry(&conn, &ws_sql, &params, |r| {
-            Ok((r.get_typed::<String>(0)?, r.get_typed::<i64>(1)?))
+    let agent_count_rows: Vec<(Option<i64>, i64)> =
+        franken_query_map_collect_retry(&conn, &agent_sql, &params, |r| {
+            Ok((r.get_typed::<Option<i64>>(0)?, r.get_typed::<i64>(1)?))
         })
         .map_err(|e| CliError::unknown(format!("query: {e}")))?;
+    let agent_rows: Vec<(String, i64)> = agent_count_rows
+        .into_iter()
+        .map(|(agent_id, count)| {
+            let agent = agent_id
+                .and_then(|id| agent_lookup.get(&id).cloned())
+                .unwrap_or_else(|| "unknown".to_string());
+            (agent, count)
+        })
+        .collect();
+
+    let workspace_lookup: HashMap<i64, String> =
+        franken_query_map_collect_retry(&conn, "SELECT id, path FROM workspaces", &[], |r| {
+            Ok((r.get_typed::<i64>(0)?, r.get_typed::<String>(1)?))
+        })
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+        .into_iter()
+        .collect();
+
+    let ws_sql = stats_workspace_count_sql(&source_where);
+    let workspace_count_rows: Vec<(i64, i64)> =
+        franken_query_map_collect_retry(&conn, &ws_sql, &params, |r| {
+            Ok((r.get_typed::<i64>(0)?, r.get_typed::<i64>(1)?))
+        })
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?;
+    let ws_rows: Vec<(String, i64)> = workspace_count_rows
+        .into_iter()
+        .filter_map(|(workspace_id, count)| {
+            workspace_lookup
+                .get(&workspace_id)
+                .cloned()
+                .map(|path| (path, count))
+        })
+        .take(10)
+        .collect();
 
     // Get date range with source filter.
     // Note: source_where already includes a leading " WHERE ...", so when it is present we must
@@ -23066,6 +23113,37 @@ mod legacy_source_filter_tests {
             )
         );
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn stats_message_count_sql_skips_join_when_unfiltered() {
+        assert_eq!(
+            stats_message_count_sql(""),
+            "SELECT COUNT(*) FROM messages",
+            "unfiltered stats can count messages directly without a conversation join"
+        );
+        assert_eq!(
+            stats_workspace_count_sql(""),
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC",
+            "unfiltered workspace stats can aggregate workspace IDs before path lookup"
+        );
+
+        let (where_sql, _param) = source_filter_where_clause(Some(&SourceFilter::Local));
+        let sql = stats_message_count_sql(&where_sql);
+        assert!(
+            sql.contains("JOIN conversations c ON m.conversation_id = c.id"),
+            "source-filtered stats must retain the conversation join; sql={sql}"
+        );
+        assert!(
+            sql.ends_with(&where_sql),
+            "source filter should be appended unchanged; sql={sql}"
+        );
+
+        let workspace_sql = stats_workspace_count_sql(&where_sql);
+        assert!(
+            workspace_sql.contains(" AND c.workspace_id IS NOT NULL"),
+            "source-filtered workspace stats append the non-null guard after the source WHERE; sql={workspace_sql}"
+        );
     }
 
     #[test]
