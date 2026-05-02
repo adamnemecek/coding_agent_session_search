@@ -2641,14 +2641,21 @@ impl CacheShards {
         while self.total_cost > self.total_cap
             || (self.byte_cap > 0 && self.total_bytes > self.byte_cap)
         {
-            // Find the shard with the most cached items. This distributes
-            // evictions fairly and prevents the first shard in HashMap
-            // iteration order from absorbing all evictions.
+            // Under byte pressure, target the byte-heaviest shard. Otherwise,
+            // target the shard with the most cached items. This avoids
+            // evicting many small useful entries before a single oversized
+            // result set is finally removed.
+            let byte_pressure = self.byte_cap > 0 && self.total_bytes > self.byte_cap;
             let mut largest_shard_key = None;
-            let mut max_len = 0;
+            let mut max_score = 0usize;
             for (k, v) in self.shards.iter() {
-                if v.len() > max_len {
-                    max_len = v.len();
+                let score = if byte_pressure {
+                    shard_cached_bytes(v)
+                } else {
+                    v.len()
+                };
+                if score > max_score {
+                    max_score = score;
                     largest_shard_key = Some(k.clone());
                 }
             }
@@ -2694,6 +2701,13 @@ impl CacheShards {
     fn byte_cap(&self) -> usize {
         self.byte_cap
     }
+}
+
+fn shard_cached_bytes(shard: &LruCache<Arc<str>, Vec<CachedHit>>) -> usize {
+    shard
+        .iter()
+        .map(|(_key, hits)| hits.iter().map(CachedHit::approx_bytes).sum::<usize>())
+        .sum()
 }
 
 #[derive(Clone)]
@@ -12397,6 +12411,75 @@ mod tests {
         );
         assert_eq!(stats.byte_cap, 100, "byte cap should be reported");
         // Note: approx_bytes may briefly exceed cap during put, but eviction brings it down
+    }
+
+    #[test]
+    fn cache_byte_pressure_evicts_byte_heavy_shard_before_small_entries() {
+        let small_hit = SearchHit {
+            title: "small".into(),
+            snippet: "small".into(),
+            content: "small".into(),
+            content_hash: stable_content_hash("small"),
+            score: 1.0,
+            source_path: "small-path".into(),
+            agent: "a".into(),
+            workspace: "w".into(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: None,
+        };
+        let large_content = "large".repeat(2_000);
+        let large_hit = SearchHit {
+            title: "large".into(),
+            snippet: "large".into(),
+            content: large_content.clone(),
+            content_hash: stable_content_hash(&large_content),
+            score: 1.0,
+            source_path: "large-path".into(),
+            agent: "b".into(),
+            workspace: "w".into(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: None,
+        };
+
+        let mut cache = CacheShards::new(100, 1_024);
+        cache.put(
+            "small",
+            Arc::<str>::from("small-1"),
+            vec![cached_hit_from(&small_hit)],
+        );
+        cache.put(
+            "small",
+            Arc::<str>::from("small-2"),
+            vec![cached_hit_from(&small_hit)],
+        );
+        cache.put(
+            "large",
+            Arc::<str>::from("large-1"),
+            vec![cached_hit_from(&large_hit)],
+        );
+
+        assert_eq!(
+            cache.shard_opt("small").map(LruCache::len),
+            Some(2),
+            "byte pressure should preserve the small shard"
+        );
+        assert!(
+            cache.shard_opt("large").is_none_or(LruCache::is_empty),
+            "oversized shard should be evicted first under byte pressure"
+        );
+        assert!(cache.total_bytes() <= cache.byte_cap());
     }
 
     // ============================================================
