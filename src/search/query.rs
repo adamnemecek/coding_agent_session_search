@@ -100,9 +100,8 @@ impl std::ops::Deref for SendConnection {
 }
 
 fn open_search_hydration_sqlite(path: &Path, timeout: Duration) -> Result<Connection> {
-    let conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
-        path, timeout,
-    )?;
+    let conn =
+        crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(path, timeout)?;
     conn.execute("PRAGMA query_only = 1;")
         .with_context(|| "setting search hydration query_only")?;
     conn.execute("PRAGMA busy_timeout = 5000;")
@@ -3142,10 +3141,7 @@ impl SearchClient {
         if guard.is_none()
             && let Some(path) = &self.sqlite_path
         {
-            match open_search_hydration_sqlite(
-                path,
-                std::time::Duration::from_secs(1),
-            ) {
+            match open_search_hydration_sqlite(path, std::time::Duration::from_secs(1)) {
                 Ok(conn) => {
                     *guard = Some(SendConnection(conn));
                 }
@@ -10073,11 +10069,12 @@ mod tests {
             .sqlite_guard()
             .context("open sqlite guard for stale generation fixture")?;
         assert!(guard.is_some(), "sqlite guard should open the db");
-        let conn = guard.as_ref().expect("sqlite guard should hold a connection");
+        let conn = guard
+            .as_ref()
+            .expect("sqlite guard should hold a connection");
         let no_params: [ParamValue; 0] = [];
-        let cache_size: i64 = conn.query_row_map("PRAGMA cache_size;", &no_params, |row| {
-            row.get_typed(0)
-        })?;
+        let cache_size: i64 =
+            conn.query_row_map("PRAGMA cache_size;", &no_params, |row| row.get_typed(0))?;
         assert_eq!(
             cache_size, -SEARCH_SQLITE_HYDRATION_CACHE_KIB,
             "search hydration should not inherit the general storage cache profile"
