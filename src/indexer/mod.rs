@@ -6326,6 +6326,62 @@ fn should_run_targeted_watch_once_only(
         && canonical_sessions_before_salvage > 0
 }
 
+fn should_skip_absent_explicit_watch_once_paths(opts: &IndexOptions) -> bool {
+    if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
+        return false;
+    }
+
+    let Some(paths) = opts
+        .watch_once_paths
+        .as_ref()
+        .filter(|paths| !paths.is_empty())
+    else {
+        return false;
+    };
+
+    paths
+        .iter()
+        .all(|path| matches!(path.try_exists(), Ok(false)))
+}
+
+fn can_skip_absent_explicit_watch_once_index_run(opts: &IndexOptions) -> bool {
+    if !should_skip_absent_explicit_watch_once_paths(opts) {
+        return false;
+    }
+    let Ok(storage) = FrankenStorage::open_readonly(&opts.db_path) else {
+        return false;
+    };
+    let db_schema_current = matches!(
+        storage.schema_version(),
+        Ok(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+    );
+    let _ = storage.close();
+    if !db_schema_current {
+        return false;
+    }
+
+    let index_path = crate::search::tantivy::expected_index_dir(&opts.data_dir);
+    let schema_hash_path = index_path.join("schema_hash.json");
+    let schema_matches = schema_hash_path.exists()
+        && std::fs::read_to_string(&schema_hash_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|json| {
+                json.get("schema_hash")
+                    .and_then(|value| value.as_str())
+                    .map(schema_hash_matches)
+            })
+            .unwrap_or(false);
+    if !schema_matches {
+        return false;
+    }
+
+    matches!(
+        crate::search::tantivy::searchable_index_summary(&index_path),
+        Ok(Some(_))
+    )
+}
+
 fn should_skip_broad_scan_after_watch_once_authoritative_repair(
     has_watch_once_paths: bool,
     watch_enabled: bool,
@@ -9224,6 +9280,21 @@ pub fn run_index(
         index_run_lock_heartbeat_interval(),
         Arc::clone(&index_run_lock.metadata_write_lock),
     );
+
+    if can_skip_absent_explicit_watch_once_index_run(&opts) {
+        let path_count = opts
+            .watch_once_paths
+            .as_ref()
+            .map(std::vec::Vec::len)
+            .unwrap_or_default();
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            data_dir = %opts.data_dir.display(),
+            path_count,
+            "skipping watch-once index because all explicit paths are absent"
+        );
+        return Ok(());
+    }
 
     let index_path = index_dir(&opts.data_dir)?;
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
@@ -26144,6 +26215,105 @@ mod tests {
         assert!(!should_run_targeted_watch_once_only(
             false, false, false, false, 43_678
         ));
+    }
+
+    fn watch_once_skip_test_options(
+        data_dir: std::path::PathBuf,
+        watch_once_paths: Option<Vec<std::path::PathBuf>>,
+    ) -> IndexOptions {
+        IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir,
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        }
+    }
+
+    #[test]
+    fn absent_explicit_watch_once_paths_skip_heavy_index_setup() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let opts = watch_once_skip_test_options(
+            data_dir.clone(),
+            Some(vec![
+                tmp.path().join("missing-a.jsonl"),
+                tmp.path().join("missing-b.jsonl"),
+            ]),
+        );
+
+        assert!(should_skip_absent_explicit_watch_once_paths(&opts));
+        assert!(
+            !can_skip_absent_explicit_watch_once_index_run(&opts),
+            "missing canonical/index assets must keep the normal repair/create path"
+        );
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let _index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+
+        assert!(
+            can_skip_absent_explicit_watch_once_index_run(&opts),
+            "populated data dirs with a current lexical index can skip absent explicit paths"
+        );
+    }
+
+    #[test]
+    fn absent_explicit_watch_once_paths_preserve_non_noop_modes() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let existing = data_dir.join("session.jsonl");
+        std::fs::write(&existing, "{}\n").unwrap();
+        let missing = data_dir.join("missing.jsonl");
+
+        let existing_opts =
+            watch_once_skip_test_options(data_dir.clone(), Some(vec![existing.clone()]));
+        assert!(
+            !should_skip_absent_explicit_watch_once_paths(&existing_opts),
+            "existing explicit paths must flow through normal watch-once reindexing"
+        );
+
+        let mixed_opts = watch_once_skip_test_options(
+            data_dir.clone(),
+            Some(vec![missing.clone(), existing.clone()]),
+        );
+        assert!(
+            !should_skip_absent_explicit_watch_once_paths(&mixed_opts),
+            "mixed existing/missing batches must still index the existing paths"
+        );
+
+        let mut watch_opts =
+            watch_once_skip_test_options(data_dir.clone(), Some(vec![missing.clone()]));
+        watch_opts.watch = true;
+        assert!(!should_skip_absent_explicit_watch_once_paths(&watch_opts));
+
+        let mut full_opts =
+            watch_once_skip_test_options(data_dir.clone(), Some(vec![missing.clone()]));
+        full_opts.full = true;
+        assert!(!should_skip_absent_explicit_watch_once_paths(&full_opts));
+
+        let mut force_opts =
+            watch_once_skip_test_options(data_dir.clone(), Some(vec![missing.clone()]));
+        force_opts.force_rebuild = true;
+        assert!(!should_skip_absent_explicit_watch_once_paths(&force_opts));
+
+        let mut semantic_opts =
+            watch_once_skip_test_options(data_dir.clone(), Some(vec![missing.clone()]));
+        semantic_opts.semantic = true;
+        assert!(!should_skip_absent_explicit_watch_once_paths(
+            &semantic_opts
+        ));
+
+        let mut hnsw_opts = watch_once_skip_test_options(data_dir, Some(vec![missing]));
+        hnsw_opts.build_hnsw = true;
+        assert!(!should_skip_absent_explicit_watch_once_paths(&hnsw_opts));
     }
 
     #[test]
