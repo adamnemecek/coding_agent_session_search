@@ -6296,6 +6296,18 @@ fn should_run_targeted_watch_once_only(
         && canonical_sessions_before_salvage > 0
 }
 
+fn should_skip_broad_scan_after_watch_once_authoritative_repair(
+    has_watch_once_paths: bool,
+    watch_enabled: bool,
+    full_rebuild: bool,
+    repaired_from_authoritative_canonical_db: bool,
+) -> bool {
+    has_watch_once_paths
+        && !watch_enabled
+        && !full_rebuild
+        && repaired_from_authoritative_canonical_db
+}
+
 fn should_repair_fallback_fts_after_full_index_run(
     full_rebuild: bool,
     canonical_only_full_rebuild: bool,
@@ -9590,6 +9602,10 @@ pub fn run_index(
         }
 
         let canonical_sessions_before_salvage = initial_canonical_sessions_before_salvage;
+        let has_explicit_watch_once_paths = opts
+            .watch_once_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty());
         // See CASS #153: plain --full must always rescan the filesystem.
         // --force-rebuild with existing sessions skips rescan (fast path).
         let mut has_pending_historical_bundles = if canonical_only_full_rebuild {
@@ -9598,9 +9614,7 @@ pub fn run_index(
             storage.has_pending_historical_bundles(&opts.db_path)?
         };
         let targeted_watch_once_only = should_run_targeted_watch_once_only(
-            opts.watch_once_paths
-                .as_ref()
-                .is_some_and(|paths| !paths.is_empty()),
+            has_explicit_watch_once_paths,
             opts.watch,
             opts.full,
             needs_rebuild,
@@ -9809,6 +9823,16 @@ pub fn run_index(
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     "skipping broad incremental scan because targeted watch-once paths were supplied"
+                );
+            } else if should_skip_broad_scan_after_watch_once_authoritative_repair(
+                has_explicit_watch_once_paths,
+                opts.watch,
+                opts.full,
+                followup_scan_after_authoritative_repair,
+            ) {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    "skipping broad incremental scan because targeted watch-once paths were supplied after authoritative lexical repair"
                 );
             } else {
                 let (lexical_strategy, lexical_strategy_reason) =
@@ -25975,6 +25999,29 @@ mod tests {
         assert!(!should_run_targeted_watch_once_only(
             false, false, false, false, 43_678
         ));
+    }
+
+    #[test]
+    fn watch_once_authoritative_repair_skips_broad_followup_scan() {
+        assert!(
+            should_skip_broad_scan_after_watch_once_authoritative_repair(true, false, false, true)
+        );
+        assert!(
+            !should_skip_broad_scan_after_watch_once_authoritative_repair(true, true, false, true)
+        );
+        assert!(
+            !should_skip_broad_scan_after_watch_once_authoritative_repair(true, false, true, true)
+        );
+        assert!(
+            !should_skip_broad_scan_after_watch_once_authoritative_repair(
+                true, false, false, false
+            )
+        );
+        assert!(
+            !should_skip_broad_scan_after_watch_once_authoritative_repair(
+                false, false, false, true
+            )
+        );
     }
 
     #[test]
