@@ -3064,6 +3064,17 @@ impl LexicalRebuildShardMergeCoordinator {
     }
 }
 
+// The final publish path can expose a federated shard bundle directly, so the
+// rebuild critical path should not compact every small residual frontier down
+// to one artifact. This is the LSM-style tiered publish threshold: keep query
+// fan-out bounded, but avoid foreground compaction for the common 5-32 shard
+// tail left after eager merging.
+const LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT: usize = 32;
+
+fn should_reduce_staged_lexical_final_frontier(frontier_artifacts: usize) -> bool {
+    frontier_artifacts > LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT
+}
+
 fn reduce_staged_lexical_final_merge_frontier_via_workers(
     mut frontier: Vec<LexicalRebuildShardMergeArtifact>,
     stage_root: &Path,
@@ -13498,9 +13509,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         }
         validate_complete_lexical_rebuild_shard_artifacts(&shard_plan, &completed_shard_artifacts)?;
         let mut reduced_final_merge_artifacts = merge_coordinator.final_merge_input_artifacts();
-        if reduced_final_merge_artifacts.len()
-            > LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN
-        {
+        if should_reduce_staged_lexical_final_frontier(reduced_final_merge_artifacts.len()) {
             reduced_final_merge_artifacts = reduce_staged_lexical_final_merge_frontier_via_workers(
                 reduced_final_merge_artifacts,
                 final_merge_stage_root.as_path(),
@@ -22281,6 +22290,20 @@ mod tests {
     }
 
     #[test]
+    fn lexical_rebuild_final_frontier_reduction_only_runs_above_federated_publish_cap() {
+        assert!(!should_reduce_staged_lexical_final_frontier(0));
+        assert!(!should_reduce_staged_lexical_final_frontier(
+            LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN + 1
+        ));
+        assert!(!should_reduce_staged_lexical_final_frontier(
+            LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT
+        ));
+        assert!(should_reduce_staged_lexical_final_frontier(
+            LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT + 1
+        ));
+    }
+
+    #[test]
     fn lexical_rebuild_default_staged_shard_builder_parallelism_uses_bounded_builder_farm() {
         assert_eq!(
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(1),
@@ -29425,7 +29448,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn rebuild_tantivy_from_db_worker_drains_large_staged_final_frontier_before_publish() {
+    fn rebuild_tantivy_from_db_publishes_bounded_final_frontier_without_reduction() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -29527,23 +29550,24 @@ mod tests {
             "expected staged shard-build log, got:\n{logs}"
         );
         assert!(
-            logs.contains("draining staged lexical rebuild final merge frontier via merge workers"),
-            "expected worker-driven final frontier reduction log, got:\n{logs}"
+            logs.contains(
+                "publishing staged lexical rebuild as federated lexical shard set without final assembly collapse"
+            ),
+            "expected bounded final frontier to publish as a federated bundle, got:\n{logs}"
         );
         assert!(
-            logs.contains(
-                "reusing already-final staged lexical rebuild artifact without redundant final merge"
-            ),
-            "expected publish to reuse the fully reduced final artifact, got:\n{logs}"
+            !logs
+                .contains("draining staged lexical rebuild final merge frontier via merge workers"),
+            "bounded final frontier should not pay foreground reduction cost: {logs}"
         );
         assert!(
             !logs.contains("running staged lexical rebuild merge round"),
-            "worker-driven final frontier reduction should avoid the fallback merge-tree tail: {logs}"
+            "bounded final frontier should avoid the fallback merge-tree tail: {logs}"
         );
         let index_path = index_dir(&data_dir).unwrap();
         let state = load_lexical_rebuild_state(&index_path)
             .unwrap()
-            .expect("completed lexical rebuild state after worker-driven final-frontier reduction");
+            .expect("completed lexical rebuild state after bounded final-frontier publish");
         assert_eq!(
             state.committed_meta_fingerprint.as_deref(),
             index_meta_fingerprint(&index_path).unwrap().as_deref(),
