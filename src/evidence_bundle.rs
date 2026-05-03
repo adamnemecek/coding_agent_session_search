@@ -274,6 +274,8 @@ fn verify_manifest(
         ));
     }
 
+    let parity_index = parity_index(manifest);
+    let mut verified_parity_groups = BTreeSet::new();
     let mut seen_paths = BTreeSet::new();
     for chunk in &manifest.chunks {
         if !seen_paths.insert(chunk.path.clone()) {
@@ -331,6 +333,11 @@ fn verify_manifest(
                 }
                 verified_chunk_count = verified_chunk_count.saturating_add(1);
                 verified_bytes = verified_bytes.saturating_add(actual_size);
+                if chunk.role == EvidenceBundleChunkRole::Parity
+                    && let Some(group) = parity_index.get(&chunk.path)
+                {
+                    verified_parity_groups.insert(group.group_id.clone());
+                }
             }
             Err(err) => chunk_failures.push(raw_chunk_failure(
                 EvidenceBundleIssueKind::MissingChunk,
@@ -340,13 +347,13 @@ fn verify_manifest(
         }
     }
 
-    let parity_index = parity_index(manifest);
     let failure_counts = chunk_failure_counts_by_parity_group(&chunk_failures, &parity_index);
     for failure in chunk_failures {
         let repairable = chunk_failure_is_repairable(
             failure.kind,
             &failure.path,
             &parity_index,
+            &verified_parity_groups,
             &failure_counts,
         );
         issues.push(issue(
@@ -452,6 +459,7 @@ fn chunk_failure_is_repairable(
     kind: EvidenceBundleIssueKind,
     path: &str,
     parity_index: &BTreeMap<String, &EvidenceBundleParityGroup>,
+    verified_parity_groups: &BTreeSet<String>,
     failure_counts: &BTreeMap<String, u32>,
 ) -> bool {
     if !matches!(
@@ -465,6 +473,9 @@ fn chunk_failure_is_repairable(
     let Some(group) = parity_index.get(path) else {
         return false;
     };
+    if !verified_parity_groups.contains(&group.group_id) {
+        return false;
+    }
     let failures_in_group = failure_counts
         .get(&group.group_id)
         .copied()
@@ -676,6 +687,49 @@ mod tests {
         assert_eq!(report.unsafe_issue_count, 0);
         assert_eq!(report.issues[0].kind, EvidenceBundleIssueKind::MissingChunk);
         assert!(report.issues[0].repairable);
+    }
+
+    #[test]
+    fn declared_parity_without_verified_parity_artifact_is_unsafe() {
+        let tmp = TempDir::new().unwrap();
+        write_chunk(tmp.path(), "semantic/shard-0.f16", b"semantic shard zero");
+
+        let mut shard = chunk(
+            tmp.path(),
+            "semantic/shard-0.f16",
+            EvidenceBundleChunkRole::SemanticShard,
+        );
+        shard.parity_group = Some("semantic-parity-0".to_string());
+        let mut missing = shard.clone();
+        missing.path = "semantic/shard-1.f16".to_string();
+        missing.size_bytes = 19;
+        missing.blake3 = blake3::hash(b"semantic shard one").to_hex().to_string();
+
+        let mut manifest = EvidenceBundleManifest::new(
+            "semantic-missing-parity-artifact",
+            EvidenceBundleKind::SemanticShard,
+            1_700_000_000_002,
+        );
+        manifest.chunks = vec![shard, missing];
+        manifest.parity_groups = vec![EvidenceBundleParityGroup {
+            group_id: "semantic-parity-0".to_string(),
+            chunk_paths: vec![
+                "semantic/shard-0.f16".to_string(),
+                "semantic/shard-1.f16".to_string(),
+                "semantic/parity-0.bin".to_string(),
+            ],
+            repairable_failed_chunks: 1,
+        }];
+
+        let report = manifest.verify(tmp.path());
+        assert!(report.is_unsafe(), "{report:?}");
+        assert_eq!(report.repairable_issue_count, 0);
+        assert_eq!(report.unsafe_issue_count, 1);
+        assert_eq!(report.issues[0].kind, EvidenceBundleIssueKind::MissingChunk);
+        assert!(
+            !report.issues[0].repairable,
+            "a parity declaration without a verified parity artifact must not claim repairability"
+        );
     }
 
     #[test]
