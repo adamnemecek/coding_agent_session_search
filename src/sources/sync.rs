@@ -2036,6 +2036,13 @@ impl SourceSyncDecision {
                 ));
                 SourceHealthKind::BackingOff
             }
+            Some(info) if matches!(info.last_result, SyncResult::Failed(_)) => {
+                let error = info.last_result.error_message().unwrap_or("unknown error");
+                reasons.push(format!(
+                    "last sync failed completely ({error}); local fallback remains active"
+                ));
+                SourceHealthKind::Flapping
+            }
             Some(info) if info.duration_ms >= SOURCE_HIGH_LATENCY_MS => {
                 reasons.push(format!(
                     "last sync took {}ms, above {}ms high-latency guard",
@@ -3087,6 +3094,36 @@ Total transferred file size: 1,234 bytes
         assert_eq!(decision.action, SourceSyncAction::Skip);
         assert_eq!(decision.health, SourceHealthKind::Flapping);
         assert!(decision.fallback_active);
+    }
+
+    #[test]
+    fn source_sync_decision_keeps_local_fallback_after_unreachable_backoff_expires() {
+        let now_ms = 1_700_000_000_000;
+        let source = source_with_schedule(SyncSchedule::Hourly);
+        let last_sync = now_ms - 10 * 60 * 1000;
+        let status = status_with_info(SourceSyncInfo {
+            last_sync: Some(last_sync),
+            last_result: SyncResult::Failed("Host unreachable".into()),
+            duration_ms: 900,
+            consecutive_failures: 1,
+            ..Default::default()
+        });
+
+        let decision = status.decision_for_source_at(&source, now_ms, false);
+
+        assert_eq!(decision.action, SourceSyncAction::Skip);
+        assert_eq!(decision.health, SourceHealthKind::Flapping);
+        assert!(decision.fallback_active);
+        assert_eq!(
+            decision.backoff_until_ms,
+            Some(last_sync + SOURCE_FAILURE_BACKOFF_BASE_MS)
+        );
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("local fallback remains active"))
+        );
     }
 
     #[test]
