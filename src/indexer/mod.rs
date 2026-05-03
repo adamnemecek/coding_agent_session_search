@@ -2958,7 +2958,7 @@ struct LexicalRebuildShardMergeCoordinator {
 }
 
 impl LexicalRebuildShardMergeCoordinator {
-    const EAGER_MERGE_FAN_IN: usize = 4;
+    const EAGER_MERGE_FAN_IN: usize = 8;
 
     fn new(stage_root: PathBuf) -> Self {
         Self {
@@ -22360,11 +22360,12 @@ mod tests {
                 )
             };
 
-        let shard_paths = (0..5)
+        let shard_count = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN + 1;
+        let shard_paths = (0..shard_count)
             .map(|idx| {
                 let shard_path = tmp.path().join(format!("eager-shard-{idx}"));
                 let packet = make_packet(
-                    i64::from(idx + 1),
+                    i64::try_from(idx + 1).unwrap(),
                     &format!("eager-segment-{idx}"),
                     &format!("alpha-{idx}"),
                     &format!("beta-{idx}"),
@@ -22407,7 +22408,7 @@ mod tests {
         assert_eq!(
             merge_coordinator.pending_merge_jobs(),
             1,
-            "five base shards should trigger one eager 4-way merge with one shard left unmerged"
+            "one more than the eager fan-in should trigger one eager merge with one shard left unmerged"
         );
         let eager_merge_result = match merge_result_rx
             .recv_timeout(Duration::from_secs(5))
@@ -22436,7 +22437,7 @@ mod tests {
         assert_eq!(
             final_merge_inputs.len(),
             2,
-            "eager reduction should shrink five base shards down to one merged artifact plus one tail shard"
+            "eager reduction should shrink one fan-in group down to one merged artifact plus one tail shard"
         );
 
         drop(merge_work_tx);
@@ -22453,7 +22454,10 @@ mod tests {
         .unwrap();
         let reader = merged_index.reader().unwrap();
         reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 10);
+        assert_eq!(
+            reader.searcher().num_docs(),
+            u64::try_from(shard_count * 2).unwrap()
+        );
     }
 
     #[test]
@@ -23503,11 +23507,17 @@ mod tests {
             LexicalRebuildShardMergeSettings { workers: 1 }
         );
         assert_eq!(
-            lexical_rebuild_staged_shard_merge_settings(&settings, 12),
+            lexical_rebuild_staged_shard_merge_settings(
+                &settings,
+                LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN * 3,
+            ),
             LexicalRebuildShardMergeSettings { workers: 3 }
         );
         assert_eq!(
-            lexical_rebuild_staged_shard_merge_settings(&settings, 32),
+            lexical_rebuild_staged_shard_merge_settings(
+                &settings,
+                LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN * 8,
+            ),
             LexicalRebuildShardMergeSettings { workers: 3 }
         );
     }
