@@ -451,10 +451,13 @@ pub(crate) fn retryable_franken_error(err: &frankensqlite::FrankenError) -> bool
         frankensqlite::FrankenError::Busy
             | frankensqlite::FrankenError::BusyRecovery
             | frankensqlite::FrankenError::BusySnapshot { .. }
+            | frankensqlite::FrankenError::DatabaseLocked { .. }
+            | frankensqlite::FrankenError::LockFailed { .. }
             | frankensqlite::FrankenError::WriteConflict { .. }
             | frankensqlite::FrankenError::SerializationFailure { .. }
     ) || lower.contains("busy")
         || lower.contains("locked")
+        || lower.contains("locking")
         || lower.contains("contention")
         || lower.contains("temporarily unavailable")
         || lower.contains("would block")
@@ -830,6 +833,7 @@ impl From<anyhow::Error> for MigrationError {
 
 /// Maximum number of backup files to retain.
 const MAX_BACKUPS: usize = 3;
+const BACKUP_VACUUM_BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout = 30000;";
 
 /// Files that contain user-authored state and must NEVER be deleted during rebuild.
 const USER_DATA_FILES: &[&str] = &["bookmarks.db", "tui_state.json", "sources.toml", ".env"];
@@ -919,29 +923,32 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
     }
 
     let backup_path = unique_backup_path(db_path);
+    let vacuum_stage_path = vacuum_stage_backup_path(&backup_path);
 
     // Try to use SQLite's VACUUM INTO command first, which safely handles WAL files
     // and produces a clean, minimized backup.
-    let vacuum_success = open_franken_with_flags(
-        &db_path.to_string_lossy(),
-        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .and_then(|mut conn| {
-        let path_str = backup_path.to_string_lossy();
-        let result = conn.execute_compat("VACUUM INTO ?", fparams![path_str.as_ref()]);
-        if let Err(close_err) = conn.close_in_place() {
-            tracing::warn!(
-                error = %close_err,
-                db_path = %db_path.display(),
-                "create_backup: close_in_place failed after VACUUM INTO; falling back to best-effort close"
-            );
-            conn.close_best_effort_in_place();
+    match vacuum_into_backup_stage(db_path, &vacuum_stage_path) {
+        Ok(()) => {
+            fs::rename(&vacuum_stage_path, &backup_path)?;
         }
-        result
-    })
-    .is_ok();
+        Err(err) if backup_vacuum_error_requires_consistent_retry(&err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "create_backup: VACUUM INTO hit transient contention; refusing raw WAL bundle copy"
+            );
+            return Err(MigrationError::Database(err));
+        }
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "create_backup: VACUUM INTO failed; falling back to raw evidence copy"
+            );
+        }
+    }
 
-    if vacuum_success {
+    if backup_path.exists() {
         sync_file_if_exists(&backup_path)?;
         if let Some(parent) = backup_path.parent() {
             sync_parent_directory(parent)?;
@@ -975,6 +982,35 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
     }
 
     Ok(Some(backup_path))
+}
+
+fn vacuum_into_backup_stage(
+    db_path: &Path,
+    stage_path: &Path,
+) -> std::result::Result<(), frankensqlite::FrankenError> {
+    let mut conn = open_franken_with_flags(
+        &db_path.to_string_lossy(),
+        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let result = (|| {
+        conn.execute(BACKUP_VACUUM_BUSY_TIMEOUT_PRAGMA)?;
+        let path_str = stage_path.to_string_lossy();
+        conn.execute_compat("VACUUM INTO ?", fparams![path_str.as_ref()])?;
+        Ok(())
+    })();
+    if let Err(close_err) = conn.close_in_place() {
+        tracing::warn!(
+            error = %close_err,
+            db_path = %db_path.display(),
+            "create_backup: close_in_place failed after VACUUM INTO; falling back to best-effort close"
+        );
+        conn.close_best_effort_in_place();
+    }
+    result
+}
+
+fn backup_vacuum_error_requires_consistent_retry(err: &frankensqlite::FrankenError) -> bool {
+    retryable_franken_error(err)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2300,6 +2336,14 @@ fn unique_backup_path(path: &Path) -> PathBuf {
         timestamp,
         nonce
     ))
+}
+
+fn vacuum_stage_backup_path(backup_path: &Path) -> PathBuf {
+    let file_name = backup_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("db.backup");
+    backup_path.with_file_name(format!(".{file_name}.vacuum-in-progress"))
 }
 
 /// Check schema compatibility without modifying the database.
@@ -14010,6 +14054,11 @@ mod tests {
             &frankensqlite::FrankenError::Busy
         ));
         assert!(!schema_check_error_requires_rebuild(
+            &frankensqlite::FrankenError::DatabaseLocked {
+                path: PathBuf::from("/tmp/test.db"),
+            }
+        ));
+        assert!(!schema_check_error_requires_rebuild(
             &frankensqlite::FrankenError::CannotOpen {
                 path: PathBuf::from("/tmp/test.db"),
             }
@@ -14042,6 +14091,61 @@ mod tests {
                 actual: 64,
             }
         ));
+    }
+
+    #[test]
+    fn create_backup_refuses_raw_copy_after_retryable_vacuum_errors() {
+        let retryable_errors = [
+            frankensqlite::FrankenError::Busy,
+            frankensqlite::FrankenError::BusyRecovery,
+            frankensqlite::FrankenError::BusySnapshot {
+                conflicting_pages: "1,2".to_string(),
+            },
+            frankensqlite::FrankenError::DatabaseLocked {
+                path: PathBuf::from("/tmp/test.db"),
+            },
+            frankensqlite::FrankenError::LockFailed {
+                detail: "fcntl lock still held".to_string(),
+            },
+            frankensqlite::FrankenError::WriteConflict { page: 7, holder: 9 },
+            frankensqlite::FrankenError::SerializationFailure { page: 11 },
+            frankensqlite::FrankenError::Internal("database is locked".to_string()),
+        ];
+
+        for err in retryable_errors {
+            assert!(
+                backup_vacuum_error_requires_consistent_retry(&err),
+                "retryable VACUUM failure must not fall back to raw bundle copy: {err}"
+            );
+        }
+
+        assert!(!backup_vacuum_error_requires_consistent_retry(
+            &frankensqlite::FrankenError::NotADatabase {
+                path: PathBuf::from("/tmp/test.db")
+            }
+        ));
+        assert!(!backup_vacuum_error_requires_consistent_retry(
+            &frankensqlite::FrankenError::DatabaseCorrupt {
+                detail: "bad header".to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn create_backup_uses_hidden_vacuum_stage_path() {
+        let backup_path = PathBuf::from("/tmp/test.db.backup.123.456.0");
+        let stage_path = vacuum_stage_backup_path(&backup_path);
+        let stage_name = stage_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+
+        assert!(stage_name.starts_with('.'));
+        assert!(stage_name.ends_with(".vacuum-in-progress"));
+        assert!(
+            !is_backup_root_name(stage_name, "test.db.backup."),
+            "incomplete VACUUM output must not be discoverable as a backup root"
+        );
     }
 
     #[test]
