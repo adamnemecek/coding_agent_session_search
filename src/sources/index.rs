@@ -25,12 +25,13 @@
 //! }
 //! ```
 
-use std::io::Write as IoWrite;
-use std::process::{Command, Stdio};
+use std::io::{Read as IoRead, Write as IoWrite};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use wait_timeout::ChildExt;
 
 use super::{
     host_key_verification_error, is_host_key_verification_failure,
@@ -335,6 +336,48 @@ impl RemoteArtifactManifestResult {
 // =============================================================================
 // RemoteIndexer
 // =============================================================================
+
+fn effective_ssh_command_timeout(requested: Duration, configured_secs: u64) -> Duration {
+    let configured = if configured_secs == 0 {
+        requested
+    } else {
+        Duration::from_secs(configured_secs)
+    };
+    let effective = requested.min(configured);
+    if effective.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        effective
+    }
+}
+
+fn wait_for_command_output_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> Result<Output, IndexError> {
+    match child.wait_timeout(timeout)? {
+        Some(status) => {
+            let mut stdout = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                pipe.read_to_end(&mut stdout)?;
+            }
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                pipe.read_to_end(&mut stderr)?;
+            }
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(IndexError::Timeout(timeout.as_secs().max(1)))
+        }
+    }
+}
 
 /// Indexer for triggering cass index on remote machines.
 pub struct RemoteIndexer {
@@ -699,11 +742,11 @@ fi
 
     /// Run an SSH command on the remote host.
     fn run_ssh_command(&self, script: &str, timeout: Duration) -> Result<String, IndexError> {
-        // Use the configured ssh_timeout as a ceiling for the command timeout
-        let timeout_secs = timeout.as_secs().min(self.ssh_timeout);
+        let command_timeout = effective_ssh_command_timeout(timeout, self.ssh_timeout);
+        let connect_timeout_secs = command_timeout.as_secs().clamp(1, 30);
 
         let mut cmd = Command::new("ssh");
-        cmd.args(strict_ssh_cli_tokens(timeout_secs.min(30)))
+        cmd.args(strict_ssh_cli_tokens(connect_timeout_secs))
             .arg("-o")
             .arg("LogLevel=ERROR")
             .arg("--")
@@ -717,11 +760,13 @@ fi
 
         let mut child = cmd.spawn()?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(script.as_bytes())?;
-        }
+        let write_error = if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(script.as_bytes()).err()
+        } else {
+            None
+        };
 
-        let output = child.wait_with_output()?;
+        let output = wait_for_command_output_with_timeout(child, command_timeout)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -743,6 +788,9 @@ fi
                 "Remote script exited with code {code}: {}",
                 stderr.trim()
             )));
+        }
+        if let Some(err) = write_error {
+            return Err(IndexError::Io(err));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -943,6 +991,44 @@ mod tests {
 
         let indexer2 = RemoteIndexer::with_defaults("server");
         assert_eq!(indexer2.host(), "server");
+    }
+
+    #[test]
+    fn test_effective_ssh_command_timeout_clamps_to_smaller_deadline() {
+        assert_eq!(
+            effective_ssh_command_timeout(Duration::from_secs(60), 10),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            effective_ssh_command_timeout(Duration::from_secs(15), 60),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            effective_ssh_command_timeout(Duration::from_secs(15), 0),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            effective_ssh_command_timeout(Duration::ZERO, 0),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wait_for_command_output_with_timeout_kills_stalled_child() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 2")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep helper");
+
+        let started = Instant::now();
+        let err = wait_for_command_output_with_timeout(child, Duration::from_millis(50))
+            .expect_err("stalled command should time out");
+        assert!(matches!(err, IndexError::Timeout(1)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
