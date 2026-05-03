@@ -2504,7 +2504,7 @@ static CACHE_DEBUG_ENABLED: Lazy<bool> = Lazy::new(|| {
 // Byte-based cap for cache memory. Unset defaults to a memory-proportional cap;
 // explicit CASS_CACHE_BYTE_CAP=0 disables the byte guard.
 static CACHE_BYTE_CAP: Lazy<usize> = Lazy::new(|| match dotenvy::var("CASS_CACHE_BYTE_CAP") {
-    Ok(value) => value.parse::<usize>().unwrap_or(0),
+    Ok(value) => cache_byte_cap_from_env_value(Some(&value), available_memory_bytes()),
     Err(_) => default_cache_byte_cap(),
 });
 
@@ -2525,6 +2525,14 @@ static WARM_DEBOUNCE_MS: Lazy<u64> = Lazy::new(|| {
 
 fn default_cache_byte_cap() -> usize {
     default_cache_byte_cap_for_available(available_memory_bytes())
+}
+
+fn cache_byte_cap_from_env_value(value: Option<&str>, available_bytes: Option<u64>) -> usize {
+    let Some(raw) = value else {
+        return default_cache_byte_cap_for_available(available_bytes);
+    };
+    raw.parse::<usize>()
+        .unwrap_or_else(|_| default_cache_byte_cap_for_available(available_bytes))
 }
 
 fn default_cache_byte_cap_for_available(available_bytes: Option<u64>) -> usize {
@@ -12355,6 +12363,22 @@ mod tests {
             default_cache_byte_cap_for_available(Some(256 * gib)),
             usize::try_from(DEFAULT_CACHE_BYTE_CAP_CEILING).unwrap_or(usize::MAX),
             "large swarm hosts still have a bounded default cache budget"
+        );
+    }
+
+    #[test]
+    fn malformed_cache_byte_cap_env_uses_default_instead_of_disabling_guard() {
+        let gib = 1024_u64 * 1024 * 1024;
+
+        assert_eq!(cache_byte_cap_from_env_value(Some("0"), Some(64 * gib)), 0);
+        assert_eq!(
+            cache_byte_cap_from_env_value(Some("not-a-number"), Some(64 * gib)),
+            default_cache_byte_cap_for_available(Some(64 * gib)),
+            "malformed env should keep the default memory guard active"
+        );
+        assert_eq!(
+            cache_byte_cap_from_env_value(None, Some(64 * gib)),
+            default_cache_byte_cap_for_available(Some(64 * gib))
         );
     }
 
