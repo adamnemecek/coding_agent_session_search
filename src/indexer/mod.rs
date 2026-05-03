@@ -22563,10 +22563,12 @@ mod tests {
     #[test]
     fn lexical_rebuild_staged_merge_controller_scales_under_large_merge_debt() {
         let controller = LexicalRebuildStagedMergeController::new(4, Some(7_000));
+        let fan_in = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
+        let ready_groups = 16;
         let merge_coordinator = LexicalRebuildShardMergeCoordinator {
             stage_root: PathBuf::from("/tmp/eager-merge"),
             ready_levels: vec![
-                (0..64)
+                (0..fan_in * ready_groups)
                     .map(|idx| LexicalRebuildShardMergeArtifact {
                         first_shard_index: idx,
                         last_shard_index: idx,
@@ -22590,21 +22592,25 @@ mod tests {
         assert_eq!(decision.workers_max, 4);
         assert_eq!(decision.allowed_jobs, 4);
         assert_eq!(decision.active_jobs, 1);
-        assert_eq!(decision.ready_artifacts, 64);
-        assert_eq!(decision.ready_groups, 16);
+        assert_eq!(decision.ready_artifacts, fan_in * ready_groups);
+        assert_eq!(decision.ready_groups, ready_groups);
         assert_eq!(
             decision.controller_reason,
-            "builder_handoff_pressure_scaling_staged_merge_budget_4_active_jobs_1_ready_groups_16_debt_budget_4_buffered_pages_150_queue_depth_0"
+            format!(
+                "builder_handoff_pressure_scaling_staged_merge_budget_4_active_jobs_1_ready_groups_{ready_groups}_debt_budget_4_buffered_pages_150_queue_depth_0"
+            )
         );
     }
 
     #[test]
     fn lexical_rebuild_staged_merge_controller_keeps_debt_budget_monotonic_with_more_workers() {
         let controller = LexicalRebuildStagedMergeController::new(8, Some(7_000));
+        let fan_in = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
+        let ready_groups = 12;
         let merge_coordinator = LexicalRebuildShardMergeCoordinator {
             stage_root: PathBuf::from("/tmp/eager-merge"),
             ready_levels: vec![
-                (0..48)
+                (0..fan_in * ready_groups)
                     .map(|idx| LexicalRebuildShardMergeArtifact {
                         first_shard_index: idx,
                         last_shard_index: idx,
@@ -22628,77 +22634,34 @@ mod tests {
         assert_eq!(decision.workers_max, 8);
         assert_eq!(decision.allowed_jobs, 8);
         assert_eq!(decision.active_jobs, 1);
-        assert_eq!(decision.ready_artifacts, 48);
-        assert_eq!(decision.ready_groups, 12);
+        assert_eq!(decision.ready_artifacts, fan_in * ready_groups);
+        assert_eq!(decision.ready_groups, ready_groups);
         assert_eq!(
             decision.controller_reason,
-            "builder_handoff_pressure_scaling_staged_merge_budget_8_active_jobs_1_ready_groups_12_debt_budget_8_buffered_pages_120_queue_depth_0"
+            format!(
+                "builder_handoff_pressure_scaling_staged_merge_budget_8_active_jobs_1_ready_groups_{ready_groups}_debt_budget_8_buffered_pages_120_queue_depth_0"
+            )
         );
     }
 
     #[test]
     fn lexical_rebuild_staged_merge_controller_restores_parallelism_after_producer_finishes() {
         let controller = LexicalRebuildStagedMergeController::new(3, Some(7_000));
+        let fan_in = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
+        let ready_groups = 2;
         let merge_coordinator = LexicalRebuildShardMergeCoordinator {
             stage_root: PathBuf::from("/tmp/eager-merge"),
-            ready_levels: vec![VecDeque::from(vec![
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 0,
-                    last_shard_index: 0,
-                    index_path: PathBuf::from("/tmp/shard-0"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 1,
-                    last_shard_index: 1,
-                    index_path: PathBuf::from("/tmp/shard-1"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 2,
-                    last_shard_index: 2,
-                    index_path: PathBuf::from("/tmp/shard-2"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 3,
-                    last_shard_index: 3,
-                    index_path: PathBuf::from("/tmp/shard-3"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 4,
-                    last_shard_index: 4,
-                    index_path: PathBuf::from("/tmp/shard-4"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 5,
-                    last_shard_index: 5,
-                    index_path: PathBuf::from("/tmp/shard-5"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 6,
-                    last_shard_index: 6,
-                    index_path: PathBuf::from("/tmp/shard-6"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 7,
-                    last_shard_index: 7,
-                    index_path: PathBuf::from("/tmp/shard-7"),
-                    docs: 0,
-                    segments: 0,
-                },
-            ])],
+            ready_levels: vec![
+                (0..fan_in * ready_groups)
+                    .map(|idx| LexicalRebuildShardMergeArtifact {
+                        first_shard_index: idx,
+                        last_shard_index: idx,
+                        index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
+                        docs: 0,
+                        segments: 0,
+                    })
+                    .collect(),
+            ],
             next_output_seq_by_level: vec![0, 0],
             pending_merge_jobs: 1,
             allowed_pending_merge_jobs: 1,
@@ -22713,8 +22676,8 @@ mod tests {
 
         assert_eq!(decision.allowed_jobs, 3);
         assert_eq!(decision.active_jobs, 1);
-        assert_eq!(decision.ready_artifacts, 8);
-        assert_eq!(decision.ready_groups, 2);
+        assert_eq!(decision.ready_artifacts, fan_in * ready_groups);
+        assert_eq!(decision.ready_groups, ready_groups);
         assert_eq!(
             decision.controller_reason,
             "producer_finished_allowing_max_staged_merge_parallelism"
