@@ -22478,38 +22478,20 @@ mod tests {
     #[test]
     fn lexical_rebuild_staged_merge_controller_trickles_under_builder_pressure() {
         let controller = LexicalRebuildStagedMergeController::new(3, Some(7_000));
+        let fan_in = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
         let merge_coordinator = LexicalRebuildShardMergeCoordinator {
             stage_root: PathBuf::from("/tmp/eager-merge"),
-            ready_levels: vec![VecDeque::from(vec![
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 0,
-                    last_shard_index: 0,
-                    index_path: PathBuf::from("/tmp/shard-0"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 1,
-                    last_shard_index: 1,
-                    index_path: PathBuf::from("/tmp/shard-1"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 2,
-                    last_shard_index: 2,
-                    index_path: PathBuf::from("/tmp/shard-2"),
-                    docs: 0,
-                    segments: 0,
-                },
-                LexicalRebuildShardMergeArtifact {
-                    first_shard_index: 3,
-                    last_shard_index: 3,
-                    index_path: PathBuf::from("/tmp/shard-3"),
-                    docs: 0,
-                    segments: 0,
-                },
-            ])],
+            ready_levels: vec![
+                (0..fan_in)
+                    .map(|idx| LexicalRebuildShardMergeArtifact {
+                        first_shard_index: idx,
+                        last_shard_index: idx,
+                        index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
+                        docs: 0,
+                        segments: 0,
+                    })
+                    .collect(),
+            ],
             next_output_seq_by_level: vec![0, 0],
             pending_merge_jobs: 0,
             allowed_pending_merge_jobs: 0,
@@ -22529,7 +22511,7 @@ mod tests {
 
         assert_eq!(decision.workers_max, 3);
         assert_eq!(decision.allowed_jobs, 1);
-        assert_eq!(decision.ready_artifacts, 4);
+        assert_eq!(decision.ready_artifacts, fan_in);
         assert_eq!(decision.ready_groups, 1);
         assert_eq!(
             decision.controller_reason,
@@ -22567,7 +22549,10 @@ mod tests {
 
         assert_eq!(decision.workers_max, 8);
         assert_eq!(decision.allowed_jobs, 3);
-        assert_eq!(decision.ready_artifacts, 24);
+        assert_eq!(
+            decision.ready_artifacts,
+            LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN * 3
+        );
         assert_eq!(decision.ready_groups, 3);
         assert_eq!(
             decision.controller_reason,
