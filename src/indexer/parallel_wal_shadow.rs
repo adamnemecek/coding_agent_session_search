@@ -27,9 +27,11 @@
 //! CASS_INDEXER_PARALLEL_WAL=off       # disable observer (zero overhead)
 //! ```
 //!
-//! Any other value (including `on` / `commit`) is **rejected** at this
-//! revision — the committing path is deliberately not exposed yet.
+//! Any other value (including reserved `on` / `commit`) stays in shadow
+//! mode at this revision — the committing path is deliberately not exposed
+//! yet.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -39,14 +41,57 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct ShadowChunkRecord {
     pub chunk_idx: usize,
+    pub worker_slot: Option<usize>,
     pub base_conv_idx: usize,
     pub convs_in_chunk: usize,
+    pub start_elapsed_micros: u64,
+    pub finish_elapsed_micros: u64,
     pub wall_micros: u64,
     pub succeeded: bool,
 }
 
+/// One hypothetical Silo/Aether-style group-commit epoch derived from
+/// shadow observations. This is evidence only; it does not drive writes.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct ShadowEpochManifest {
+    pub epoch_id: u64,
+    pub chunk_count: usize,
+    pub worker_slots: Vec<usize>,
+    pub conversation_count: usize,
+    pub first_chunk_idx: usize,
+    pub last_chunk_idx: usize,
+    pub first_start_elapsed_micros: u64,
+    pub last_finish_elapsed_micros: u64,
+    pub max_chunk_wall_micros: u64,
+    pub failed_chunks: usize,
+    pub would_have_group_fsyncs: usize,
+    pub fsyncs_saved_vs_per_chunk: usize,
+}
+
+/// Deterministic manifest for the current shadow window. It is the canary
+/// contract future commit-mode work must satisfy before changing durability
+/// semantics.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct ParallelWalShadowEpochPlan {
+    pub schema_version: u32,
+    pub mode: &'static str,
+    pub epoch_micros: u64,
+    pub commit_mode_allowed: bool,
+    pub fallback_decision: &'static str,
+    pub fallback_reason: &'static str,
+    pub logical_digest: String,
+    pub window_chunks: usize,
+    pub total_chunks_observed: u64,
+    pub successful_chunks: usize,
+    pub failed_chunks: usize,
+    pub total_conversations: usize,
+    pub estimated_fsyncs_saved_vs_per_chunk: usize,
+    pub planned_epochs: Vec<ShadowEpochManifest>,
+    pub proof_obligations: Vec<&'static str>,
+}
+
 /// Aggregate shadow telemetry. This is the payload we expose to
-/// operators via `cass health --json.responsiveness.parallel_wal_shadow`.
+/// operators via `cass health --json.parallel_wal_shadow`.
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct ParallelWalShadowTelemetry {
     /// Most-recent run's chunk records (FIFO, bounded at
@@ -63,9 +108,15 @@ pub(crate) struct ParallelWalShadowTelemetry {
     pub chunk_errors: u64,
     /// Whether shadow mode is currently active.
     pub active: bool,
+    /// Hypothetical epoch/group-commit manifest for the current shadow
+    /// window. This is intentionally shadow-only evidence.
+    pub epoch_plan_manifest: ParallelWalShadowEpochPlan,
 }
 
 const MAX_SHADOW_RECORDS: usize = 64;
+const SHADOW_EPOCH_MICROS: u64 = 40_000;
+
+static PROCESS_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
 struct ShadowObserverState {
     recent_chunks: std::collections::VecDeque<ShadowChunkRecord>,
@@ -102,9 +153,9 @@ impl ShadowObserverState {
 static OBSERVER: std::sync::LazyLock<Mutex<ShadowObserverState>> =
     std::sync::LazyLock::new(|| Mutex::new(ShadowObserverState::new()));
 
-/// Parse the env var. Only three values are accepted; anything else is
-/// treated as `off` (including `on`/`commit` which are intentionally NOT
-/// wired up yet — the spec mandates shadow precedes commit).
+/// Parse the env var. Explicit off-like values disable the observer;
+/// everything else remains shadow-only, including reserved `on`/`commit`
+/// values that are intentionally NOT wired up yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShadowMode {
     /// Observer is disabled; hot path is untouched.
@@ -136,8 +187,10 @@ pub(crate) fn mode_from_env() -> ShadowMode {
 /// dropping for clearer telemetry.
 pub(crate) struct ShadowChunkGuard {
     chunk_idx: usize,
+    worker_slot: Option<usize>,
     base_conv_idx: usize,
     convs_in_chunk: usize,
+    start_elapsed_micros: u64,
     started_at: Instant,
     succeeded: Option<bool>,
 }
@@ -155,10 +208,14 @@ impl ShadowChunkGuard {
 impl Drop for ShadowChunkGuard {
     fn drop(&mut self) {
         let wall = self.started_at.elapsed();
+        let finish_elapsed_micros = elapsed_since_process_start_micros();
         let record = ShadowChunkRecord {
             chunk_idx: self.chunk_idx,
+            worker_slot: self.worker_slot,
             base_conv_idx: self.base_conv_idx,
             convs_in_chunk: self.convs_in_chunk,
+            start_elapsed_micros: self.start_elapsed_micros,
+            finish_elapsed_micros,
             wall_micros: wall.as_micros().min(u64::MAX as u128) as u64,
             succeeded: self.succeeded.unwrap_or(false),
         };
@@ -179,8 +236,10 @@ pub(crate) fn start_chunk(
     }
     Some(ShadowChunkGuard {
         chunk_idx,
+        worker_slot: rayon::current_thread_index(),
         base_conv_idx,
         convs_in_chunk,
+        start_elapsed_micros: elapsed_since_process_start_micros(),
         started_at: Instant::now(),
         succeeded: None,
     })
@@ -191,13 +250,183 @@ pub(crate) fn start_chunk(
 pub(crate) fn telemetry_snapshot() -> ParallelWalShadowTelemetry {
     let state = OBSERVER.lock().unwrap_or_else(PoisonError::into_inner);
     let active = mode_from_env() == ShadowMode::Shadow;
+    let recent_chunks: Vec<_> = state.recent_chunks.iter().cloned().collect();
+    let epoch_plan_manifest = build_epoch_plan_manifest(
+        active,
+        &recent_chunks,
+        state.chunks_observed,
+        state.chunk_errors,
+    );
     ParallelWalShadowTelemetry {
-        recent_chunks: state.recent_chunks.iter().cloned().collect(),
+        recent_chunks,
         chunks_observed: state.chunks_observed,
         cumulative_wall_micros: state.cumulative_wall_micros,
         chunk_errors: state.chunk_errors,
         active,
+        epoch_plan_manifest,
     }
+}
+
+fn elapsed_since_process_start_micros() -> u64 {
+    PROCESS_START.elapsed().as_micros().min(u64::MAX as u128) as u64
+}
+
+fn build_epoch_plan_manifest(
+    active: bool,
+    recent_chunks: &[ShadowChunkRecord],
+    total_chunks_observed: u64,
+    total_chunk_errors: u64,
+) -> ParallelWalShadowEpochPlan {
+    let planned_epochs = build_epoch_manifests(recent_chunks);
+    let successful_chunks = recent_chunks
+        .iter()
+        .filter(|record| record.succeeded)
+        .count();
+    let failed_chunks = recent_chunks.len().saturating_sub(successful_chunks);
+    let total_conversations = recent_chunks
+        .iter()
+        .map(|record| record.convs_in_chunk)
+        .sum();
+    let estimated_fsyncs_saved_vs_per_chunk = planned_epochs
+        .iter()
+        .map(|epoch| epoch.fsyncs_saved_vs_per_chunk)
+        .sum();
+    let (fallback_decision, fallback_reason) = if !active {
+        (
+            "observer_disabled",
+            "shadow observer is disabled; keep the existing begin-concurrent durability path",
+        )
+    } else if recent_chunks.is_empty() {
+        (
+            "collect_shadow_evidence",
+            "no shadow chunks observed yet; commit-mode promotion has no evidence window",
+        )
+    } else if failed_chunks > 0 || total_chunk_errors > 0 {
+        (
+            "fallback_to_current_writer",
+            "one or more shadow-observed chunks failed; commit-mode promotion remains blocked",
+        )
+    } else {
+        (
+            "shadow_only",
+            "epoch plan is advisory evidence; commit mode remains blocked until equivalence and crash-replay gates pass",
+        )
+    };
+
+    ParallelWalShadowEpochPlan {
+        schema_version: 1,
+        mode: "shadow_epoch_plan",
+        epoch_micros: SHADOW_EPOCH_MICROS,
+        commit_mode_allowed: false,
+        fallback_decision,
+        fallback_reason,
+        logical_digest: logical_window_digest(recent_chunks),
+        window_chunks: recent_chunks.len(),
+        total_chunks_observed,
+        successful_chunks,
+        failed_chunks,
+        total_conversations,
+        estimated_fsyncs_saved_vs_per_chunk,
+        planned_epochs,
+        proof_obligations: vec![
+            "shadow-vs-baseline persisted-row digest equality",
+            "deterministic crash/replay at epoch flush checkpoints",
+            "fallback to current begin-concurrent writer on any chunk or manifest validation error",
+            "no commit-mode exposure while commit_mode_allowed is false",
+        ],
+    }
+}
+
+fn build_epoch_manifests(recent_chunks: &[ShadowChunkRecord]) -> Vec<ShadowEpochManifest> {
+    #[derive(Default)]
+    struct EpochAccumulator {
+        chunk_count: usize,
+        worker_slots: BTreeSet<usize>,
+        conversation_count: usize,
+        first_chunk_idx: Option<usize>,
+        last_chunk_idx: Option<usize>,
+        first_start_elapsed_micros: Option<u64>,
+        last_finish_elapsed_micros: u64,
+        max_chunk_wall_micros: u64,
+        failed_chunks: usize,
+    }
+
+    let mut epochs: BTreeMap<u64, EpochAccumulator> = BTreeMap::new();
+    for record in recent_chunks {
+        let epoch_id = record.finish_elapsed_micros / SHADOW_EPOCH_MICROS;
+        let acc = epochs.entry(epoch_id).or_default();
+        acc.chunk_count += 1;
+        if let Some(worker_slot) = record.worker_slot {
+            acc.worker_slots.insert(worker_slot);
+        }
+        acc.conversation_count = acc.conversation_count.saturating_add(record.convs_in_chunk);
+        acc.first_chunk_idx = Some(
+            acc.first_chunk_idx
+                .map_or(record.chunk_idx, |idx| idx.min(record.chunk_idx)),
+        );
+        acc.last_chunk_idx = Some(
+            acc.last_chunk_idx
+                .map_or(record.chunk_idx, |idx| idx.max(record.chunk_idx)),
+        );
+        acc.first_start_elapsed_micros = Some(
+            acc.first_start_elapsed_micros
+                .map_or(record.start_elapsed_micros, |micros| {
+                    micros.min(record.start_elapsed_micros)
+                }),
+        );
+        acc.last_finish_elapsed_micros = acc
+            .last_finish_elapsed_micros
+            .max(record.finish_elapsed_micros);
+        acc.max_chunk_wall_micros = acc.max_chunk_wall_micros.max(record.wall_micros);
+        if !record.succeeded {
+            acc.failed_chunks += 1;
+        }
+    }
+
+    epochs
+        .into_iter()
+        .map(|(epoch_id, acc)| {
+            let successful_chunks = acc.chunk_count.saturating_sub(acc.failed_chunks);
+            let would_have_group_fsyncs = usize::from(successful_chunks > 0);
+            let fsyncs_saved_vs_per_chunk =
+                successful_chunks.saturating_sub(would_have_group_fsyncs);
+            ShadowEpochManifest {
+                epoch_id,
+                chunk_count: acc.chunk_count,
+                worker_slots: acc.worker_slots.into_iter().collect(),
+                conversation_count: acc.conversation_count,
+                first_chunk_idx: acc.first_chunk_idx.unwrap_or(0),
+                last_chunk_idx: acc.last_chunk_idx.unwrap_or(0),
+                first_start_elapsed_micros: acc.first_start_elapsed_micros.unwrap_or(0),
+                last_finish_elapsed_micros: acc.last_finish_elapsed_micros,
+                max_chunk_wall_micros: acc.max_chunk_wall_micros,
+                failed_chunks: acc.failed_chunks,
+                would_have_group_fsyncs,
+                fsyncs_saved_vs_per_chunk,
+            }
+        })
+        .collect()
+}
+
+fn logical_window_digest(recent_chunks: &[ShadowChunkRecord]) -> String {
+    let mut records = recent_chunks.to_vec();
+    records.sort_by_key(|record| (record.chunk_idx, record.base_conv_idx));
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cass.parallel_wal_shadow.logical_window.v1");
+    for record in records {
+        hasher.update(&(record.chunk_idx as u64).to_le_bytes());
+        hasher.update(
+            &record
+                .worker_slot
+                .map(|slot| slot as u64)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(&(record.base_conv_idx as u64).to_le_bytes());
+        hasher.update(&(record.convs_in_chunk as u64).to_le_bytes());
+        hasher.update(&[u8::from(record.succeeded)]);
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Mean wall-clock per chunk in the recent window; returns `None` when
@@ -383,9 +612,13 @@ mod tests {
             "cumulative_wall_micros",
             "chunk_errors",
             "active",
+            "epoch_plan_manifest",
             "chunk_idx",
+            "worker_slot",
             "convs_in_chunk",
             "succeeded",
+            "logical_digest",
+            "fallback_decision",
         ] {
             assert!(
                 json.contains(key),
@@ -401,5 +634,91 @@ mod tests {
                 std::env::set_var("CASS_INDEXER_PARALLEL_WAL", v);
             }
         }
+    }
+
+    fn synthetic_record(
+        chunk_idx: usize,
+        worker_slot: Option<usize>,
+        base_conv_idx: usize,
+        convs_in_chunk: usize,
+        finish_elapsed_micros: u64,
+        succeeded: bool,
+    ) -> ShadowChunkRecord {
+        ShadowChunkRecord {
+            chunk_idx,
+            worker_slot,
+            base_conv_idx,
+            convs_in_chunk,
+            start_elapsed_micros: finish_elapsed_micros.saturating_sub(100),
+            finish_elapsed_micros,
+            wall_micros: 100,
+            succeeded,
+        }
+    }
+
+    #[test]
+    fn epoch_plan_manifest_groups_chunks_by_shadow_epoch() {
+        let records = vec![
+            synthetic_record(0, Some(3), 0, 10, 1_000, true),
+            synthetic_record(1, Some(4), 10, 8, 2_000, true),
+            synthetic_record(2, Some(3), 18, 7, SHADOW_EPOCH_MICROS + 100, true),
+        ];
+
+        let manifest = build_epoch_plan_manifest(true, &records, records.len() as u64, 0);
+
+        assert_eq!(manifest.schema_version, 1);
+        assert!(!manifest.commit_mode_allowed);
+        assert_eq!(manifest.fallback_decision, "shadow_only");
+        assert_eq!(manifest.window_chunks, 3);
+        assert_eq!(manifest.successful_chunks, 3);
+        assert_eq!(manifest.total_conversations, 25);
+        assert_eq!(manifest.planned_epochs.len(), 2);
+        assert_eq!(manifest.planned_epochs[0].epoch_id, 0);
+        assert_eq!(manifest.planned_epochs[0].worker_slots, vec![3, 4]);
+        assert_eq!(manifest.planned_epochs[0].conversation_count, 18);
+        assert_eq!(manifest.planned_epochs[0].would_have_group_fsyncs, 1);
+        assert_eq!(manifest.planned_epochs[0].fsyncs_saved_vs_per_chunk, 1);
+        assert_eq!(manifest.planned_epochs[1].epoch_id, 1);
+        assert_eq!(manifest.estimated_fsyncs_saved_vs_per_chunk, 1);
+        assert!(
+            manifest
+                .proof_obligations
+                .iter()
+                .any(|obligation| obligation.contains("crash/replay")),
+            "manifest must carry the qhj9o.4 crash/replay gate"
+        );
+    }
+
+    #[test]
+    fn epoch_plan_digest_is_logical_not_timing_sensitive() {
+        let records = vec![
+            synthetic_record(1, Some(2), 8, 4, 1_000, true),
+            synthetic_record(0, Some(1), 0, 8, 900, true),
+        ];
+        let mut retimed = records.clone();
+        retimed[0].wall_micros = 9_999;
+        retimed[0].start_elapsed_micros = 30_000;
+        retimed[0].finish_elapsed_micros = 30_500;
+
+        let original = build_epoch_plan_manifest(true, &records, records.len() as u64, 0);
+        let retimed = build_epoch_plan_manifest(true, &retimed, records.len() as u64, 0);
+
+        assert_eq!(
+            original.logical_digest, retimed.logical_digest,
+            "logical digest should identify committed chunk/worker/row intent, not timing noise"
+        );
+    }
+
+    #[test]
+    fn epoch_plan_manifest_blocks_commit_on_empty_or_error_windows() {
+        let empty = build_epoch_plan_manifest(true, &[], 0, 0);
+        assert_eq!(empty.fallback_decision, "collect_shadow_evidence");
+        assert!(!empty.commit_mode_allowed);
+
+        let failed = vec![synthetic_record(0, Some(0), 0, 10, 1_000, false)];
+        let manifest = build_epoch_plan_manifest(true, &failed, 1, 1);
+        assert_eq!(manifest.fallback_decision, "fallback_to_current_writer");
+        assert_eq!(manifest.failed_chunks, 1);
+        assert!(!manifest.commit_mode_allowed);
     }
 }

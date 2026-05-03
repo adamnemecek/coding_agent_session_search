@@ -67,6 +67,22 @@ schemas: (auto-generated from contract)
       - chunk_errors: integer
       - chunks_observed: integer
       - cumulative_wall_micros: integer
+      - epoch_plan_manifest: object
+        - commit_mode_allowed: boolean
+        - epoch_micros: integer
+        - estimated_fsyncs_saved_vs_per_chunk: integer
+        - failed_chunks: integer
+        - fallback_decision: string
+        - fallback_reason: string
+        - logical_digest: string
+        - mode: string
+        - planned_epochs: array
+        - proof_obligations: array
+        - schema_version: integer
+        - successful_chunks: integer
+        - total_chunks_observed: integer
+        - total_conversations: integer
+        - window_chunks: integer
       - recent_chunks: array
     - policy_registry: object
       - controllers: array

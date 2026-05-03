@@ -137,7 +137,29 @@
     "chunks_observed": 0,
     "cumulative_wall_micros": 0,
     "chunk_errors": 0,
-    "active": true
+    "active": true,
+    "epoch_plan_manifest": {
+      "schema_version": 1,
+      "mode": "shadow_epoch_plan",
+      "epoch_micros": 40000,
+      "commit_mode_allowed": false,
+      "fallback_decision": "collect_shadow_evidence",
+      "fallback_reason": "no shadow chunks observed yet; commit-mode promotion has no evidence window",
+      "logical_digest": "d9c2dba932c2b67701c69d4a4f054db1e5489f6835e068e8d1456e6bdd4a6d45",
+      "window_chunks": 0,
+      "total_chunks_observed": 0,
+      "successful_chunks": 0,
+      "failed_chunks": 0,
+      "total_conversations": 0,
+      "estimated_fsyncs_saved_vs_per_chunk": 0,
+      "planned_epochs": [],
+      "proof_obligations": [
+        "shadow-vs-baseline persisted-row digest equality",
+        "deterministic crash/replay at epoch flush checkpoints",
+        "fallback to current begin-concurrent writer on any chunk or manifest validation error",
+        "no commit-mode exposure while commit_mode_allowed is false"
+      ]
+    }
   },
   "state": {
     "index": {

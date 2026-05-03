@@ -18924,11 +18924,54 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                                 "type": "object",
                                 "properties": {
                                     "chunk_idx": { "type": "integer" },
+                                    "worker_slot": { "type": ["integer", "null"], "description": "Rayon worker slot observed for this chunk when available." },
                                     "base_conv_idx": { "type": "integer" },
                                     "convs_in_chunk": { "type": "integer" },
+                                    "start_elapsed_micros": { "type": "integer" },
+                                    "finish_elapsed_micros": { "type": "integer" },
                                     "wall_micros": { "type": "integer" },
                                     "succeeded": { "type": "boolean" }
                                 }
+                            }
+                        },
+                        "epoch_plan_manifest": {
+                            "type": "object",
+                            "description": "Shadow-only Silo/Aether epoch-plan manifest. Groups observed chunks into hypothetical group-commit epochs and exposes row counts, worker slots, logical digest, fallback decision, and proof gates. commit_mode_allowed is false until equivalence and crash-replay evidence pass.",
+                            "properties": {
+                                "schema_version": { "type": "integer" },
+                                "mode": { "type": "string" },
+                                "epoch_micros": { "type": "integer" },
+                                "commit_mode_allowed": { "type": "boolean" },
+                                "fallback_decision": { "type": "string" },
+                                "fallback_reason": { "type": "string" },
+                                "logical_digest": { "type": "string" },
+                                "window_chunks": { "type": "integer" },
+                                "total_chunks_observed": { "type": "integer" },
+                                "successful_chunks": { "type": "integer" },
+                                "failed_chunks": { "type": "integer" },
+                                "total_conversations": { "type": "integer" },
+                                "estimated_fsyncs_saved_vs_per_chunk": { "type": "integer" },
+                                "planned_epochs": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "epoch_id": { "type": "integer" },
+                                            "chunk_count": { "type": "integer" },
+                                            "worker_slots": { "type": "array", "items": { "type": "integer" } },
+                                            "conversation_count": { "type": "integer" },
+                                            "first_chunk_idx": { "type": "integer" },
+                                            "last_chunk_idx": { "type": "integer" },
+                                            "first_start_elapsed_micros": { "type": "integer" },
+                                            "last_finish_elapsed_micros": { "type": "integer" },
+                                            "max_chunk_wall_micros": { "type": "integer" },
+                                            "failed_chunks": { "type": "integer" },
+                                            "would_have_group_fsyncs": { "type": "integer" },
+                                            "fsyncs_saved_vs_per_chunk": { "type": "integer" }
+                                        }
+                                    }
+                                },
+                                "proof_obligations": { "type": "array", "items": { "type": "string" } }
                             }
                         }
                     }

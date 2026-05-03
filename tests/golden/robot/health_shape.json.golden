@@ -321,6 +321,62 @@
         },
         "active": {
           "type": "boolean"
+        },
+        "epoch_plan_manifest": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "epoch_micros": {
+              "type": "integer"
+            },
+            "commit_mode_allowed": {
+              "type": "boolean"
+            },
+            "fallback_decision": {
+              "type": "string"
+            },
+            "fallback_reason": {
+              "type": "string"
+            },
+            "logical_digest": {
+              "type": "string"
+            },
+            "window_chunks": {
+              "type": "integer"
+            },
+            "total_chunks_observed": {
+              "type": "integer"
+            },
+            "successful_chunks": {
+              "type": "integer"
+            },
+            "failed_chunks": {
+              "type": "integer"
+            },
+            "total_conversations": {
+              "type": "integer"
+            },
+            "estimated_fsyncs_saved_vs_per_chunk": {
+              "type": "integer"
+            },
+            "planned_epochs": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "proof_obligations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
         }
       }
     },

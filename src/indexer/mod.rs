@@ -17230,8 +17230,8 @@ pub mod persist {
                 // semantics change. When CASS_INDEXER_PARALLEL_WAL=shadow is
                 // set, this records per-chunk wall-clock so future sessions
                 // can compare what a parallel-WAL coordinator would have
-                // decided. In `off` mode (default), this returns None and
-                // costs one env lookup + one Option construction.
+                // decided. Explicit `off` mode returns None; default shadow
+                // mode records a tiny bounded evidence manifest.
                 let shadow_guard = crate::indexer::parallel_wal_shadow::start_chunk(
                     chunk_idx,
                     base_idx,
