@@ -2966,6 +2966,14 @@ pub struct LexicalRebuildConversationFootprintRow {
     pub message_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LexicalRebuildConversationSummaryRow {
+    conversation_id: i64,
+    last_message_idx: Option<i64>,
+    user_message_count: Option<i64>,
+    assistant_message_count: Option<i64>,
+}
+
 pub(crate) const LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE: usize = 4 * 1024;
 const LEXICAL_REBUILD_FOOTPRINT_CONVERSATION_BATCH_SIZE: i64 = 4_096;
 const LEXICAL_REBUILD_FOOTPRINT_EXACT_FALLBACK_MAX_UNKNOWN_CONVERSATIONS: usize = 4_096;
@@ -6234,7 +6242,7 @@ impl FrankenStorage {
         let mut unknown_conversation_ids = Vec::new();
 
         loop {
-            let summary_rows: Vec<(i64, Option<i64>, Option<i64>, Option<i64>)> = self
+            let summary_rows: Vec<LexicalRebuildConversationSummaryRow> = self
                 .conn
                 .query_map_collect(
                     "SELECT id, last_message_idx, user_message_count, assistant_message_count
@@ -6247,12 +6255,12 @@ impl FrankenStorage {
                         LEXICAL_REBUILD_FOOTPRINT_CONVERSATION_BATCH_SIZE
                     ],
                     |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                        ))
+                        Ok(LexicalRebuildConversationSummaryRow {
+                            conversation_id: row.get_typed(0)?,
+                            last_message_idx: row.get_typed(1)?,
+                            user_message_count: row.get_typed(2)?,
+                            assistant_message_count: row.get_typed(3)?,
+                        })
                     },
                 )
                 .with_context(|| "listing lexical rebuild conversation summary footprints")?;
@@ -6261,14 +6269,13 @@ impl FrankenStorage {
             }
 
             footprints.reserve(summary_rows.len());
-            for (conversation_id, last_message_idx, user_messages, assistant_messages) in
-                summary_rows
-            {
+            for summary_row in summary_rows {
+                let conversation_id = summary_row.conversation_id;
                 last_conversation_id = conversation_id;
                 match lexical_rebuild_estimated_message_count_from_conversation_summary(
-                    last_message_idx,
-                    user_messages,
-                    assistant_messages,
+                    summary_row.last_message_idx,
+                    summary_row.user_message_count,
+                    summary_row.assistant_message_count,
                 ) {
                     Some(message_count) => {
                         footprints.push(LexicalRebuildConversationFootprintRow {
