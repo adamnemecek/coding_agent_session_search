@@ -456,6 +456,7 @@ impl SemanticShardManifest {
         let mut ann_ready_indices = std::collections::BTreeSet::new();
         let mut seen_indices = std::collections::BTreeSet::new();
         let mut seen_index_paths = std::collections::BTreeSet::new();
+        let mut seen_ann_index_paths = std::collections::BTreeSet::new();
         let mut expected_shard_count = None;
         let mut expected_generation_metadata: Option<(&str, u32, u32, usize, u64, &str)> = None;
         let mut generation_consistent = true;
@@ -515,8 +516,10 @@ impl SemanticShardManifest {
             if shard.ready
                 && shard.mmap_ready
                 && shard.ann_ready
-                && shard.ann_index_path.is_some()
                 && shard.ann_size_bytes > 0
+                && let Some(ann_index_path) = shard.ann_index_path.as_deref()
+                && semantic_shard_artifact_path_is_safe(ann_index_path)
+                && seen_ann_index_paths.insert(ann_index_path)
             {
                 ann_ready_indices.insert(shard.shard_index);
             }
@@ -1957,6 +1960,61 @@ mod tests {
                 "unsafe shard index paths must not summarize as complete"
             );
         }
+
+        let outside_ann_dir = tempfile::tempdir().unwrap();
+        for unsafe_ann_path in [
+            outside_ann_dir
+                .path()
+                .join("outside.chsw")
+                .to_string_lossy()
+                .to_string(),
+            "vector_index/shards/../outside.chsw".to_string(),
+            "./vector_index/shards/fast/hash.chsw".to_string(),
+            " vector_index/shards/fast/hash.chsw".to_string(),
+        ] {
+            let mut unsafe_ann = test_shard(0, 1, true);
+            unsafe_ann.ann_ready = true;
+            unsafe_ann.ann_index_path = Some(unsafe_ann_path);
+            unsafe_ann.ann_size_bytes = 4096;
+            shards.replace_shards_for_generation(
+                TierKind::Fast,
+                "fnv1a-384",
+                "fp-sharded",
+                vec![unsafe_ann],
+            );
+            let unsafe_ann_summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+            assert_eq!(unsafe_ann_summary.shard_count, 1);
+            assert_eq!(unsafe_ann_summary.ready_shards, 1);
+            assert_eq!(unsafe_ann_summary.ann_ready_shards, 0);
+            assert!(
+                unsafe_ann_summary.complete,
+                "unsafe optional ANN paths must not invalidate the vector shard generation"
+            );
+        }
+
+        let mut duplicate_ann_path = test_shard(1, 2, true);
+        duplicate_ann_path.ann_ready = true;
+        duplicate_ann_path.ann_index_path =
+            Some("vector_index/shards/fast-fnv1a-384/shared-ann.chsw".to_owned());
+        duplicate_ann_path.ann_size_bytes = 4096;
+        let mut first_ann_path = test_shard(0, 2, true);
+        first_ann_path.ann_ready = true;
+        first_ann_path.ann_index_path = duplicate_ann_path.ann_index_path.clone();
+        first_ann_path.ann_size_bytes = 4096;
+        shards.replace_shards_for_generation(
+            TierKind::Fast,
+            "fnv1a-384",
+            "fp-sharded",
+            vec![first_ann_path, duplicate_ann_path],
+        );
+        let duplicate_ann_summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+        assert_eq!(duplicate_ann_summary.shard_count, 2);
+        assert_eq!(duplicate_ann_summary.ready_shards, 2);
+        assert_eq!(duplicate_ann_summary.ann_ready_shards, 1);
+        assert!(
+            duplicate_ann_summary.complete,
+            "duplicate optional ANN paths must not invalidate the vector shard generation"
+        );
 
         shards.replace_shards_for_generation(
             TierKind::Fast,
