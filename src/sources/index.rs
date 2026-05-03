@@ -163,6 +163,83 @@ pub struct IndexResult {
     pub duration: Duration,
     /// Error message if failed.
     pub error: Option<String>,
+    /// Remote lexical artifact proof written after a successful index run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_manifest: Option<RemoteArtifactManifestResult>,
+}
+
+/// Result of writing a remote lexical artifact evidence manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteArtifactManifestResult {
+    /// Whether the proof command completed and produced a complete manifest.
+    pub success: bool,
+    /// Path to evidence-bundle-manifest.json on the remote host.
+    pub manifest_path: Option<String>,
+    /// Deterministic content-addressed bundle id.
+    pub bundle_id: Option<String>,
+    /// Number of files described by the manifest.
+    pub chunk_count: Option<usize>,
+    /// Total bytes expected by the evidence report.
+    pub expected_bytes: Option<u64>,
+    /// Verification status reported by the remote command.
+    pub verification_status: Option<String>,
+    /// Error message when the proof command failed.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteArtifactManifestCommandOutput {
+    manifest_path: Option<String>,
+    bundle_id: Option<String>,
+    chunk_count: Option<usize>,
+    expected_bytes: Option<u64>,
+    verification_status: Option<String>,
+}
+
+impl RemoteArtifactManifestResult {
+    fn from_command_output(output: &str) -> Self {
+        match serde_json::from_str::<RemoteArtifactManifestCommandOutput>(output) {
+            Ok(parsed) => {
+                let complete = parsed.verification_status.as_deref() == Some("complete");
+                Self {
+                    success: complete,
+                    manifest_path: parsed.manifest_path,
+                    bundle_id: parsed.bundle_id,
+                    chunk_count: parsed.chunk_count,
+                    expected_bytes: parsed.expected_bytes,
+                    verification_status: parsed.verification_status,
+                    error: if complete {
+                        None
+                    } else {
+                        Some("remote artifact manifest verification was not complete".to_string())
+                    },
+                }
+            }
+            Err(err) => Self {
+                success: false,
+                manifest_path: None,
+                bundle_id: None,
+                chunk_count: None,
+                expected_bytes: None,
+                verification_status: None,
+                error: Some(format!(
+                    "failed to parse remote artifact manifest output: {err}"
+                )),
+            },
+        }
+    }
+
+    fn from_error(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            manifest_path: None,
+            bundle_id: None,
+            chunk_count: None,
+            expected_bytes: None,
+            verification_status: None,
+            error: Some(error.into()),
+        }
+    }
 }
 
 // =============================================================================
@@ -242,7 +319,10 @@ impl RemoteIndexer {
         self.verify_cass_installed()?;
 
         // Run indexing in background with log file for progress tracking
-        let result = self.run_index_with_polling(&on_progress, start)?;
+        let mut result = self.run_index_with_polling(&on_progress, start)?;
+        if result.success {
+            result.artifact_manifest = Some(self.write_remote_artifact_manifest());
+        }
 
         // Report final result
         if result.success {
@@ -293,6 +373,21 @@ command -v cass >/dev/null 2>&1 && echo "CASS_FOUND" || echo "CASS_NOT_FOUND"
         }
 
         Ok(())
+    }
+
+    fn artifact_manifest_script() -> &'static str {
+        r#"
+source ~/.cargo/env 2>/dev/null || true
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+cass sources artifact-manifest --write --json
+"#
+    }
+
+    fn write_remote_artifact_manifest(&self) -> RemoteArtifactManifestResult {
+        match self.run_ssh_command(Self::artifact_manifest_script(), Duration::from_secs(60)) {
+            Ok(output) => RemoteArtifactManifestResult::from_command_output(&output),
+            Err(err) => RemoteArtifactManifestResult::from_error(err.to_string()),
+        }
     }
 
     /// Run indexing with background execution and polling.
@@ -417,6 +512,7 @@ fi
                     sessions_indexed: sessions,
                     duration: start.elapsed(),
                     error: None,
+                    artifact_manifest: None,
                 });
             }
 
@@ -440,6 +536,7 @@ fi
                     sessions_indexed: 0,
                     duration: start.elapsed(),
                     error: Some(error_msg),
+                    artifact_manifest: None,
                 });
             }
 
@@ -729,5 +826,35 @@ mod tests {
 
         let indexer2 = RemoteIndexer::with_defaults("server");
         assert_eq!(indexer2.host(), "server");
+    }
+
+    #[test]
+    fn test_artifact_manifest_script_uses_robot_safe_write_command() {
+        let script = RemoteIndexer::artifact_manifest_script();
+        assert!(script.contains("cass sources artifact-manifest --write --json"));
+        assert!(!script.contains("cass sources artifact-manifest --write\n"));
+    }
+
+    #[test]
+    fn test_remote_artifact_manifest_result_parses_command_output() {
+        let result = RemoteArtifactManifestResult::from_command_output(
+            r#"{
+              "status": "ok",
+              "manifest_path": "/home/user/.local/share/cass/index/v1/evidence-bundle-manifest.json",
+              "bundle_id": "cass-federated-lexical-abc",
+              "chunk_count": 3,
+              "expected_bytes": 42,
+              "verification_status": "complete"
+            }"#,
+        );
+
+        assert!(result.success);
+        assert_eq!(
+            result.bundle_id.as_deref(),
+            Some("cass-federated-lexical-abc")
+        );
+        assert_eq!(result.chunk_count, Some(3));
+        assert_eq!(result.expected_bytes, Some(42));
+        assert_eq!(result.error, None);
     }
 }

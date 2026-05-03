@@ -83,8 +83,14 @@ The wizard generates sources.toml entries like:
   "cargo not found": Use --skip-install and install manually
   "Index taking too long": Large histories take time; runs in background
 
+## Artifact Proofs
+  cass sources artifact-manifest --write --json
+Writes evidence-bundle-manifest.json for the current lexical artifact.
+Use --index-path to verify a copied artifact before exchange.
+
 ## Related Commands
   cass sources list         List configured sources
   cass sources sync         Sync data from sources
+  cass sources artifact-manifest  Write/verify lexical artifact proof
   cass sources discover     Just discover hosts (no setup)
   cass sources add          Manually add a source

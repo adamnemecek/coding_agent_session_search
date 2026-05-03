@@ -800,9 +800,33 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                     };
 
                     match indexer.run_index(progress_callback) {
-                        Ok(_) => {
+                        Ok(result) => {
                             if !opts.json {
                                 println!("│ {} {} indexed", "✓".green(), host.host_name);
+                                if opts.verbose
+                                    && let Some(artifact) = &result.artifact_manifest
+                                {
+                                    if artifact.success {
+                                        println!(
+                                            "│   {} artifact proof {} ({} chunks)",
+                                            "✓".green(),
+                                            artifact
+                                                .bundle_id
+                                                .as_deref()
+                                                .unwrap_or("bundle id unavailable"),
+                                            artifact.chunk_count.unwrap_or(0)
+                                        );
+                                    } else {
+                                        println!(
+                                            "│   {} artifact proof unavailable: {}",
+                                            "⚠".yellow(),
+                                            artifact
+                                                .error
+                                                .as_deref()
+                                                .unwrap_or("unknown artifact manifest error")
+                                        );
+                                    }
+                                }
                             }
                             state.completed_indexes.push(host.host_name.clone());
                             state.save()?;

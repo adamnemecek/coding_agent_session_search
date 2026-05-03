@@ -1128,6 +1128,21 @@ pub enum SourcesCommand {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
+    /// Build or write a lexical artifact evidence manifest for remote exchange
+    ArtifactManifest {
+        /// Exact lexical index path. Defaults to <data-dir>/index/<schema-version>.
+        #[arg(long, value_hint = ValueHint::DirPath, conflicts_with = "data_dir")]
+        index_path: Option<PathBuf>,
+        /// Override cass data dir used to resolve the lexical index path
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<PathBuf>,
+        /// Write evidence-bundle-manifest.json next to the lexical artifact
+        #[arg(long)]
+        write: bool,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Manage path mappings for a source (P6.3)
     #[command(subcommand)]
     Mappings(MappingsAction),
@@ -2230,7 +2245,15 @@ fn format_missing_subcommand_error(args: &[String]) -> String {
         ),
         "sources" => (
             &[
-                "list", "add", "remove", "doctor", "sync", "mappings", "discover", "setup",
+                "list",
+                "add",
+                "remove",
+                "doctor",
+                "sync",
+                "artifact-manifest",
+                "mappings",
+                "discover",
+                "setup",
             ],
             &[
                 "cass sources list --json",
@@ -6889,6 +6912,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Sources(SourcesCommand::Sync { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Sources(SourcesCommand::ArtifactManifest { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Sources(SourcesCommand::Discover { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -7487,9 +7513,15 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  \"cargo not found\": Use --skip-install and install manually".to_string(),
             "  \"Index taking too long\": Large histories take time; runs in background".to_string(),
             String::new(),
+            "## Artifact Proofs".to_string(),
+            "  cass sources artifact-manifest --write --json".to_string(),
+            "Writes evidence-bundle-manifest.json for the current lexical artifact.".to_string(),
+            "Use --index-path to verify a copied artifact before exchange.".to_string(),
+            String::new(),
             "## Related Commands".to_string(),
             "  cass sources list         List configured sources".to_string(),
             "  cass sources sync         Sync data from sources".to_string(),
+            "  cass sources artifact-manifest  Write/verify lexical artifact proof".to_string(),
             "  cass sources discover     Just discover hosts (no setup)".to_string(),
             "  cass sources add          Manually add a source".to_string(),
         ],
@@ -27310,6 +27342,15 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_sources_sync(source, no_index, verbose, dry_run, structured_format)
         }
+        SourcesCommand::ArtifactManifest {
+            index_path,
+            data_dir,
+            write,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_sources_artifact_manifest(index_path, data_dir, write, structured_format)
+        }
         SourcesCommand::Mappings(action) => run_mappings_command(action, cli),
         SourcesCommand::Agents(action) => run_agents_command(action, cli),
         SourcesCommand::Discover {
@@ -27348,6 +27389,119 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             })
         }
     }
+}
+
+fn resolved_sources_artifact_manifest_index_path(
+    index_path: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+) -> PathBuf {
+    index_path.unwrap_or_else(|| {
+        let data_dir = data_dir.unwrap_or_else(default_data_dir);
+        search::tantivy::expected_index_dir(&data_dir)
+    })
+}
+
+fn sources_artifact_manifest_error(e: anyhow::Error) -> CliError {
+    CliError {
+        code: 5,
+        kind: CliErrorKind::LexicalGeneration.kind_str(),
+        message: format!("Failed to build lexical artifact evidence manifest: {e:#}"),
+        hint: Some(
+            "Run `cass index --full --json` first, then retry the artifact manifest command."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+fn run_sources_artifact_manifest(
+    index_path: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    write: bool,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let index_path = resolved_sources_artifact_manifest_index_path(index_path, data_dir);
+    let manifest = search::tantivy::lexical_search_evidence_bundle_manifest(&index_path)
+        .map_err(sources_artifact_manifest_error)?;
+    let report = manifest.verify(&index_path);
+    if !report.is_complete() {
+        return Err(CliError {
+            code: 5,
+            kind: CliErrorKind::LexicalGeneration.kind_str(),
+            message: format!(
+                "Generated lexical artifact evidence manifest did not verify cleanly: {:?}",
+                report.status
+            ),
+            hint: Some(
+                "Re-run `cass index --full --json` before exchanging artifacts.".to_string(),
+            ),
+            retryable: true,
+        });
+    }
+
+    let manifest_path = if write {
+        let path = manifest.save(&index_path).map_err(|e| CliError {
+            code: 14,
+            kind: CliErrorKind::IoError.kind_str(),
+            message: format!("Failed to write lexical artifact evidence manifest: {e:#}"),
+            hint: Some("Check that the index directory is writable.".to_string()),
+            retryable: true,
+        })?;
+        Some(path)
+    } else {
+        None
+    };
+    let expected_manifest_path = crate::evidence_bundle::EvidenceBundleManifest::path(&index_path);
+    let bundle_id = manifest.bundle_id.clone();
+    let kind = manifest.kind;
+    let chunk_count = manifest.chunks.len();
+
+    let payload = serde_json::json!({
+        "status": "ok",
+        "index_path": index_path.display().to_string(),
+        "manifest_path": manifest_path
+            .as_ref()
+            .unwrap_or(&expected_manifest_path)
+            .display()
+            .to_string(),
+        "wrote_manifest": write,
+        "bundle_id": bundle_id,
+        "kind": kind,
+        "chunk_count": chunk_count,
+        "expected_bytes": report.expected_bytes,
+        "verification_status": report.status,
+    });
+
+    if let Some(fmt) = output_format {
+        let fmt = if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        };
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!("Lexical artifact evidence manifest");
+        println!("  index: {}", index_path.display());
+        println!(
+            "  manifest: {}{}",
+            manifest_path
+                .as_ref()
+                .unwrap_or(&expected_manifest_path)
+                .display(),
+            if write { "" } else { " (not written)" }
+        );
+        println!(
+            "  bundle_id: {}",
+            payload["bundle_id"].as_str().unwrap_or("")
+        );
+        println!("  chunks: {}", payload["chunk_count"].as_u64().unwrap_or(0));
+        println!(
+            "  expected_bytes: {}",
+            payload["expected_bytes"].as_u64().unwrap_or(0)
+        );
+    }
+
+    Ok(())
 }
 
 /// List configured sources (P5.3)

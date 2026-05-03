@@ -499,13 +499,57 @@ fn validate_federated_search_manifest(
 fn federated_evidence_chunk_role(relative_path: &str) -> EvidenceBundleChunkRole {
     if relative_path == FEDERATED_SEARCH_MANIFEST_FILE {
         EvidenceBundleChunkRole::Manifest
-    } else if relative_path == "schema_hash.json" || relative_path.ends_with("/meta.json") {
+    } else if relative_path == "schema_hash.json"
+        || relative_path == "meta.json"
+        || relative_path.ends_with("/meta.json")
+    {
         EvidenceBundleChunkRole::Metadata
     } else if relative_path.starts_with("shards/") {
         EvidenceBundleChunkRole::LexicalShard
     } else {
         EvidenceBundleChunkRole::Other
     }
+}
+
+fn standard_lexical_evidence_chunk_role(relative_path: &str) -> EvidenceBundleChunkRole {
+    if relative_path == "schema_hash.json" || relative_path == "meta.json" {
+        EvidenceBundleChunkRole::Metadata
+    } else {
+        EvidenceBundleChunkRole::LexicalShard
+    }
+}
+
+fn current_schema_hash_file_matches(index_path: &Path) -> Result<()> {
+    let schema_hash_path = index_path.join("schema_hash.json");
+    let content = fs::read_to_string(&schema_hash_path).with_context(|| {
+        format!(
+            "reading cass schema hash metadata for lexical artifact {}",
+            schema_hash_path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "parsing cass schema hash metadata for lexical artifact {}",
+            schema_hash_path.display()
+        )
+    })?;
+    let stored_hash = value
+        .get("schema_hash")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "lexical artifact schema hash metadata is missing schema_hash: {}",
+                schema_hash_path.display()
+            )
+        })?;
+    if stored_hash != CASS_SCHEMA_HASH {
+        return Err(anyhow::anyhow!(
+            "lexical artifact schema mismatch: expected {}, got {}",
+            CASS_SCHEMA_HASH,
+            stored_hash
+        ));
+    }
+    Ok(())
 }
 
 fn relative_artifact_path_string(relative_path: &Path) -> Result<String> {
@@ -589,6 +633,58 @@ fn federated_evidence_bundle_id(chunks: &[EvidenceBundleChunk]) -> Result<String
     ))
 }
 
+fn lexical_search_evidence_bundle_manifest_with_roles(
+    index_path: &Path,
+    role_for_path: fn(&str) -> EvidenceBundleChunkRole,
+) -> Result<EvidenceBundleManifest> {
+    let mut relative_paths = Vec::new();
+    collect_federated_evidence_artifact_paths(index_path, index_path, &mut relative_paths)?;
+    relative_paths.sort();
+
+    let chunks = relative_paths
+        .into_iter()
+        .map(|relative_path| {
+            let role = role_for_path(&relative_path);
+            EvidenceBundleChunk::from_file(index_path, relative_path, role, true, None)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bundle_id = federated_evidence_bundle_id(&chunks)?;
+    let mut evidence =
+        EvidenceBundleManifest::new(bundle_id, EvidenceBundleKind::LexicalGeneration, 0);
+    evidence.chunks = chunks;
+    Ok(evidence)
+}
+
+/// Build a deterministic evidence manifest for any cass lexical artifact.
+///
+/// Normal Tantivy directories and federated lexical bundles both use this proof
+/// surface before remote exchange. Federated bundles get their contract and
+/// shard fingerprints validated; standard indexes require the current
+/// `schema_hash.json` and a readable searchable summary.
+pub fn lexical_search_evidence_bundle_manifest(
+    index_path: &Path,
+) -> Result<EvidenceBundleManifest> {
+    if let Some(manifest) = load_federated_search_manifest_internal(index_path)? {
+        validate_federated_search_manifest(index_path, &manifest, true)?;
+        return lexical_search_evidence_bundle_manifest_with_roles(
+            index_path,
+            federated_evidence_chunk_role,
+        );
+    }
+
+    current_schema_hash_file_matches(index_path)?;
+    searchable_index_summary(index_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot build lexical evidence bundle because no searchable index exists in {}",
+            index_path.display()
+        )
+    })?;
+    lexical_search_evidence_bundle_manifest_with_roles(
+        index_path,
+        standard_lexical_evidence_chunk_role,
+    )
+}
+
 /// Build a deterministic evidence manifest for a federated lexical bundle.
 ///
 /// This is the admission proof remote artifact exchange can compare before
@@ -607,27 +703,16 @@ pub fn federated_search_evidence_bundle_manifest(
         ));
     };
     validate_federated_search_manifest(index_path, &manifest, true)?;
-
-    let mut relative_paths = Vec::new();
-    collect_federated_evidence_artifact_paths(index_path, index_path, &mut relative_paths)?;
-    relative_paths.sort();
-
-    let chunks = relative_paths
-        .into_iter()
-        .map(|relative_path| {
-            let role = federated_evidence_chunk_role(&relative_path);
-            EvidenceBundleChunk::from_file(index_path, relative_path, role, true, None)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let bundle_id = federated_evidence_bundle_id(&chunks)?;
-    let mut evidence =
-        EvidenceBundleManifest::new(bundle_id, EvidenceBundleKind::LexicalGeneration, 0);
-    evidence.chunks = chunks;
-    Ok(evidence)
+    lexical_search_evidence_bundle_manifest_with_roles(index_path, federated_evidence_chunk_role)
 }
 
 pub fn write_federated_search_evidence_bundle_manifest(index_path: &Path) -> Result<PathBuf> {
     let manifest = federated_search_evidence_bundle_manifest(index_path)?;
+    manifest.save(index_path)
+}
+
+pub fn write_lexical_search_evidence_bundle_manifest(index_path: &Path) -> Result<PathBuf> {
+    let manifest = lexical_search_evidence_bundle_manifest(index_path)?;
     manifest.save(index_path)
 }
 
@@ -2245,6 +2330,46 @@ mod tests {
             }],
         };
         write_federated_manifest_for_test(root, &manifest);
+    }
+
+    fn write_minimal_standard_lexical_artifact(root: &Path, segment_bytes: &[u8]) {
+        fs::create_dir_all(root).expect("create standard lexical root");
+        fs::write(root.join("meta.json"), br#"{"segments":[]}"#).expect("write root meta");
+        fs::write(root.join("segment.bin"), segment_bytes).expect("write segment");
+        write_root_schema_hash_file(root).expect("write schema hash");
+    }
+
+    #[test]
+    fn lexical_evidence_manifest_supports_standard_searchable_index() {
+        let root = TempDir::new().expect("temp dir");
+        write_minimal_standard_lexical_artifact(root.path(), b"standard segment bytes");
+
+        let manifest =
+            lexical_search_evidence_bundle_manifest(root.path()).expect("standard manifest");
+        assert!(manifest.verify(root.path()).is_complete());
+        assert!(manifest.chunks.iter().any(|chunk| {
+            chunk.path == "meta.json" && chunk.role == EvidenceBundleChunkRole::Metadata
+        }));
+        assert!(manifest.chunks.iter().any(|chunk| {
+            chunk.path == "segment.bin" && chunk.role == EvidenceBundleChunkRole::LexicalShard
+        }));
+    }
+
+    #[test]
+    fn lexical_evidence_manifest_rejects_standard_schema_mismatch() {
+        let root = TempDir::new().expect("temp dir");
+        write_minimal_standard_lexical_artifact(root.path(), b"standard segment bytes");
+        fs::write(
+            root.path().join("schema_hash.json"),
+            r#"{"schema_hash":"stale"}"#,
+        )
+        .expect("write stale schema hash");
+
+        let error = lexical_search_evidence_bundle_manifest(root.path()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("lexical artifact schema mismatch"),
+            "unexpected schema error: {error:#}"
+        );
     }
 
     #[test]
