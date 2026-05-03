@@ -27,6 +27,7 @@
 
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::process::{Child, Command, Output, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -351,20 +352,40 @@ fn effective_ssh_command_timeout(requested: Duration, configured_secs: u64) -> D
     }
 }
 
+fn drain_child_pipe<R>(mut pipe: R) -> JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: IoRead + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        pipe.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn finish_child_pipe(
+    pipe_reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, IndexError> {
+    match pipe_reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| IndexError::Io(std::io::Error::other("child pipe reader panicked")))?
+            .map_err(IndexError::Io),
+        None => Ok(Vec::new()),
+    }
+}
+
 fn wait_for_command_output_with_timeout(
     mut child: Child,
     timeout: Duration,
 ) -> Result<Output, IndexError> {
+    let stdout_reader = child.stdout.take().map(drain_child_pipe);
+    let stderr_reader = child.stderr.take().map(drain_child_pipe);
+
     match child.wait_timeout(timeout)? {
         Some(status) => {
-            let mut stdout = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                pipe.read_to_end(&mut stdout)?;
-            }
-            let mut stderr = Vec::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                pipe.read_to_end(&mut stderr)?;
-            }
+            let stdout = finish_child_pipe(stdout_reader)?;
+            let stderr = finish_child_pipe(stderr_reader)?;
             Ok(Output {
                 status,
                 stdout,
@@ -1029,6 +1050,24 @@ mod tests {
             .expect_err("stalled command should time out");
         assert!(matches!(err, IndexError::Timeout(1)));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_wait_for_command_output_with_timeout_drains_large_output() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("yes stdout | head -c 200000; yes stderr | head -c 200000 >&2")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn large-output helper");
+
+        let output = wait_for_command_output_with_timeout(child, Duration::from_secs(5))
+            .expect("large-output command should finish without filling pipes");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(output.stderr.len(), 200_000);
     }
 
     #[test]
