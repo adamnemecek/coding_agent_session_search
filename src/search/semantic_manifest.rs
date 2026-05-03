@@ -442,14 +442,19 @@ impl SemanticShardManifest {
         let mut summary = SemanticShardSummary::default();
         let mut ready_indices = std::collections::BTreeSet::new();
         let mut ann_ready_indices = std::collections::BTreeSet::new();
+        let mut seen_indices = std::collections::BTreeSet::new();
         let mut expected_shard_count = None;
+        let mut expected_generation_metadata: Option<(&str, u32, u32, usize, u64, &str)> = None;
         let mut generation_consistent = true;
         for shard in self
             .shards
             .iter()
             .filter(|shard| shard.matches_generation(tier, embedder_id, db_fingerprint))
         {
-            if shard.shard_count == 0 {
+            if shard.shard_count == 0 || shard.shard_index >= shard.shard_count {
+                generation_consistent = false;
+            }
+            if !seen_indices.insert(shard.shard_index) {
                 generation_consistent = false;
             }
             match expected_shard_count {
@@ -458,6 +463,27 @@ impl SemanticShardManifest {
                 }
                 None => expected_shard_count = Some(shard.shard_count),
                 _ => {}
+            }
+            let generation_metadata = (
+                shard.model_revision.as_str(),
+                shard.schema_version,
+                shard.chunking_version,
+                shard.dimension,
+                shard.total_conversations,
+                shard.quantization.as_str(),
+            );
+            match expected_generation_metadata {
+                Some(expected) if expected != generation_metadata => {
+                    generation_consistent = false;
+                }
+                None => expected_generation_metadata = Some(generation_metadata),
+                _ => {}
+            }
+            if shard.schema_version != SEMANTIC_SCHEMA_VERSION
+                || shard.chunking_version != CHUNKING_STRATEGY_VERSION
+                || shard.dimension == 0
+            {
+                generation_consistent = false;
             }
             summary.shard_count = summary.shard_count.max(shard.shard_count);
             summary.doc_count = summary.doc_count.saturating_add(shard.doc_count);
@@ -1835,6 +1861,70 @@ mod tests {
         assert_eq!(inconsistent_summary.ready_shards, 2);
         assert_eq!(inconsistent_summary.ann_ready_shards, 0);
         assert!(!inconsistent_summary.complete);
+
+        shards.replace_shards_for_generation(
+            TierKind::Fast,
+            "fnv1a-384",
+            "fp-sharded",
+            vec![
+                test_shard(0, 2, true),
+                test_shard(1, 2, true),
+                test_shard(1, 2, false),
+            ],
+        );
+        let duplicate_summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+        assert_eq!(duplicate_summary.shard_count, 2);
+        assert_eq!(duplicate_summary.ready_shards, 2);
+        assert!(
+            !duplicate_summary.complete,
+            "duplicate shard indexes must not summarize as a complete generation"
+        );
+
+        shards.replace_shards_for_generation(
+            TierKind::Fast,
+            "fnv1a-384",
+            "fp-sharded",
+            vec![test_shard(2, 2, true)],
+        );
+        let out_of_range_summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+        assert_eq!(out_of_range_summary.shard_count, 2);
+        assert_eq!(out_of_range_summary.ready_shards, 1);
+        assert!(
+            !out_of_range_summary.complete,
+            "shard indexes outside the declared shard count are malformed"
+        );
+
+        let mut mismatched_metadata = test_shard(1, 2, true);
+        mismatched_metadata.dimension = 768;
+        shards.replace_shards_for_generation(
+            TierKind::Fast,
+            "fnv1a-384",
+            "fp-sharded",
+            vec![test_shard(0, 2, true), mismatched_metadata],
+        );
+        let metadata_summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+        assert_eq!(metadata_summary.shard_count, 2);
+        assert_eq!(metadata_summary.ready_shards, 2);
+        assert!(
+            !metadata_summary.complete,
+            "complete shard generations require consistent shard metadata"
+        );
+
+        let mut stale_schema = test_shard(0, 1, true);
+        stale_schema.schema_version = SEMANTIC_SCHEMA_VERSION.saturating_sub(1);
+        shards.replace_shards_for_generation(
+            TierKind::Fast,
+            "fnv1a-384",
+            "fp-sharded",
+            vec![stale_schema],
+        );
+        let stale_schema_summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+        assert_eq!(stale_schema_summary.shard_count, 1);
+        assert_eq!(stale_schema_summary.ready_shards, 1);
+        assert!(
+            !stale_schema_summary.complete,
+            "stale schema shards must not summarize as complete"
+        );
     }
 
     #[test]
