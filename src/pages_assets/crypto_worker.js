@@ -101,6 +101,7 @@ function getWorkerFailureMessageType(type) {
  */
 async function handleUnlockPassword(password, cfg, requestId) {
     config = cfg;
+    validateSupportedPayloadFormat(config);
 
     // Find password slot
     const passwordSlots = config.key_slots.filter(s => s.slot_type === 'password');
@@ -139,6 +140,7 @@ async function handleUnlockPassword(password, cfg, requestId) {
  */
 async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
     config = cfg;
+    validateSupportedPayloadFormat(config);
 
     // Find recovery slot
     const recoverySlots = config.key_slots.filter(s => s.slot_type === 'recovery');
@@ -282,6 +284,7 @@ async function unwrapDek(kek, slot, exportId) {
  */
 async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled, requestId) {
     config = cfg;
+    validateSupportedPayloadFormat(config);
     dek = base64ToArray(dekBase64);
     const { payload } = config;
     const totalChunks = payload.chunk_count;
@@ -299,12 +302,18 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled, requestId) {
         ['decrypt']
     );
 
-    // Decrypt each chunk
-    const decryptedChunks = [];
+    // Decrypt and decompress each chunk. Rust writes one independent deflate
+    // stream per encrypted chunk, so concatenating compressed streams before
+    // inflate would drop data in browsers/engines that stop at the first stream.
+    const plaintextChunks = [];
     let totalDecrypted = 0;
 
     for (let i = 0; i < totalChunks; i++) {
         const chunkName = `chunk-${String(i).padStart(5, '0')}.bin`;
+        const expectedChunkPath = `payload/${chunkName}`;
+        if (payload.files[i] !== expectedChunkPath) {
+            throw new Error(`Invalid payload file entry ${i}: expected ${expectedChunkPath}`);
+        }
         const chunkUrl = `./payload/${chunkName}`;
 
         try {
@@ -331,8 +340,9 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled, requestId) {
                 encryptedChunk
             );
 
-            decryptedChunks.push(new Uint8Array(decrypted));
-            totalDecrypted += decrypted.byteLength;
+            const plaintext = await decompressDeflate(new Uint8Array(decrypted));
+            plaintextChunks.push(plaintext);
+            totalDecrypted += plaintext.byteLength;
 
             // Report progress
             const percent = Math.round(((i + 1) / totalChunks) * 90);
@@ -347,23 +357,10 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled, requestId) {
         }
     }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Decompressing...', percent: 92, requestId });
-
-    // Concatenate chunks
-    const compressed = concatenateChunks(decryptedChunks);
-
-    // Decompress. The current archive format stores every encrypted payload
-    // chunk as deflate; fail closed instead of handing compressed bytes to
-    // sqlite-wasm and surfacing a misleading database initialization error.
-    if (config.compression !== 'deflate') {
-        throw new Error(`Unsupported archive compression: ${config.compression ?? 'missing'}`);
-    }
-    const decompressed = await decompressDeflate(compressed);
-
     self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95, requestId });
 
     // Store in OPFS or memory
-    const dbBytes = decompressed;
+    const dbBytes = concatenateChunks(plaintextChunks);
 
     const transfer = dbBytes.buffer.slice(
         dbBytes.byteOffset,
@@ -379,6 +376,41 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled, requestId) {
         },
         [transfer]
     );
+}
+
+function validateSupportedPayloadFormat(cfg) {
+    if (!cfg || typeof cfg !== 'object') {
+        throw new Error('Invalid archive config');
+    }
+
+    if (cfg.version !== 2) {
+        throw new Error(`Unsupported archive schema version: ${cfg.version ?? 'missing'}`);
+    }
+
+    if (cfg.compression !== 'deflate') {
+        throw new Error(`Unsupported archive compression: ${cfg.compression ?? 'missing'}`);
+    }
+
+    const payload = cfg.payload;
+    if (!payload || typeof payload !== 'object') {
+        throw new Error('Invalid archive payload metadata');
+    }
+
+    if (!Number.isSafeInteger(payload.chunk_size) || payload.chunk_size <= 0) {
+        throw new Error(`Invalid archive chunk_size: ${payload.chunk_size ?? 'missing'}`);
+    }
+
+    if (!Number.isSafeInteger(payload.chunk_count) || payload.chunk_count <= 0) {
+        throw new Error(`Invalid archive chunk_count: ${payload.chunk_count ?? 'missing'}`);
+    }
+
+    if (payload.chunk_count > 0xFFFFFFFF) {
+        throw new Error(`Invalid archive chunk_count: ${payload.chunk_count} exceeds maximum`);
+    }
+
+    if (!Array.isArray(payload.files) || payload.files.length !== payload.chunk_count) {
+        throw new Error('Invalid archive payload files list');
+    }
 }
 
 /**

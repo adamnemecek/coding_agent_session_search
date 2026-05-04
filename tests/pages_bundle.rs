@@ -1737,10 +1737,23 @@ mod tests {
     fn test_crypto_worker_rejects_unsupported_archive_compression() {
         let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
         assert!(
-            crypto_worker_js.contains("config.compression !== 'deflate'")
+            crypto_worker_js.contains("cfg.compression !== 'deflate'")
                 && crypto_worker_js.contains("Unsupported archive compression")
                 && !crypto_worker_js.contains("// No compression"),
             "crypto worker should fail closed when encrypted config.json declares unsupported compression"
+        );
+    }
+
+    #[test]
+    fn test_crypto_worker_inflates_each_encrypted_payload_chunk_independently() {
+        let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
+        assert!(
+            crypto_worker_js.contains("const plaintextChunks = [];")
+                && crypto_worker_js.contains("await decompressDeflate(new Uint8Array(decrypted))")
+                && crypto_worker_js.contains("const dbBytes = concatenateChunks(plaintextChunks);")
+                && !crypto_worker_js
+                    .contains("const compressed = concatenateChunks(decryptedChunks);"),
+            "crypto worker must inflate each independently-compressed payload chunk before concatenating plaintext"
         );
     }
 }
