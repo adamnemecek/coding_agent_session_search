@@ -17,7 +17,7 @@
 
 use crate::pages::attachments::reencrypt_blobs_into_dir;
 use crate::pages::encrypt::{
-    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, load_config,
+    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, MAX_CHUNK_SIZE, SlotType, load_config,
 };
 use crate::pages::qr::RecoverySecret;
 use aes_gcm::{
@@ -137,6 +137,7 @@ pub fn key_add_password(
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
     let mut config = load_config(&archive_dir)?;
+    ensure_supported_payload_format(&config)?;
 
     // Unlock with current password to get DEK
     let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
@@ -167,6 +168,7 @@ pub fn key_add_recovery(
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
     let mut config = load_config(&archive_dir)?;
+    ensure_supported_payload_format(&config)?;
 
     // Unlock with current password to get DEK
     let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
@@ -216,6 +218,7 @@ pub fn key_revoke(
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
     let mut config = load_config(&archive_dir)?;
+    ensure_supported_payload_format(&config)?;
 
     // Safety: Cannot revoke last slot
     if config.key_slots.len() <= 1 {
@@ -283,6 +286,7 @@ pub fn key_rotate(
 ) -> Result<RotateResult> {
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config = load_config(&archive_dir)?;
+    ensure_supported_payload_format(&config)?;
     let old_export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
     let old_export_id: [u8; 16] = old_export_id_raw.as_slice().try_into().map_err(|err| {
         // [coding_agent_session_search-htiim] Chain the underlying
@@ -400,6 +404,37 @@ pub fn key_rotate(
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+fn ensure_supported_payload_format(config: &EncryptionConfig) -> Result<()> {
+    if config.compression != "deflate" {
+        bail!(
+            "Unsupported archive compression '{}'. The current encrypted pages format supports only deflate.",
+            config.compression
+        );
+    }
+
+    if config.payload.chunk_size == 0 {
+        bail!("Invalid archive chunk_size 0: must be > 0");
+    }
+
+    if config.payload.chunk_size > MAX_CHUNK_SIZE {
+        bail!(
+            "Invalid archive chunk_size {}: must be <= {} bytes",
+            config.payload.chunk_size,
+            MAX_CHUNK_SIZE
+        );
+    }
+
+    if config.payload.chunk_count != config.payload.files.len() {
+        bail!(
+            "Invalid archive payload metadata: chunk_count {} does not match file list length {}",
+            config.payload.chunk_count,
+            config.payload.files.len()
+        );
+    }
+
+    Ok(())
+}
 
 /// Unwrap DEK using password (tries all password slots)
 fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result<[u8; 32]> {
@@ -1327,6 +1362,21 @@ mod tests {
         (temp_dir, bundle_root)
     }
 
+    fn rewrite_test_config(archive_dir: &Path, mutate: impl FnOnce(&mut EncryptionConfig)) {
+        let site_dir = super::super::resolve_site_dir(archive_dir).unwrap();
+        let mut config = load_config(&site_dir).unwrap();
+        mutate(&mut config);
+        write_json_pretty(&site_dir.join("config.json"), &config).unwrap();
+    }
+
+    fn assert_unsupported_payload_format_error(err: anyhow::Error, compression: &str) {
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("supports only deflate") && rendered.contains(compression),
+            "unexpected unsupported-format error: {err:#}"
+        );
+    }
+
     #[test]
     fn test_decrypt_all_chunks_rejects_mismatched_chunk_count_before_progress() {
         let temp_dir = TempDir::new().unwrap();
@@ -1370,6 +1420,55 @@ mod tests {
         assert_eq!(result.slots.len(), 1);
         assert_eq!(result.slots[0].slot_type, "password");
         assert_eq!(result.slots[0].kdf, "argon2id");
+    }
+
+    #[test]
+    fn test_key_mutations_reject_unsupported_payload_compression() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        key_add_password(&archive_dir, "test-password", "second-password").unwrap();
+        rewrite_test_config(&archive_dir, |config| {
+            config.compression = "zstd".to_string();
+        });
+
+        let err = key_add_password(&archive_dir, "test-password", "third-password").unwrap_err();
+        assert_unsupported_payload_format_error(err, "zstd");
+
+        let err = key_add_recovery(&archive_dir, "test-password").unwrap_err();
+        assert_unsupported_payload_format_error(err, "zstd");
+
+        let err = key_revoke(&archive_dir, "second-password", 0).unwrap_err();
+        assert_unsupported_payload_format_error(err, "zstd");
+
+        let err =
+            key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap_err();
+        assert_unsupported_payload_format_error(err, "zstd");
+
+        let config = load_config(&archive_dir).unwrap();
+        assert_eq!(config.key_slots.len(), 2);
+        assert!(unwrap_dek_with_password(&config, "test-password").is_ok());
+        assert!(unwrap_dek_with_password(&config, "second-password").is_ok());
+        assert!(unwrap_dek_with_password(&config, "third-password").is_err());
+        assert!(unwrap_dek_with_password(&config, "new-password").is_err());
+    }
+
+    #[test]
+    fn test_key_rotate_rejects_oversized_payload_chunk_size_before_rewriting() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        rewrite_test_config(&archive_dir, |config| {
+            config.payload.chunk_size = MAX_CHUNK_SIZE + 1;
+        });
+
+        let err =
+            key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("chunk_size") && rendered.contains("must be <="),
+            "unexpected chunk-size error: {err:#}"
+        );
+
+        let config = load_config(&archive_dir).unwrap();
+        assert!(unwrap_dek_with_password(&config, "test-password").is_ok());
+        assert!(unwrap_dek_with_password(&config, "new-password").is_err());
     }
 
     #[test]
