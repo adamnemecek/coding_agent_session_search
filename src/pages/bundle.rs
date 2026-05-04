@@ -245,7 +245,8 @@ impl BundleBuilder {
             let (chunk_count, is_encrypted) = match archive_config.as_encrypted() {
                 Some(_enc_config) => {
                     progress("payload", "Copying encrypted payload...");
-                    let count = copy_payload_chunks(&payload_dir, &site_payload_dir)?;
+                    let count =
+                        copy_payload_chunks(encrypted_dir, &payload_dir, &site_payload_dir)?;
                     (count, true)
                 }
                 None => {
@@ -263,7 +264,7 @@ impl BundleBuilder {
             let attachment_count = if blobs_dir.exists() && blobs_dir.is_dir() {
                 progress("attachments", "Copying encrypted attachments...");
                 let site_blobs_dir = site_dir.join("blobs");
-                copy_blobs_directory(&blobs_dir, &site_blobs_dir)?
+                copy_blobs_directory(encrypted_dir, &blobs_dir, &site_blobs_dir)?
             } else {
                 0
             };
@@ -527,7 +528,9 @@ pub struct BundleResult {
 }
 
 /// Copy payload chunks from source to destination
-fn copy_payload_chunks(src_dir: &Path, dest_dir: &Path) -> Result<usize> {
+fn copy_payload_chunks(src_root: &Path, src_dir: &Path, dest_dir: &Path) -> Result<usize> {
+    ensure_regular_copy_directory_under_root(src_root, src_dir, "Encrypted payload directory")?;
+
     let mut count = 0;
 
     for entry in fs::read_dir(src_dir)? {
@@ -646,8 +649,46 @@ fn ensure_regular_copy_source_under_root(
     Ok(())
 }
 
+fn ensure_regular_copy_directory_under_root(
+    src_root: &Path,
+    src_dir: &Path,
+    label: &str,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(src_dir)
+        .with_context(|| format!("{label} not found: {}", src_dir.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        bail!("{label} must not be a symlink: {}", src_dir.display());
+    }
+    if !file_type.is_dir() {
+        bail!("{label} must be a directory: {}", src_dir.display());
+    }
+
+    let canonical_root = src_root.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve bundle source directory {}",
+            src_root.display()
+        )
+    })?;
+    let canonical_source = src_dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve {label} source directory {}",
+            src_dir.display()
+        )
+    })?;
+    if !canonical_source.starts_with(&canonical_root) {
+        bail!(
+            "{label} resolves outside bundle source directory: {}",
+            src_dir.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Copy encrypted attachment blobs from source to destination
-fn copy_blobs_directory(src_dir: &Path, dest_dir: &Path) -> Result<usize> {
+fn copy_blobs_directory(src_root: &Path, src_dir: &Path, dest_dir: &Path) -> Result<usize> {
+    ensure_regular_copy_directory_under_root(src_root, src_dir, "Attachment blobs directory")?;
     fs::create_dir_all(dest_dir).context("Failed to create blobs directory")?;
 
     let mut count = 0;
@@ -1241,10 +1282,31 @@ mod tests {
         )
         .unwrap();
 
-        let copied = copy_payload_chunks(src.path(), dst.path()).unwrap();
+        let copied = copy_payload_chunks(src.path(), src.path(), dst.path()).unwrap();
         assert_eq!(copied, 1);
         assert!(dst.path().join("chunk-0.bin").exists());
         assert!(!dst.path().join("chunk-linked.bin").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_payload_chunks_rejects_symlinked_source_directory() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        fs::write(outside.path().join("chunk-0.bin"), "outside chunk").unwrap();
+        symlink(outside.path(), source.path().join("payload")).unwrap();
+
+        let err = copy_payload_chunks(source.path(), &source.path().join("payload"), dst.path())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!dst.path().join("chunk-0.bin").exists());
     }
 
     #[test]
@@ -1373,10 +1435,31 @@ mod tests {
         )
         .unwrap();
 
-        let copied = copy_blobs_directory(src.path(), dst.path()).unwrap();
+        let copied = copy_blobs_directory(src.path(), src.path(), dst.path()).unwrap();
         assert_eq!(copied, 1);
         assert!(dst.path().join("blob.bin").exists());
         assert!(!dst.path().join("linked-blob.bin").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_blobs_directory_rejects_symlinked_source_directory() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        fs::write(outside.path().join("blob.bin"), "outside blob").unwrap();
+        symlink(outside.path(), source.path().join("blobs")).unwrap();
+
+        let err = copy_blobs_directory(source.path(), &source.path().join("blobs"), dst.path())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!dst.path().join("blob.bin").exists());
     }
 
     #[test]
