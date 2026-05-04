@@ -754,6 +754,41 @@ pub fn searchable_index_exists(index_path: &Path) -> bool {
     index_path.join("meta.json").exists() || federated_search_manifest_path(index_path).exists()
 }
 
+pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
+    if let Some(manifest) = load_federated_search_manifest_internal(index_path)? {
+        validate_federated_search_manifest(index_path, &manifest, true)?;
+        for shard in manifest.shards {
+            let shard_path = index_path.join(&shard.relative_path);
+            fs_cass_open_search_reader(&shard_path, FsReloadPolicy::Manual)
+                .map_err(map_fs_err)
+                .with_context(|| {
+                    format!(
+                        "opening federated lexical shard reader {}",
+                        shard_path.display()
+                    )
+                })?;
+        }
+        return Ok(());
+    }
+
+    if !index_path.join("meta.json").exists() {
+        return Err(anyhow::anyhow!(
+            "standard lexical index metadata is missing in {}",
+            index_path.display()
+        ));
+    }
+    current_schema_hash_file_matches(index_path)?;
+    fs_cass_open_search_reader(index_path, FsReloadPolicy::Manual)
+        .map_err(map_fs_err)
+        .with_context(|| {
+            format!(
+                "opening standard lexical index reader {}",
+                index_path.display()
+            )
+        })?;
+    Ok(())
+}
+
 pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {
     let meta_path = index_path.join("meta.json");
     if meta_path.exists() {

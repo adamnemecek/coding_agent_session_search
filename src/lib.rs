@@ -8026,6 +8026,447 @@ fn sparse_threshold_for_visible_limit(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchLexicalSelfHeal {
+    action: &'static str,
+    reason: Option<String>,
+    indexed_docs: Option<usize>,
+}
+
+impl SearchLexicalSelfHeal {
+    fn skipped() -> Self {
+        Self {
+            action: "skipped",
+            reason: None,
+            indexed_docs: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchLexicalSelfHealDiagnosis {
+    reason: String,
+    checkpoint_refresh_allowed: bool,
+}
+
+impl SearchLexicalSelfHealDiagnosis {
+    fn rebuild(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            checkpoint_refresh_allowed: false,
+        }
+    }
+
+    fn checkpoint(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            checkpoint_refresh_allowed: true,
+        }
+    }
+}
+
+fn search_lexical_self_heal_diagnosis(
+    index_path: &Path,
+    db_path: &Path,
+) -> CliResult<Option<SearchLexicalSelfHealDiagnosis>> {
+    if !crate::search::tantivy::searchable_index_exists(index_path) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
+            "searchable lexical metadata missing",
+        )));
+    }
+
+    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
+            "lexical artifact contract is unusable: {err:#}"
+        ))));
+    }
+
+    let checkpoint =
+        crate::indexer::load_lexical_rebuild_checkpoint(index_path).map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::LexicalRebuild.kind_str(),
+            message: format!("failed to inspect lexical rebuild checkpoint: {e}"),
+            hint: Some(
+                "cass will rebuild the derived lexical index on the next search attempt"
+                    .to_string(),
+            ),
+            retryable: true,
+        })?;
+    let Some(checkpoint) = checkpoint else {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical rebuild checkpoint missing",
+        )));
+    };
+
+    if !stored_path_identity_matches(&checkpoint.db_path, db_path) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(format!(
+            "lexical checkpoint references {}, but active database is {}",
+            checkpoint.db_path,
+            db_path.display()
+        ))));
+    }
+    if !checkpoint.completed {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical rebuild checkpoint is incomplete",
+        )));
+    }
+    if checkpoint.schema_hash != crate::search::tantivy::SCHEMA_HASH {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical checkpoint schema no longer matches this cass binary",
+        )));
+    }
+    if !crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical checkpoint page-size contract is incompatible with this cass binary",
+        )));
+    }
+
+    Ok(None)
+}
+
+fn search_active_rebuild_wait_duration(timeout_ms: Option<u64>, started_at: Instant) -> Duration {
+    let configured_ms = dotenvy::var("CASS_SEARCH_ACTIVE_REBUILD_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30_000);
+    let configured = Duration::from_millis(configured_ms);
+    timeout_ms
+        .map(Duration::from_millis)
+        .map(|timeout| timeout.saturating_sub(started_at.elapsed()).min(configured))
+        .unwrap_or(configured)
+}
+
+fn wait_for_searchable_index_after_active_rebuild(
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    max_wait: Duration,
+) -> bool {
+    let deadline = Instant::now() + max_wait;
+    loop {
+        let rebuild_active = probe_index_run_lock(data_dir, db_path).active;
+        if crate::search::tantivy::searchable_index_exists(index_path) && !rebuild_active {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(
+            Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn search_lock_busy_error(data_dir: &Path) -> CliError {
+    CliError {
+        code: 7,
+        kind: CliErrorKind::IndexBusy.kind_str(),
+        message: format!(
+            "cass is already repairing the search index in {}",
+            data_dir.display()
+        ),
+        hint: Some("Wait for the active index run to finish; search will retry against the repaired lexical index afterward.".to_string()),
+        retryable: true,
+    }
+}
+
+fn search_lexical_repair_failed_error(reason: &str, err: anyhow::Error) -> CliError {
+    let rendered = format!("{err:#}");
+    if rendered.contains("already holds") {
+        return CliError {
+            code: 7,
+            kind: CliErrorKind::IndexBusy.kind_str(),
+            message: format!(
+                "cass could not start automatic lexical repair because another index run is active: {rendered}"
+            ),
+            hint: Some(
+                "Wait for the active index run to finish, then retry the search.".to_string(),
+            ),
+            retryable: true,
+        };
+    }
+
+    CliError {
+        code: 5,
+        kind: CliErrorKind::LexicalRebuild.kind_str(),
+        message: format!("automatic lexical repair failed after detecting {reason}: {rendered}"),
+        hint: Some("Run 'cass status --json' for the current repair state; retryable derived-index repairs never discard the canonical database.".to_string()),
+        retryable: true,
+    }
+}
+
+fn ensure_lexical_assets_for_search(
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    timeout_ms: Option<u64>,
+    started_at: Instant,
+    dry_run: bool,
+) -> CliResult<SearchLexicalSelfHeal> {
+    if dry_run || !db_path.exists() {
+        return Ok(SearchLexicalSelfHeal::skipped());
+    }
+
+    let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
+    let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
+    if initial_rebuild_active {
+        if initial_index_exists {
+            return Ok(SearchLexicalSelfHeal {
+                action: "active-rebuild-searching-existing-index",
+                reason: Some("lexical repair is already running".to_string()),
+                indexed_docs: None,
+            });
+        }
+
+        let waited = wait_for_searchable_index_after_active_rebuild(
+            data_dir,
+            db_path,
+            index_path,
+            search_active_rebuild_wait_duration(timeout_ms, started_at),
+        );
+        return if waited {
+            Ok(SearchLexicalSelfHeal {
+                action: "waited-for-active-rebuild",
+                reason: Some("foreground search waited for active lexical repair".to_string()),
+                indexed_docs: None,
+            })
+        } else {
+            Err(search_lock_busy_error(data_dir))
+        };
+    }
+
+    let Some(diagnosis) = search_lexical_self_heal_diagnosis(index_path, db_path)? else {
+        return Ok(SearchLexicalSelfHeal::skipped());
+    };
+    let reason = diagnosis.reason;
+
+    if initial_index_exists && diagnosis.checkpoint_refresh_allowed {
+        match crate::indexer::refresh_completed_lexical_rebuild_checkpoint_from_live_index(
+            db_path, data_dir,
+        ) {
+            Ok(()) => {
+                if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+                    return Ok(SearchLexicalSelfHeal {
+                        action: "refreshed-checkpoint",
+                        reason: Some(reason),
+                        indexed_docs: None,
+                    });
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    reason = %reason,
+                    "live lexical checkpoint refresh did not repair search assets; falling back to canonical rebuild"
+                );
+            }
+        }
+    }
+
+    tracing::warn!(
+        reason = %reason,
+        data_dir = %data_dir.display(),
+        db_path = %db_path.display(),
+        "search detected unusable lexical assets; rebuilding from canonical database before running query"
+    );
+    let repair =
+        crate::indexer::repair_lexical_index_from_canonical_db_for_search(db_path, data_dir, None)
+            .map_err(|err| search_lexical_repair_failed_error(&reason, err))?;
+
+    Ok(SearchLexicalSelfHeal {
+        action: "rebuilt-from-canonical-db",
+        reason: Some(reason),
+        indexed_docs: Some(repair.indexed_docs),
+    })
+}
+
+#[cfg(test)]
+mod search_lexical_self_heal_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+    use crate::storage::sqlite::FrankenStorage;
+
+    fn seed_canonical_search_db(data_dir: &Path) -> PathBuf {
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open canonical db");
+        let agent = Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: Some(PathBuf::from("/tmp/search-self-heal")),
+            external_id: Some("search-self-heal-conversation".to_string()),
+            title: Some("Search self heal".to_string()),
+            source_path: data_dir.join("session.jsonl"),
+            started_at: Some(1_770_000_000_000),
+            ended_at: Some(1_770_000_001_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("tester".to_string()),
+                created_at: Some(1_770_000_000_000),
+                content: "autohealneedle should be searchable after derived-index repair"
+                    .to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation");
+        drop(storage);
+        db_path
+    }
+
+    #[test]
+    fn search_self_heal_rebuilds_missing_lexical_index_from_canonical_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        assert!(!crate::search::tantivy::searchable_index_exists(
+            &index_path
+        ));
+
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("search self-heal should rebuild missing lexical index");
+        assert_eq!(repair.action, "rebuilt-from-canonical-db");
+        assert_eq!(repair.indexed_docs, Some(1));
+        assert!(crate::search::tantivy::searchable_index_exists(&index_path));
+
+        let client = SearchClient::open(&index_path, Some(&db_path))
+            .expect("open search client")
+            .expect("repaired index should open");
+        let hits = client
+            .search(
+                "autohealneedle",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect("query repaired index");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("autohealneedle"));
+    }
+
+    #[test]
+    fn search_self_heal_refreshes_stale_checkpoint_when_live_index_matches_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("initial rebuild");
+
+        let state_path = index_path.join(".lexical-rebuild-state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
+                .expect("parse checkpoint");
+        state["schema_hash"] = serde_json::json!("old-schema-hash");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
+        )
+        .expect("write stale checkpoint");
+
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("search self-heal should refresh checkpoint");
+        assert_eq!(repair.action, "refreshed-checkpoint");
+
+        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
+            .expect("load repaired checkpoint")
+            .expect("checkpoint present");
+        assert_eq!(checkpoint.schema_hash, crate::search::tantivy::SCHEMA_HASH);
+        assert!(checkpoint.completed);
+    }
+
+    #[test]
+    fn search_self_heal_rebuilds_incompatible_live_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("initial rebuild");
+
+        std::fs::write(
+            index_path.join("schema_hash.json"),
+            serde_json::to_vec(&serde_json::json!({"schema_hash": "old-schema-hash"}))
+                .expect("serialize stale schema hash"),
+        )
+        .expect("write stale schema hash");
+
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("search self-heal should rebuild incompatible lexical artifact");
+        assert_eq!(repair.action, "rebuilt-from-canonical-db");
+        assert_eq!(repair.indexed_docs, Some(1));
+        crate::search::tantivy::validate_searchable_index_contract(&index_path)
+            .expect("repaired lexical artifact contract");
+
+        let client = SearchClient::open(&index_path, Some(&db_path))
+            .expect("open search client")
+            .expect("repaired index should open");
+        let hits = client
+            .search(
+                "autohealneedle",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect("query rebuilt index");
+        assert_eq!(hits.len(), 1);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -8074,6 +8515,22 @@ fn run_cli_search(
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
+    let search_self_heal = ensure_lexical_assets_for_search(
+        &data_dir,
+        &db_path,
+        &index_path,
+        timeout_ms,
+        start_time,
+        dry_run,
+    )?;
+    if search_self_heal.action != "skipped" {
+        tracing::info!(
+            action = search_self_heal.action,
+            reason = search_self_heal.reason.as_deref(),
+            indexed_docs = search_self_heal.indexed_docs,
+            "search lexical self-heal completed"
+        );
+    }
     let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
     let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
 

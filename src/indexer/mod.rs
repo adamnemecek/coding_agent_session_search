@@ -11447,6 +11447,80 @@ pub(crate) fn rebuild_tantivy_from_db(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchLexicalRepairOutcome {
+    pub indexed_docs: usize,
+}
+
+pub(crate) fn refresh_completed_lexical_rebuild_checkpoint_from_live_index(
+    db_path: &Path,
+    data_dir: &Path,
+) -> Result<()> {
+    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+        format!(
+            "opening database to refresh lexical checkpoint: {}",
+            db_path.display()
+        )
+    })?;
+    refresh_completed_lexical_rebuild_checkpoint(&storage, db_path, data_dir)?;
+    storage.close_without_checkpoint().with_context(|| {
+        format!(
+            "closing readonly database after lexical checkpoint refresh: {}",
+            db_path.display()
+        )
+    })
+}
+
+pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
+    db_path: &Path,
+    data_dir: &Path,
+    progress: Option<Arc<IndexingProgress>>,
+) -> Result<SearchLexicalRepairOutcome> {
+    let index_run_lock = acquire_index_run_lock(data_dir, db_path, SearchMaintenanceMode::Index)?;
+    let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
+        data_dir.to_path_buf(),
+        index_run_lock_heartbeat_interval(),
+        Arc::clone(&index_run_lock.metadata_write_lock),
+    );
+
+    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+        format!(
+            "opening database to repair lexical index for search: {}",
+            db_path.display()
+        )
+    })?;
+    let total_conversations = count_total_conversations_exact(&storage)?;
+    if total_conversations == 0 {
+        let index_path = index_dir(data_dir)?;
+        let _empty_index = TantivyIndex::open_or_create(&index_path).with_context(|| {
+            format!(
+                "creating empty lexical index for empty canonical database: {}",
+                index_path.display()
+            )
+        })?;
+        refresh_completed_lexical_rebuild_checkpoint(&storage, db_path, data_dir)?;
+        storage.close_without_checkpoint().with_context(|| {
+            format!(
+                "closing readonly database after empty search-triggered lexical repair: {}",
+                db_path.display()
+            )
+        })?;
+        return Ok(SearchLexicalRepairOutcome { indexed_docs: 0 });
+    }
+    storage.close_without_checkpoint().with_context(|| {
+        format!(
+            "closing readonly database before search-triggered lexical repair: {}",
+            db_path.display()
+        )
+    })?;
+
+    let rebuild =
+        rebuild_tantivy_from_db_deferred_startup(db_path, data_dir, total_conversations, progress)?;
+    Ok(SearchLexicalRepairOutcome {
+        indexed_docs: rebuild.indexed_docs,
+    })
+}
+
 fn rebuild_tantivy_from_db_deferred_startup(
     db_path: &Path,
     data_dir: &Path,
