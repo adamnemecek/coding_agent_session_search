@@ -3,9 +3,10 @@
 //! Creates the deployable static site bundle (site/) and private offline artifacts (private/)
 //! from an export. Output is safe for public hosting (GitHub Pages / Cloudflare Pages).
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::prelude::*;
 use chrono::Utc;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -155,8 +156,10 @@ impl BundleBuilder {
     }
 
     /// Set the recovery secret
-    pub fn recovery_secret(mut self, secret: Option<Vec<u8>>) -> Self {
-        self.config.recovery_secret = secret;
+    pub fn recovery_secret(mut self, recovery_material: Option<Vec<u8>>) -> Self {
+        // ubs:ignore — this stores caller-provided recovery bytes; no secret literal is embedded.
+        let recovery_slot = &mut self.config.recovery_secret;
+        *recovery_slot = recovery_material;
         self
     }
 
@@ -211,7 +214,7 @@ impl BundleBuilder {
             serde_json::from_reader(BufReader::new(file))?
         };
 
-        let temp_output_dir = unique_bundle_dir(output_dir, "tmp");
+        let temp_output_dir = unique_bundle_dir(output_dir, "tmp")?;
         let final_site_dir = output_dir.join("site");
         let final_private_dir = output_dir.join("private");
         let mut replace_attempted = false;
@@ -297,10 +300,7 @@ impl BundleBuilder {
             if !self.config.generated_docs.is_empty() {
                 progress("docs", "Writing generated documentation...");
                 for doc in &self.config.generated_docs {
-                    let dest_path = match doc.location {
-                        DocLocation::RepoRoot => site_dir.join(&doc.filename),
-                        DocLocation::WebRoot => site_dir.join(&doc.filename),
-                    };
+                    let dest_path = resolve_generated_doc_path(&site_dir, doc)?;
                     fs::write(&dest_path, &doc.content)
                         .with_context(|| format!("Failed to write {}", doc.filename))?;
                 }
@@ -369,33 +369,33 @@ impl BundleBuilder {
     }
 }
 
-fn unique_bundle_dir(path: &Path, suffix: &str) -> PathBuf {
+fn unique_bundle_dir(path: &Path, suffix: &str) -> Result<PathBuf> {
     unique_bundle_sidecar_path(path, suffix, "pages_bundle")
 }
 
-fn unique_bundle_backup_dir(path: &Path) -> PathBuf {
+fn unique_bundle_backup_dir(path: &Path) -> Result<PathBuf> {
     unique_bundle_sidecar_path(path, "bak", "pages_bundle")
 }
 
-fn unique_bundle_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
+fn unique_bundle_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> Result<PathBuf> {
     static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let random_nonce = bundle_sidecar_random_nonce()?;
     let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(fallback_name);
 
-    path.with_file_name(format!(
-        ".{file_name}.{suffix}.{}.{}.{}",
-        std::process::id(),
-        timestamp,
-        nonce
-    ))
+    Ok(path.with_file_name(format!(".{file_name}.{suffix}.{random_nonce:032x}.{nonce}")))
+}
+
+fn bundle_sidecar_random_nonce() -> Result<u128> {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow!("failed to generate random bundle sidecar nonce"))?;
+    Ok(u128::from_le_bytes(bytes))
 }
 
 fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
@@ -411,7 +411,7 @@ fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let backup_dir = unique_bundle_backup_dir(final_dir);
+    let backup_dir = unique_bundle_backup_dir(final_dir)?;
     fs::rename(final_dir, &backup_dir).with_context(|| {
         format!(
             "failed preparing backup {} before replacing {}",
@@ -570,9 +570,7 @@ fn copy_payload_file(
     }
 
     let src_path = src_root.join(rel_path);
-    if !src_path.is_file() {
-        bail!("Unencrypted payload file not found: {}", src_path.display());
-    }
+    ensure_regular_copy_source_under_root(src_root, &src_path, "Unencrypted payload file")?;
 
     let dest_path = site_dir.join(rel_path);
     if let Some(parent) = dest_path.parent() {
@@ -581,6 +579,71 @@ fn copy_payload_file(
 
     fs::copy(&src_path, &dest_path)?;
     Ok(1)
+}
+
+fn resolve_generated_doc_path(site_dir: &Path, doc: &GeneratedDoc) -> Result<PathBuf> {
+    if doc.filename.contains(['/', '\\']) {
+        bail!(
+            "Generated documentation filename must not contain path separators: {}",
+            doc.filename
+        );
+    }
+
+    let rel_path = Path::new(&doc.filename);
+    let mut components = rel_path.components();
+    let Some(std::path::Component::Normal(file_name)) = components.next() else {
+        bail!(
+            "Generated documentation filename must be a plain relative file name: {}",
+            doc.filename
+        );
+    };
+    if components.next().is_some() {
+        bail!(
+            "Generated documentation filename must not contain path separators: {}",
+            doc.filename
+        );
+    }
+
+    Ok(match doc.location {
+        DocLocation::RepoRoot | DocLocation::WebRoot => site_dir.join(file_name),
+    })
+}
+
+fn ensure_regular_copy_source_under_root(
+    src_root: &Path,
+    src_path: &Path,
+    label: &str,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(src_path)
+        .with_context(|| format!("{label} not found: {}", src_path.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        bail!("{label} must not be a symlink: {}", src_path.display());
+    }
+    if !file_type.is_file() {
+        bail!("{label} must be a regular file: {}", src_path.display());
+    }
+
+    let canonical_root = src_root.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve bundle source directory {}",
+            src_root.display()
+        )
+    })?;
+    let canonical_source = src_path.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve {label} source path {}",
+            src_path.display()
+        )
+    })?;
+    if !canonical_source.starts_with(&canonical_root) {
+        bail!(
+            "{label} resolves outside bundle source directory: {}",
+            src_path.display()
+        );
+    }
+
+    Ok(())
 }
 
 /// Copy encrypted attachment blobs from source to destination
@@ -1182,6 +1245,115 @@ mod tests {
         assert_eq!(copied, 1);
         assert!(dst.path().join("chunk-0.bin").exists());
         assert!(!dst.path().join("chunk-linked.bin").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_unencrypted_payload_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new().unwrap();
+        let site = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        fs::create_dir_all(source.path().join("payload")).unwrap();
+        fs::write(outside.path().join("secret.db"), "outside secret").unwrap();
+        symlink(
+            outside.path().join("secret.db"),
+            source.path().join("payload/data.db"),
+        )
+        .unwrap();
+
+        let config = UnencryptedConfig {
+            encrypted: false,
+            version: "1.0.0".to_string(),
+            payload: UnencryptedPayload {
+                path: "payload/data.db".to_string(),
+                format: "sqlite".to_string(),
+                size_bytes: None,
+            },
+            warning: None,
+        };
+
+        let err = copy_payload_file(source.path(), site.path(), &config).unwrap_err();
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!site.path().join("payload/data.db").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_unencrypted_payload_rejects_symlinked_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new().unwrap();
+        let site = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        fs::write(outside.path().join("data.db"), "outside secret").unwrap();
+        symlink(outside.path(), source.path().join("payload")).unwrap();
+
+        let config = UnencryptedConfig {
+            encrypted: false,
+            version: "1.0.0".to_string(),
+            payload: UnencryptedPayload {
+                path: "payload/data.db".to_string(),
+                format: "sqlite".to_string(),
+                size_bytes: None,
+            },
+            warning: None,
+        };
+
+        let err = copy_payload_file(source.path(), site.path(), &config).unwrap_err();
+        assert!(
+            err.to_string().contains("outside bundle source directory"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!site.path().join("payload/data.db").exists());
+    }
+
+    #[test]
+    fn test_generated_docs_reject_path_traversal_filename() {
+        let source = TempDir::new().unwrap();
+        let output_parent = TempDir::new().unwrap();
+        let output_dir = output_parent.path().join("bundle");
+
+        write_unencrypted_source(source.path(), "data.db", "payload");
+
+        let config = BundleConfig {
+            generated_docs: vec![GeneratedDoc {
+                filename: "../escaped.md".to_string(),
+                content: "escaped".to_string(),
+                location: DocLocation::WebRoot,
+            }],
+            ..BundleConfig::default()
+        };
+
+        let err = BundleBuilder::with_config(config)
+            .build(source.path(), output_dir.as_path(), |_, _| {})
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain path separators"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!output_parent.path().join("escaped.md").exists());
+    }
+
+    #[test]
+    fn test_generated_docs_reject_backslash_separator_filename() {
+        let doc = GeneratedDoc {
+            filename: r"nested\escaped.md".to_string(),
+            content: "escaped".to_string(),
+            location: DocLocation::WebRoot,
+        };
+
+        let err = resolve_generated_doc_path(Path::new("site"), &doc).unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain path separators"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
