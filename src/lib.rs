@@ -14514,6 +14514,54 @@ fn doctor_raw_mirror_invalid_manifest_report(
     }
 }
 
+fn doctor_raw_mirror_loaded_invalid_manifest_report(
+    data_dir: &Path,
+    manifest_path: &Path,
+    blob_path: &Path,
+    manifest: DoctorRawMirrorManifestFile,
+    manifest_checksum_status: DoctorArtifactChecksumStatus,
+    reason: String,
+) -> DoctorRawMirrorManifestReport {
+    let manifest_path_string = manifest_path.display().to_string();
+    let blob_path_string = blob_path.display().to_string();
+    DoctorRawMirrorManifestReport {
+        manifest_id: manifest.manifest_id,
+        manifest_path: manifest_path_string.clone(),
+        redacted_manifest_path: doctor_redacted_path(&manifest_path_string, data_dir),
+        blob_relative_path: manifest.blob_relative_path,
+        blob_path: blob_path_string.clone(),
+        redacted_blob_path: doctor_redacted_path(&blob_path_string, data_dir),
+        blob_blake3: manifest.blob_blake3,
+        blob_size_bytes: manifest.blob_size_bytes,
+        provider: doctor_normalized_provider_slug(&manifest.provider),
+        source_id: manifest.source_id,
+        origin_kind: manifest.origin_kind,
+        origin_host: manifest.origin_host,
+        original_path: manifest.original_path.clone(),
+        redacted_original_path: if manifest.redacted_original_path.trim().is_empty() {
+            doctor_redacted_path(&manifest.original_path, data_dir)
+        } else {
+            manifest.redacted_original_path
+        },
+        original_path_blake3: manifest.original_path_blake3,
+        captured_at_ms: manifest.captured_at_ms,
+        source_mtime_ms: manifest.source_mtime_ms,
+        source_size_bytes: manifest.source_size_bytes,
+        compression_state: manifest.compression.state,
+        encryption_state: manifest.encryption.state,
+        db_link_count: doctor_raw_mirror_unique_db_links(&manifest.db_links).len(),
+        upstream_path_exists: if manifest.original_path.trim().is_empty() {
+            None
+        } else {
+            Some(Path::new(&manifest.original_path).exists())
+        },
+        status: "invalid_manifest".to_string(),
+        blob_checksum_status: DoctorArtifactChecksumStatus::Mismatched,
+        manifest_checksum_status,
+        invalid_reason: Some(reason),
+    }
+}
+
 fn doctor_verify_raw_mirror_manifest(
     data_dir: &Path,
     root: &Path,
@@ -14601,7 +14649,14 @@ fn doctor_verify_raw_mirror_manifest(
     };
 
     if path_has_symlink_below_root(&blob_path, root) {
-        return invalid("blob path contains a symlinked component".to_string());
+        return doctor_raw_mirror_loaded_invalid_manifest_report(
+            data_dir,
+            manifest_path,
+            &blob_path,
+            manifest,
+            manifest_checksum_status,
+            "blob path contains a symlinked component".to_string(),
+        );
     }
 
     let (blob_checksum_status, status, invalid_reason) = match std::fs::symlink_metadata(&blob_path)
@@ -17389,6 +17444,14 @@ mod doctor_asset_taxonomy_tests {
             report.manifests[0].invalid_reason.as_deref(),
             Some("blob path contains a symlinked component"),
             "raw mirror verification must not follow symlinked blob ancestors"
+        );
+        assert_eq!(
+            report.manifests[0].manifest_id, manifest.manifest_id,
+            "symlink rejection should preserve manifest identity for diagnostics"
+        );
+        assert!(
+            !report.manifests[0].blob_path.is_empty(),
+            "symlink rejection should keep the rejected blob path visible in the report"
         );
         assert_eq!(
             report.summary.verified_blob_count, 0,
