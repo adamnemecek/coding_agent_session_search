@@ -12241,6 +12241,7 @@ struct DoctorAssetSafety {
     safe_to_gc_allowed: bool,
 }
 
+#[cfg(test)]
 const DOCTOR_ASSET_ALL_OPERATIONS: &[DoctorAssetOperation] = &[
     DoctorAssetOperation::Read,
     DoctorAssetOperation::Backup,
@@ -12900,8 +12901,10 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
                     .then_with(|| left.0.cmp(&right.0))
             });
             for (index, (path, observation)) in retained_entries.into_iter().enumerate() {
-                let safe_to_gc =
-                    doctor_asset_safe_to_gc(DoctorAssetClass::RetainedPublishBackup, index >= retention_limit);
+                let safe_to_gc = doctor_asset_safe_to_gc(
+                    DoctorAssetClass::RetainedPublishBackup,
+                    index >= retention_limit,
+                );
                 let gc_reason = if safe_to_gc {
                     format!(
                         "retained lexical publish backup falls outside retention cap ({retention_limit})"
@@ -12987,6 +12990,9 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
                 "cleanup dry-run marks the full retained generation reclaimable ({} bytes)",
                 reclaimable_bytes
             )
+        } else if candidate_safe_to_gc {
+            "asset taxonomy retains quarantined lexical generations for operator inspection"
+                .to_string()
         } else if inspection_required {
             "cleanup dry-run requires inspection before garbage collection".to_string()
         } else if reclaimable_bytes == 0 {

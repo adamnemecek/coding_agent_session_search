@@ -357,6 +357,42 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
     );
 
     let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let taxonomy = payload["asset_taxonomy"]
+        .as_array()
+        .expect("doctor exposes asset taxonomy");
+    assert!(
+        taxonomy.iter().any(|entry| {
+            entry["asset_class"].as_str() == Some("source_session_log")
+                && entry["precious"].as_bool() == Some(true)
+                && entry["auto_delete_allowed"].as_bool() == Some(false)
+                && entry["safe_to_gc_allowed"].as_bool() == Some(false)
+        }),
+        "source logs must be classified as precious non-delete evidence"
+    );
+    assert!(
+        taxonomy.iter().any(|entry| {
+            entry["asset_class"].as_str() == Some("support_bundle")
+                && entry["allowed_operations"]
+                    .as_array()
+                    .expect("support allowed operations")
+                    .iter()
+                    .any(|operation| operation.as_str() == Some("redact"))
+                && !entry["allowed_operations"]
+                    .as_array()
+                    .expect("support allowed operations")
+                    .iter()
+                    .any(|operation| operation.as_str() == Some("prune_reclaim"))
+        }),
+        "support bundles must allow redaction without becoming cleanup candidates"
+    );
+    assert!(
+        taxonomy.iter().any(|entry| {
+            entry["asset_class"].as_str() == Some("reclaimable_derived_cache")
+                && entry["safety_classification"].as_str() == Some("derived_reclaimable")
+                && entry["safe_to_gc_allowed"].as_bool() == Some(true)
+        }),
+        "doctor should expose the explicit derived-only reclaimable class"
+    );
     let quarantine = &payload["quarantine"];
 
     assert_eq!(
@@ -393,6 +429,9 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
                 .as_str()
                 .unwrap_or_default()
                 .contains("prior-live-older")
+                && entry["asset_class"].as_str() == Some("retained_publish_backup")
+                && entry["safety_classification"].as_str() == Some("derived_reclaimable")
+                && entry["auto_delete_allowed"].as_bool() == Some(true)
                 && entry["safe_to_gc"].as_bool() == Some(true)
         }),
         "older retained publish backup should be GC-eligible in doctor JSON"
@@ -403,6 +442,7 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
                 .as_str()
                 .unwrap_or_default()
                 .contains("prior-live-newer")
+                && entry["asset_class"].as_str() == Some("retained_publish_backup")
                 && entry["safe_to_gc"].as_bool() == Some(false)
         }),
         "newest retained publish backup should remain protected in doctor JSON"
@@ -413,6 +453,15 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
         .expect("lexical generations array");
     assert_eq!(generations.len(), 1, "expected one quarantined generation");
     assert_eq!(generations[0]["generation_id"], "gen-quarantined");
+    assert_eq!(
+        generations[0]["asset_class"].as_str(),
+        Some("quarantined_lexical_generation")
+    );
+    assert_eq!(
+        generations[0]["safety_classification"].as_str(),
+        Some("diagnostic_evidence")
+    );
+    assert_eq!(generations[0]["safe_to_gc_allowed"].as_bool(), Some(false));
     assert_eq!(generations[0]["safe_to_gc"].as_bool(), Some(false));
     assert_eq!(generations[0]["reclaimable_bytes"].as_u64(), Some(0));
     assert!(
@@ -430,6 +479,8 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
             entry["artifact_kind"].as_str() == Some("lexical_shard")
                 && entry["generation_id"].as_str() == Some("gen-quarantined")
                 && entry["shard_id"].as_str() == Some("shard-a")
+                && entry["asset_class"].as_str() == Some("quarantined_lexical_shard")
+                && entry["safety_classification"].as_str() == Some("diagnostic_evidence")
                 && entry["gc_reason"].as_str() == Some("validation_failed")
         }),
         "doctor JSON should expose each quarantined shard with a gc reason"
@@ -644,6 +695,14 @@ fn doctor_fix_preserves_pinned_superseded_generation() {
     let action = &actions[0];
     assert_eq!(action["artifact_kind"].as_str(), Some("lexical_generation"));
     assert_eq!(action["generation_id"].as_str(), Some("gen-partly-pinned"));
+    assert_eq!(
+        action["asset_class"].as_str(),
+        Some("reclaimable_derived_cache")
+    );
+    assert_eq!(
+        action["safety_classification"].as_str(),
+        Some("derived_reclaimable")
+    );
     assert_eq!(action["applied"].as_bool(), Some(false));
     assert_eq!(action["skipped"].as_bool(), Some(true));
     assert!(
@@ -839,6 +898,9 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
     assert!(
         actions.iter().any(|action| {
             action["artifact_kind"].as_str() == Some("retained_publish_backup")
+                && action["asset_class"].as_str() == Some("retained_publish_backup")
+                && action["safety_classification"].as_str() == Some("derived_reclaimable")
+                && action["safe_to_gc_allowed"].as_bool() == Some(true)
                 && action["applied"].as_bool() == Some(true)
         }),
         "apply result should include retained publish backup prune action"
@@ -847,6 +909,9 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
         actions.iter().any(|action| {
             action["artifact_kind"].as_str() == Some("lexical_generation")
                 && action["generation_id"].as_str() == Some("gen-superseded")
+                && action["asset_class"].as_str() == Some("reclaimable_derived_cache")
+                && action["safety_classification"].as_str() == Some("derived_reclaimable")
+                && action["safe_to_gc_allowed"].as_bool() == Some(true)
                 && action["applied"].as_bool() == Some(true)
         }),
         "apply result should include superseded generation prune action"
@@ -1110,6 +1175,7 @@ fn doctor_fix_refuses_symlinked_retained_publish_backup_targets() {
     assert!(
         actions.iter().any(|action| {
             action["artifact_kind"].as_str() == Some("retained_publish_backup")
+                && action["asset_class"].as_str() == Some("retained_publish_backup")
                 && action["path"]
                     .as_str()
                     .unwrap_or_default()
