@@ -14702,6 +14702,109 @@ struct DoctorSourceIdentityInventoryBuilder {
     unknown_mapping_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DoctorSourceAuthorityKind {
+    CanonicalArchiveDb,
+    VerifiedRawMirror,
+    VerifiedBackupBundle,
+    VerifiedCandidateArchive,
+    LiveUpstreamSource,
+    RemoteSyncCopy,
+    DerivedLexicalIndex,
+    DerivedSemanticIndex,
+    SupportBundle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DoctorSourceAuthorityDecision {
+    ReadOnly,
+    CandidateOnly,
+    Promotable,
+    Refused,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DoctorSourceAuthorityPolicy {
+    authority: DoctorSourceAuthorityKind,
+    repairs: &'static [DoctorAssetClass],
+    required_evidence: &'static [&'static str],
+    refuses_when: &'static [&'static str],
+    decision_when_valid: DoctorSourceAuthorityDecision,
+    notes: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorSourceAuthorityMatrixEntry {
+    authority: DoctorSourceAuthorityKind,
+    repairs: Vec<DoctorAssetClass>,
+    required_evidence: Vec<&'static str>,
+    refuses_when: Vec<&'static str>,
+    decision_when_valid: DoctorSourceAuthorityDecision,
+    notes: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorSourceAuthorityCandidate {
+    authority: DoctorSourceAuthorityKind,
+    decision: DoctorSourceAuthorityDecision,
+    reason: String,
+    repairs: Vec<DoctorAssetClass>,
+    coverage_delta: i64,
+    freshness_delta_ms: Option<i64>,
+    checksum_status: DoctorArtifactChecksumStatus,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DoctorSourceAuthorityCoverageDelta {
+    archive_conversation_count: usize,
+    visible_local_source_conversation_count: usize,
+    missing_current_source_count: usize,
+    remote_source_count: usize,
+    unknown_mapping_count: usize,
+    raw_mirror_db_link_count: usize,
+    visible_local_source_minus_archive: i64,
+    raw_mirror_links_minus_archive: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DoctorSourceAuthorityFreshnessDelta {
+    archive_db_modified_at_ms: Option<i64>,
+    newest_raw_mirror_capture_at_ms: Option<i64>,
+    newest_raw_mirror_source_mtime_ms: Option<i64>,
+    raw_mirror_capture_minus_archive_db_ms: Option<i64>,
+    freshness_state: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorSourceAuthorityChecksumEvidence {
+    raw_mirror_status: String,
+    raw_mirror_manifest_count: usize,
+    raw_mirror_verified_blob_count: usize,
+    raw_mirror_missing_blob_count: usize,
+    raw_mirror_checksum_mismatch_count: usize,
+    raw_mirror_manifest_checksum_mismatch_count: usize,
+    raw_mirror_manifest_checksum_not_recorded_count: usize,
+    raw_mirror_invalid_manifest_count: usize,
+    summary_status: DoctorArtifactChecksumStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorSourceAuthorityReport {
+    schema_version: u32,
+    decision: DoctorSourceAuthorityDecision,
+    selected_authority: Option<DoctorSourceAuthorityKind>,
+    selected_authorities: Vec<DoctorSourceAuthorityCandidate>,
+    rejected_authorities: Vec<DoctorSourceAuthorityCandidate>,
+    coverage_delta: DoctorSourceAuthorityCoverageDelta,
+    freshness_delta: DoctorSourceAuthorityFreshnessDelta,
+    checksum_evidence: DoctorSourceAuthorityChecksumEvidence,
+    matrix: Vec<DoctorSourceAuthorityMatrixEntry>,
+    notes: Vec<String>,
+}
+
 fn doctor_normalized_provider_slug(provider: &str) -> String {
     let normalized = provider.trim().to_ascii_lowercase().replace('-', "_");
     if normalized.is_empty() {
@@ -14740,6 +14843,189 @@ fn doctor_provider_prune_risk(provider: &str) -> DoctorProviderPruneRisk {
             note: "No provider-specific pruning behavior is encoded yet; monitor source coverage over time.",
         },
     }
+}
+
+const DOCTOR_AUTHORITY_ARCHIVE_REPAIRS: &[DoctorAssetClass] = &[
+    DoctorAssetClass::DerivedLexicalIndex,
+    DoctorAssetClass::DerivedSemanticIndex,
+    DoctorAssetClass::SourceCoverageLedger,
+];
+const DOCTOR_AUTHORITY_RAW_MIRROR_REPAIRS: &[DoctorAssetClass] = &[
+    DoctorAssetClass::CanonicalArchiveDb,
+    DoctorAssetClass::SourceCoverageLedger,
+];
+const DOCTOR_AUTHORITY_BACKUP_REPAIRS: &[DoctorAssetClass] = &[
+    DoctorAssetClass::CanonicalArchiveDb,
+    DoctorAssetClass::ArchiveDbSidecar,
+    DoctorAssetClass::SourceCoverageLedger,
+];
+const DOCTOR_AUTHORITY_CANDIDATE_REPAIRS: &[DoctorAssetClass] = &[
+    DoctorAssetClass::CanonicalArchiveDb,
+    DoctorAssetClass::ArchiveDbSidecar,
+    DoctorAssetClass::DerivedLexicalIndex,
+    DoctorAssetClass::DerivedSemanticIndex,
+];
+const DOCTOR_AUTHORITY_LIVE_SOURCE_REPAIRS: &[DoctorAssetClass] = &[
+    DoctorAssetClass::RawMirrorBlob,
+    DoctorAssetClass::SourceCoverageLedger,
+];
+const DOCTOR_AUTHORITY_REMOTE_COPY_REPAIRS: &[DoctorAssetClass] = &[
+    DoctorAssetClass::CanonicalArchiveDb,
+    DoctorAssetClass::SourceCoverageLedger,
+];
+const DOCTOR_AUTHORITY_NO_REPAIRS: &[DoctorAssetClass] = &[];
+
+const DOCTOR_SOURCE_AUTHORITY_POLICY_TABLE: &[DoctorSourceAuthorityPolicy] = &[
+    DoctorSourceAuthorityPolicy {
+        authority: DoctorSourceAuthorityKind::CanonicalArchiveDb,
+        repairs: DOCTOR_AUTHORITY_ARCHIVE_REPAIRS,
+        required_evidence: &[
+            "archive-db-opens",
+            "conversation-count-known",
+            "repair-target-is-derived-or-ledger",
+        ],
+        refuses_when: &[
+            "archive-db-corrupt",
+            "archive-db-missing",
+            "candidate-would-reduce-coverage",
+        ],
+        decision_when_valid: DoctorSourceAuthorityDecision::ReadOnly,
+        notes: "The existing cass archive is the source of truth for derived asset rebuilds and must not be replaced by smaller live source coverage.",
+    },
+    DoctorSourceAuthorityPolicy {
+        authority: DoctorSourceAuthorityKind::VerifiedRawMirror,
+        repairs: DOCTOR_AUTHORITY_RAW_MIRROR_REPAIRS,
+        required_evidence: &[
+            "manifest-checksum-matched",
+            "blob-checksum-matched",
+            "source-identity-recorded",
+            "candidate-coverage-nondecreasing-before-promotion",
+        ],
+        refuses_when: &[
+            "mirror-absent",
+            "blob-missing",
+            "checksum-mismatch",
+            "manifest-invalid",
+            "candidate-coverage-shrinks",
+        ],
+        decision_when_valid: DoctorSourceAuthorityDecision::CandidateOnly,
+        notes: "A verified raw mirror can seed a staged reconstruction candidate; promotion still needs coverage and checksum verification.",
+    },
+    DoctorSourceAuthorityPolicy {
+        authority: DoctorSourceAuthorityKind::VerifiedBackupBundle,
+        repairs: DOCTOR_AUTHORITY_BACKUP_REPAIRS,
+        required_evidence: &[
+            "backup-manifest-present",
+            "backup-checksums-matched",
+            "restore-rehearsal-receipt",
+        ],
+        refuses_when: &[
+            "backup-unverified",
+            "backup-stale",
+            "backup-coverage-unknown",
+            "restore-rehearsal-missing",
+        ],
+        decision_when_valid: DoctorSourceAuthorityDecision::CandidateOnly,
+        notes: "Backups are evidence until verified; restore apply should consume a rehearsal receipt, not a filename guess.",
+    },
+    DoctorSourceAuthorityPolicy {
+        authority: DoctorSourceAuthorityKind::VerifiedCandidateArchive,
+        repairs: DOCTOR_AUTHORITY_CANDIDATE_REPAIRS,
+        required_evidence: &[
+            "candidate-db-opens",
+            "candidate-checksums-matched",
+            "coverage-nondecreasing",
+            "promotion-plan-fingerprint-approved",
+        ],
+        refuses_when: &[
+            "candidate-incomplete",
+            "candidate-checksum-mismatch",
+            "candidate-coverage-lower-than-current-archive",
+        ],
+        decision_when_valid: DoctorSourceAuthorityDecision::Promotable,
+        notes: "Only an isolated candidate with non-decreasing coverage may become promotable.",
+    },
+    DoctorSourceAuthorityPolicy {
+        authority: DoctorSourceAuthorityKind::LiveUpstreamSource,
+        repairs: DOCTOR_AUTHORITY_LIVE_SOURCE_REPAIRS,
+        required_evidence: &[
+            "source-path-visible",
+            "provider-identity-known",
+            "coverage-continuity-proven",
+        ],
+        refuses_when: &[
+            "source-path-missing",
+            "provider-mapping-unknown",
+            "provider-pruning-risk",
+            "coverage-shrinks-relative-to-archive",
+        ],
+        decision_when_valid: DoctorSourceAuthorityDecision::CandidateOnly,
+        notes: "Live provider logs are useful capture inputs, but they do not outrank the archive when pruning risk is present.",
+    },
+    DoctorSourceAuthorityPolicy {
+        authority: DoctorSourceAuthorityKind::RemoteSyncCopy,
+        repairs: DOCTOR_AUTHORITY_REMOTE_COPY_REPAIRS,
+        required_evidence: &[
+            "source-id-matched",
+            "origin-host-matched",
+            "generation-or-checksum-matched",
+            "coverage-nondecreasing",
+        ],
+        refuses_when: &[
+            "remote-identity-ambiguous",
+            "remote-generation-unverified",
+            "remote-copy-coverage-unknown",
+        ],
+        decision_when_valid: DoctorSourceAuthorityDecision::CandidateOnly,
+        notes: "Remote copies need identity, generation, and checksum evidence before they can seed repair.",
+    },
+    DoctorSourceAuthorityPolicy {
+        authority: DoctorSourceAuthorityKind::DerivedLexicalIndex,
+        repairs: DOCTOR_AUTHORITY_NO_REPAIRS,
+        required_evidence: &[],
+        refuses_when: &["derived-index-is-not-archive-authority"],
+        decision_when_valid: DoctorSourceAuthorityDecision::Refused,
+        notes: "Lexical indexes are rebuildable outputs, never archive reconstruction authorities.",
+    },
+    DoctorSourceAuthorityPolicy {
+        authority: DoctorSourceAuthorityKind::DerivedSemanticIndex,
+        repairs: DOCTOR_AUTHORITY_NO_REPAIRS,
+        required_evidence: &[],
+        refuses_when: &["derived-index-is-not-archive-authority"],
+        decision_when_valid: DoctorSourceAuthorityDecision::Refused,
+        notes: "Semantic/vector indexes are rebuildable outputs, never archive reconstruction authorities.",
+    },
+    DoctorSourceAuthorityPolicy {
+        authority: DoctorSourceAuthorityKind::SupportBundle,
+        repairs: DOCTOR_AUTHORITY_NO_REPAIRS,
+        required_evidence: &["manifest-only-diagnostic-artifact"],
+        refuses_when: &["support-bundle-is-redacted-diagnostic-evidence"],
+        decision_when_valid: DoctorSourceAuthorityDecision::Refused,
+        notes: "Support bundles are for diagnostics and sharing; they must not become repair authorities.",
+    },
+];
+
+fn doctor_source_authority_policy(
+    authority: DoctorSourceAuthorityKind,
+) -> &'static DoctorSourceAuthorityPolicy {
+    DOCTOR_SOURCE_AUTHORITY_POLICY_TABLE
+        .iter()
+        .find(|policy| policy.authority == authority)
+        .expect("doctor source authority policy table must cover every authority")
+}
+
+fn doctor_source_authority_matrix_report() -> Vec<DoctorSourceAuthorityMatrixEntry> {
+    DOCTOR_SOURCE_AUTHORITY_POLICY_TABLE
+        .iter()
+        .map(|policy| DoctorSourceAuthorityMatrixEntry {
+            authority: policy.authority,
+            repairs: policy.repairs.to_vec(),
+            required_evidence: policy.required_evidence.to_vec(),
+            refuses_when: policy.refuses_when.to_vec(),
+            decision_when_valid: policy.decision_when_valid,
+            notes: policy.notes,
+        })
+        .collect()
 }
 
 fn doctor_source_inventory_stable_id(
@@ -15892,6 +16178,295 @@ fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
     };
 
     report
+}
+
+fn doctor_raw_mirror_summary_checksum_status(
+    raw_mirror: &DoctorRawMirrorReport,
+) -> DoctorArtifactChecksumStatus {
+    if raw_mirror.summary.missing_blob_count > 0 {
+        DoctorArtifactChecksumStatus::Missing
+    } else if raw_mirror.summary.checksum_mismatch_count > 0
+        || raw_mirror.summary.manifest_checksum_mismatch_count > 0
+        || raw_mirror.summary.invalid_manifest_count > 0
+    {
+        DoctorArtifactChecksumStatus::Mismatched
+    } else if raw_mirror.summary.verified_blob_count > 0
+        && raw_mirror.summary.manifest_checksum_not_recorded_count == 0
+    {
+        DoctorArtifactChecksumStatus::Matched
+    } else {
+        DoctorArtifactChecksumStatus::NotRecorded
+    }
+}
+
+fn doctor_source_authority_candidate(
+    authority: DoctorSourceAuthorityKind,
+    decision: DoctorSourceAuthorityDecision,
+    reason: String,
+    coverage_delta: i64,
+    freshness_delta_ms: Option<i64>,
+    checksum_status: DoctorArtifactChecksumStatus,
+    evidence: Vec<String>,
+) -> DoctorSourceAuthorityCandidate {
+    let policy = doctor_source_authority_policy(authority);
+    DoctorSourceAuthorityCandidate {
+        authority,
+        decision,
+        reason,
+        repairs: policy.repairs.to_vec(),
+        coverage_delta,
+        freshness_delta_ms,
+        checksum_status,
+        evidence,
+    }
+}
+
+fn doctor_source_authority_checksum_evidence(
+    raw_mirror: &DoctorRawMirrorReport,
+) -> DoctorSourceAuthorityChecksumEvidence {
+    DoctorSourceAuthorityChecksumEvidence {
+        raw_mirror_status: raw_mirror.status.clone(),
+        raw_mirror_manifest_count: raw_mirror.summary.manifest_count,
+        raw_mirror_verified_blob_count: raw_mirror.summary.verified_blob_count,
+        raw_mirror_missing_blob_count: raw_mirror.summary.missing_blob_count,
+        raw_mirror_checksum_mismatch_count: raw_mirror.summary.checksum_mismatch_count,
+        raw_mirror_manifest_checksum_mismatch_count: raw_mirror
+            .summary
+            .manifest_checksum_mismatch_count,
+        raw_mirror_manifest_checksum_not_recorded_count: raw_mirror
+            .summary
+            .manifest_checksum_not_recorded_count,
+        raw_mirror_invalid_manifest_count: raw_mirror.summary.invalid_manifest_count,
+        summary_status: doctor_raw_mirror_summary_checksum_status(raw_mirror),
+    }
+}
+
+fn doctor_source_authority_coverage_delta(
+    source_inventory: &DoctorSourceInventoryReport,
+    raw_mirror: &DoctorRawMirrorReport,
+) -> DoctorSourceAuthorityCoverageDelta {
+    let visible_local_source_conversation_count = source_inventory
+        .local_source_count
+        .saturating_sub(source_inventory.missing_current_source_count);
+    let raw_mirror_db_link_count = raw_mirror
+        .manifests
+        .iter()
+        .filter(|manifest| {
+            manifest.status == "verified"
+                && manifest.blob_checksum_status == DoctorArtifactChecksumStatus::Matched
+                && manifest.manifest_checksum_status == DoctorArtifactChecksumStatus::Matched
+        })
+        .map(|manifest| manifest.db_link_count)
+        .sum::<usize>();
+    DoctorSourceAuthorityCoverageDelta {
+        archive_conversation_count: source_inventory.total_indexed_conversations,
+        visible_local_source_conversation_count,
+        missing_current_source_count: source_inventory.missing_current_source_count,
+        remote_source_count: source_inventory.remote_source_count,
+        unknown_mapping_count: source_inventory.unknown_mapping_count,
+        raw_mirror_db_link_count,
+        visible_local_source_minus_archive: visible_local_source_conversation_count as i64
+            - source_inventory.local_source_count as i64,
+        raw_mirror_links_minus_archive: raw_mirror_db_link_count as i64
+            - source_inventory.total_indexed_conversations as i64,
+    }
+}
+
+fn doctor_source_authority_freshness_delta(
+    db_path: &Path,
+    raw_mirror: &DoctorRawMirrorReport,
+) -> DoctorSourceAuthorityFreshnessDelta {
+    let archive_db_modified_at_ms = std::fs::metadata(db_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(system_time_to_unix_ms);
+    let newest_raw_mirror_capture_at_ms =
+        raw_mirror.manifests.iter().map(|m| m.captured_at_ms).max();
+    let newest_raw_mirror_source_mtime_ms = raw_mirror
+        .manifests
+        .iter()
+        .filter_map(|manifest| manifest.source_mtime_ms)
+        .max();
+    let raw_mirror_capture_minus_archive_db_ms =
+        match (newest_raw_mirror_capture_at_ms, archive_db_modified_at_ms) {
+            (Some(raw), Some(db)) => Some(raw.saturating_sub(db)),
+            _ => None,
+        };
+    let freshness_state = if archive_db_modified_at_ms.is_none() {
+        "archive-db-missing".to_string()
+    } else if raw_mirror_capture_minus_archive_db_ms.is_some_and(|delta| delta > 0) {
+        "raw-mirror-newer-than-archive-db".to_string()
+    } else {
+        "archive-db-current-or-not-compared".to_string()
+    };
+    DoctorSourceAuthorityFreshnessDelta {
+        archive_db_modified_at_ms,
+        newest_raw_mirror_capture_at_ms,
+        newest_raw_mirror_source_mtime_ms,
+        raw_mirror_capture_minus_archive_db_ms,
+        freshness_state,
+    }
+}
+
+fn build_doctor_source_authority_report(
+    db_path: &Path,
+    source_inventory: &DoctorSourceInventoryReport,
+    raw_mirror: &DoctorRawMirrorReport,
+) -> DoctorSourceAuthorityReport {
+    let coverage_delta = doctor_source_authority_coverage_delta(source_inventory, raw_mirror);
+    let freshness_delta = doctor_source_authority_freshness_delta(db_path, raw_mirror);
+    let checksum_evidence = doctor_source_authority_checksum_evidence(raw_mirror);
+    let raw_mirror_trusted = raw_mirror.status == "verified"
+        && checksum_evidence.summary_status == DoctorArtifactChecksumStatus::Matched;
+    let archive_available =
+        source_inventory.db_available && source_inventory.total_indexed_conversations > 0;
+    let mut selected_authorities = Vec::new();
+    let mut rejected_authorities = Vec::new();
+
+    if archive_available {
+        selected_authorities.push(doctor_source_authority_candidate(
+            DoctorSourceAuthorityKind::CanonicalArchiveDb,
+            DoctorSourceAuthorityDecision::ReadOnly,
+            format!(
+                "archive database currently contains {} indexed conversation(s) and is authoritative for derived rebuild decisions",
+                source_inventory.total_indexed_conversations
+            ),
+            0,
+            None,
+            DoctorArtifactChecksumStatus::NotRecorded,
+            vec![
+                "archive-db-opened".to_string(),
+                format!(
+                    "archive-conversation-count={}",
+                    source_inventory.total_indexed_conversations
+                ),
+            ],
+        ));
+    }
+
+    if raw_mirror_trusted {
+        let reason = if source_inventory.missing_current_source_count > 0 {
+            format!(
+                "verified raw mirror evidence remains available while {} indexed local conversation(s) have missing upstream files",
+                source_inventory.missing_current_source_count
+            )
+        } else {
+            "verified raw mirror evidence can seed reconstruction candidates when later repair modes need it".to_string()
+        };
+        selected_authorities.push(doctor_source_authority_candidate(
+            DoctorSourceAuthorityKind::VerifiedRawMirror,
+            DoctorSourceAuthorityDecision::CandidateOnly,
+            reason,
+            coverage_delta.raw_mirror_links_minus_archive,
+            freshness_delta.raw_mirror_capture_minus_archive_db_ms,
+            checksum_evidence.summary_status,
+            vec![
+                format!(
+                    "verified-blob-count={}",
+                    raw_mirror.summary.verified_blob_count
+                ),
+                format!("db-link-count={}", coverage_delta.raw_mirror_db_link_count),
+            ],
+        ));
+    } else {
+        rejected_authorities.push(doctor_source_authority_candidate(
+            DoctorSourceAuthorityKind::VerifiedRawMirror,
+            DoctorSourceAuthorityDecision::Refused,
+            format!(
+                "raw mirror is not trusted for archive repair: status={}, checksum_status={:?}",
+                raw_mirror.status, checksum_evidence.summary_status
+            ),
+            coverage_delta.raw_mirror_links_minus_archive,
+            freshness_delta.raw_mirror_capture_minus_archive_db_ms,
+            checksum_evidence.summary_status,
+            vec![
+                format!("manifest-count={}", raw_mirror.summary.manifest_count),
+                format!("missing-blob-count={}", raw_mirror.summary.missing_blob_count),
+                format!(
+                    "checksum-mismatch-count={}",
+                    raw_mirror.summary.checksum_mismatch_count
+                        + raw_mirror.summary.manifest_checksum_mismatch_count
+                ),
+            ],
+        ));
+    }
+
+    if source_inventory.missing_current_source_count > 0 || source_inventory.unknown_mapping_count > 0
+    {
+        rejected_authorities.push(doctor_source_authority_candidate(
+            DoctorSourceAuthorityKind::LiveUpstreamSource,
+            DoctorSourceAuthorityDecision::Refused,
+            format!(
+                "live upstream source coverage is incomplete: {} missing local conversation(s), {} unknown mapping(s)",
+                source_inventory.missing_current_source_count,
+                source_inventory.unknown_mapping_count
+            ),
+            coverage_delta.visible_local_source_minus_archive,
+            None,
+            DoctorArtifactChecksumStatus::NotRecorded,
+            vec![
+                "coverage-shrinks-relative-to-archive".to_string(),
+                "provider-pruning-risk".to_string(),
+            ],
+        ));
+    }
+
+    if source_inventory.remote_source_count > 0 {
+        rejected_authorities.push(doctor_source_authority_candidate(
+            DoctorSourceAuthorityKind::RemoteSyncCopy,
+            DoctorSourceAuthorityDecision::Refused,
+            format!(
+                "{} remote conversation row(s) require source identity, generation, and checksum verification before repair authority",
+                source_inventory.remote_source_count
+            ),
+            0,
+            None,
+            DoctorArtifactChecksumStatus::NotRecorded,
+            vec!["remote-generation-unverified".to_string()],
+        ));
+    }
+
+    for authority in [
+        DoctorSourceAuthorityKind::VerifiedBackupBundle,
+        DoctorSourceAuthorityKind::VerifiedCandidateArchive,
+        DoctorSourceAuthorityKind::DerivedLexicalIndex,
+        DoctorSourceAuthorityKind::DerivedSemanticIndex,
+        DoctorSourceAuthorityKind::SupportBundle,
+    ] {
+        let policy = doctor_source_authority_policy(authority);
+        rejected_authorities.push(doctor_source_authority_candidate(
+            authority,
+            DoctorSourceAuthorityDecision::Refused,
+            policy.refuses_when.join("; "),
+            0,
+            None,
+            DoctorArtifactChecksumStatus::NotRecorded,
+            policy.refuses_when.iter().map(|reason| reason.to_string()).collect(),
+        ));
+    }
+
+    let selected_authority = selected_authorities.first().map(|candidate| candidate.authority);
+    let decision = selected_authorities
+        .first()
+        .map(|candidate| candidate.decision)
+        .unwrap_or(DoctorSourceAuthorityDecision::Refused);
+
+    DoctorSourceAuthorityReport {
+        schema_version: 1,
+        decision,
+        selected_authority,
+        selected_authorities,
+        rejected_authorities,
+        coverage_delta,
+        freshness_delta,
+        checksum_evidence,
+        matrix: doctor_source_authority_matrix_report(),
+        notes: vec![
+            "Doctor chooses the most conservative authority first; live sources never outrank an existing archive when coverage shrinks.".to_string(),
+            "Candidate-only means evidence may seed an isolated rebuild candidate, not direct promotion.".to_string(),
+            "Promotion requires a later non-decreasing coverage check plus checksum-verified receipt.".to_string(),
+        ],
+    }
 }
 
 fn doctor_artifact_checksum_status(
@@ -22789,6 +23364,8 @@ fn run_doctor(
             );
         }
     }
+    let source_authority =
+        build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
 
     // Apply fix: rebuild index if needed (only when --fix is passed)
     if needs_rebuild && fix {
@@ -23118,6 +23695,7 @@ fn run_doctor(
             "repair_contract": doctor_repair_contract_report(),
             "source_inventory": source_inventory,
             "raw_mirror": raw_mirror,
+            "source_authority": source_authority,
             "checks": check_reports,
             "quarantine": quarantine_report,
             "_meta": {
