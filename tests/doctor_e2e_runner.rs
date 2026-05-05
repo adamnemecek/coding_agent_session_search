@@ -177,6 +177,18 @@ fn doctor_e2e_runner_records_artifacts_and_no_mutation_for_pruned_source() {
         !stdout.contains("CASS_DOCTOR_PRIVACY_SENTINEL"),
         "stdout artifact should not leak privacy sentinels"
     );
+
+    let doctor_events =
+        std::fs::read_to_string(result.artifact_dir.join("doctor-events.jsonl")).unwrap();
+    assert!(
+        doctor_events.contains("\"phase\":\"operation_started\""),
+        "doctor event artifact should preserve the real doctor operation event stream"
+    );
+    assert!(
+        doctor_events.contains("\"hash_chain_tip\"")
+            || doctor_events.contains("\"previous_event_hash\""),
+        "doctor event artifact should include hash-chain evidence for debugging"
+    );
 }
 
 #[test]

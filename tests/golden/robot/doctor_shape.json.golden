@@ -137,6 +137,85 @@
         }
       }
     },
+    "event_log": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "null"
+        },
+        "checksum_blake3": {
+          "type": "string"
+        },
+        "hash_chain_tip": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "event_count": {
+          "type": "integer"
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "schema_version": {
+                "type": "integer"
+              },
+              "event_id": {
+                "type": "string"
+              },
+              "previous_event_hash": {
+                "type": "null"
+              },
+              "operation_id": {
+                "type": "string"
+              },
+              "action_id": {
+                "type": "null"
+              },
+              "phase": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "asset_class": {
+                "type": "null"
+              },
+              "redacted_target_path": {
+                "type": "null"
+              },
+              "elapsed_ms": {
+                "type": "integer"
+              },
+              "progress_label": {
+                "type": "string"
+              },
+              "safety_gate_passed": {
+                "type": "null"
+              },
+              "blocked_reasons": {
+                "type": "array",
+                "items": {
+                  "type": "unknown"
+                }
+              },
+              "receipt_correlation_id": {
+                "type": "null"
+              },
+              "artifact_ids": {
+                "type": "array",
+                "items": {
+                  "type": "unknown"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "asset_taxonomy": {
       "type": "array",
       "items": {

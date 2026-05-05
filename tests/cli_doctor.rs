@@ -543,6 +543,27 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
             .contains("--fix"),
         "read-only doctor outcome should explain that repair was not attempted"
     );
+    let event_log = &payload["event_log"];
+    assert_eq!(
+        event_log["status"].as_str(),
+        Some("embedded_operation_events")
+    );
+    assert!(
+        event_log["event_count"].as_u64().unwrap_or(0) >= 3,
+        "read-only doctor should emit start/check/finish events: {event_log:#}"
+    );
+    let events = event_log["events"].as_array().expect("doctor events");
+    assert_eq!(events[0]["phase"].as_str(), Some("operation_started"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["phase"].as_str() == Some("check_warn")),
+        "read-only doctor should make warning checks branchable in the event log: {events:#?}"
+    );
+    assert_eq!(
+        event_log["hash_chain_tip"].as_str(),
+        events.last().and_then(|event| event["event_id"].as_str())
+    );
     let plan_receipt_schema = &repair_contract["plan_receipt_schema"];
     assert_eq!(plan_receipt_schema["plan_schema_version"].as_u64(), Some(1));
     assert!(
@@ -1698,6 +1719,38 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
                         .is_some_and(|path| path.starts_with("[cass-data]/"))
             }),
         "receipt actions should expose applied status and support-bundle redacted paths"
+    );
+    assert_eq!(
+        payload["event_log"]["status"].as_str(),
+        Some("embedded_receipt_events"),
+        "mutating doctor top-level event_log should link to the cleanup receipt event stream"
+    );
+    let receipt_event_log = &receipt["event_log"];
+    assert_eq!(
+        receipt_event_log["status"].as_str(),
+        Some("embedded_receipt_events")
+    );
+    let receipt_events = receipt_event_log["events"]
+        .as_array()
+        .expect("receipt event log events");
+    assert_eq!(
+        receipt_events
+            .first()
+            .and_then(|event| event["phase"].as_str()),
+        Some("operation_started")
+    );
+    assert!(
+        receipt_events
+            .iter()
+            .any(|event| event["phase"].as_str() == Some("action_applied")
+                && event["receipt_correlation_id"].as_str() == Some("doctor_cleanup_apply_v1")),
+        "receipt event log should correlate applied cleanup actions with the cleanup receipt"
+    );
+    assert_eq!(
+        receipt_event_log["hash_chain_tip"].as_str(),
+        receipt_events
+            .last()
+            .and_then(|event| event["event_id"].as_str())
     );
     assert!(
         actions.iter().any(|action| {

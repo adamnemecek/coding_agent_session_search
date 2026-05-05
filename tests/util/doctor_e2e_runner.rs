@@ -398,14 +398,44 @@ impl DoctorE2eRunner {
             "{\"event\":\"receipt_scan\",\"status\":\"none-found\"}\n",
             &mut artifacts,
         )?;
-        write_text_artifact(
+        let mut doctor_events = vec![json!({
+            "event": "scenario_start",
+            "scenario_id": spec.scenario_id
+        })];
+        if let Some((value, _)) = &parsed_json {
+            match value
+                .pointer("/event_log/events")
+                .and_then(serde_json::Value::as_array)
+            {
+                Some(events) if !events.is_empty() => {
+                    doctor_events.extend(events.iter().cloned());
+                }
+                _ => {
+                    failures.push(
+                        "doctor JSON did not include a non-empty /event_log/events array"
+                            .to_string(),
+                    );
+                    doctor_events.push(json!({
+                        "event": "doctor_event_log_missing",
+                        "status": "fail"
+                    }));
+                }
+            }
+        } else {
+            doctor_events.push(json!({
+                "event": "doctor_event_log_unavailable",
+                "status": "fail"
+            }));
+        }
+        doctor_events.push(json!({
+            "event": "scenario_end",
+            "scenario_id": spec.scenario_id,
+            "failure_count": failures.len()
+        }));
+        write_jsonl_artifact(
             &scenario_artifact_dir,
             "doctor-events.jsonl",
-            &format!(
-                "{}\n{}\n",
-                json!({"event":"scenario_start","scenario_id": spec.scenario_id}),
-                json!({"event":"scenario_end","scenario_id": spec.scenario_id,"failure_count": failures.len()})
-            ),
+            &doctor_events,
             &mut artifacts,
         )?;
 

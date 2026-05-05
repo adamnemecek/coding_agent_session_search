@@ -13639,12 +13639,48 @@ struct DoctorAction {
     artifacts: Vec<DoctorArtifact>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DoctorEvent {
+    schema_version: u32,
+    event_id: String,
+    previous_event_hash: Option<String>,
+    operation_id: String,
+    action_id: Option<String>,
+    phase: String,
+    mode: DoctorRepairMode,
+    asset_class: Option<DoctorAssetClass>,
+    redacted_target_path: Option<String>,
+    elapsed_ms: Option<i64>,
+    progress_label: String,
+    safety_gate_passed: Option<bool>,
+    blocked_reasons: Vec<String>,
+    receipt_correlation_id: Option<String>,
+    artifact_ids: Vec<String>,
+}
+
+struct DoctorEventDraft {
+    operation_id: String,
+    action_id: Option<String>,
+    phase: String,
+    mode: DoctorRepairMode,
+    asset_class: Option<DoctorAssetClass>,
+    redacted_target_path: Option<String>,
+    elapsed_ms: Option<i64>,
+    progress_label: String,
+    safety_gate_passed: Option<bool>,
+    blocked_reasons: Vec<String>,
+    receipt_correlation_id: Option<String>,
+    artifact_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 struct DoctorEventLogMetadata {
     path: Option<String>,
     checksum_blake3: Option<String>,
     hash_chain_tip: Option<String>,
     status: String,
+    event_count: usize,
+    events: Vec<DoctorEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -17272,6 +17308,13 @@ fn doctor_artifact_checksum_status_label(status: DoctorArtifactChecksumStatus) -
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn doctor_serde_label<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn doctor_artifact_descriptor_blake3(
     artifact_kind: &str,
     asset_class: DoctorAssetClass,
@@ -17629,10 +17672,7 @@ fn build_cleanup_doctor_plan(
         safety_gates,
         actions,
         artifact_manifest: doctor_artifact_manifest(artifacts),
-        event_log: DoctorEventLogMetadata {
-            status: "not_written_in_current_doctor_slice".to_string(),
-            ..DoctorEventLogMetadata::default()
-        },
+        event_log: DoctorEventLogMetadata::default(),
         forensic_bundle: DoctorForensicBundleMetadata {
             status: "not_captured_in_current_doctor_slice".to_string(),
             ..DoctorForensicBundleMetadata::default()
@@ -17643,6 +17683,14 @@ fn build_cleanup_doctor_plan(
         remaining_risk,
     };
     plan.plan_fingerprint = doctor_cleanup_plan_fingerprint(&plan);
+    plan.event_log = doctor_cleanup_event_log_for_actions(
+        &plan.plan_fingerprint,
+        &plan.actions,
+        result.operation_started_at_ms,
+        None,
+        None,
+        "embedded_planned_events",
+    );
     plan
 }
 
@@ -17667,6 +17715,314 @@ fn doctor_action_status_counts(actions: &[DoctorAction]) -> BTreeMap<String, usi
             .or_default() += 1;
     }
     counts
+}
+
+fn doctor_event_id(event: &DoctorEvent) -> String {
+    doctor_canonical_blake3("doctor-event-v1", doctor_event_identity_payload(event))
+}
+
+fn doctor_event_log_checksum(events: &[DoctorEvent]) -> String {
+    doctor_canonical_blake3(
+        "doctor-event-log-v1",
+        serde_json::json!({
+            "schema_version": 1,
+            "events": events
+                .iter()
+                .map(doctor_event_identity_payload)
+                .collect::<Vec<_>>(),
+        }),
+    )
+}
+
+fn doctor_event_identity_payload(event: &DoctorEvent) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": event.schema_version,
+        "previous_event_hash": event.previous_event_hash,
+        "operation_id": event.operation_id,
+        "action_id": event.action_id,
+        "phase": event.phase,
+        "mode": event.mode,
+        "asset_class": event.asset_class,
+        "redacted_target_path": event.redacted_target_path,
+        "progress_label": event.progress_label,
+        "safety_gate_passed": event.safety_gate_passed,
+        "blocked_reasons": event.blocked_reasons,
+        "receipt_correlation_id": event.receipt_correlation_id,
+        "artifact_ids": event.artifact_ids,
+    })
+}
+
+fn doctor_event_log_from_events(
+    status: impl Into<String>,
+    events: Vec<DoctorEvent>,
+) -> DoctorEventLogMetadata {
+    let hash_chain_tip = events.last().map(|event| event.event_id.clone());
+    let checksum_blake3 = if events.is_empty() {
+        None
+    } else {
+        Some(doctor_event_log_checksum(&events))
+    };
+    DoctorEventLogMetadata {
+        path: None,
+        checksum_blake3,
+        hash_chain_tip,
+        status: status.into(),
+        event_count: events.len(),
+        events,
+    }
+}
+
+fn doctor_action_event_draft(
+    operation_id: &str,
+    mode: DoctorRepairMode,
+    action: Option<&DoctorAction>,
+    phase: &str,
+    elapsed_ms: Option<i64>,
+    progress_label: impl Into<String>,
+    receipt_correlation_id: Option<&str>,
+) -> DoctorEventDraft {
+    DoctorEventDraft {
+        operation_id: operation_id.to_string(),
+        action_id: action.map(|action| action.action_id.clone()),
+        phase: phase.to_string(),
+        mode: action.map(|action| action.mode).unwrap_or(mode),
+        asset_class: action.map(|action| action.asset_class),
+        redacted_target_path: action.map(|action| action.redacted_target_path.clone()),
+        elapsed_ms,
+        progress_label: progress_label.into(),
+        safety_gate_passed: action.map(|action| action.safety_gate.passed),
+        blocked_reasons: action
+            .map(|action| action.safety_gate.blocked_reasons.clone())
+            .unwrap_or_default(),
+        receipt_correlation_id: receipt_correlation_id.map(str::to_owned),
+        artifact_ids: action
+            .map(|action| {
+                action
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.artifact_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn doctor_status_event_draft(
+    operation_id: &str,
+    mode: DoctorRepairMode,
+    phase: &str,
+    asset_class: Option<DoctorAssetClass>,
+    elapsed_ms: Option<i64>,
+    progress_label: impl Into<String>,
+    blocked_reasons: Vec<String>,
+) -> DoctorEventDraft {
+    DoctorEventDraft {
+        operation_id: operation_id.to_string(),
+        action_id: None,
+        phase: phase.to_string(),
+        mode,
+        asset_class,
+        redacted_target_path: None,
+        elapsed_ms,
+        progress_label: progress_label.into(),
+        safety_gate_passed: None,
+        blocked_reasons,
+        receipt_correlation_id: None,
+        artifact_ids: Vec::new(),
+    }
+}
+
+fn push_doctor_event(events: &mut Vec<DoctorEvent>, draft: DoctorEventDraft) {
+    let previous_event_hash = events.last().map(|event| event.event_id.clone());
+    let mut event = DoctorEvent {
+        schema_version: 1,
+        event_id: String::new(),
+        previous_event_hash,
+        operation_id: draft.operation_id,
+        action_id: draft.action_id,
+        phase: draft.phase,
+        mode: draft.mode,
+        asset_class: draft.asset_class,
+        redacted_target_path: draft.redacted_target_path,
+        elapsed_ms: draft.elapsed_ms,
+        progress_label: draft.progress_label,
+        safety_gate_passed: draft.safety_gate_passed,
+        blocked_reasons: draft.blocked_reasons,
+        receipt_correlation_id: draft.receipt_correlation_id,
+        artifact_ids: draft.artifact_ids,
+    };
+    event.event_id = doctor_event_id(&event);
+    events.push(event);
+}
+
+fn doctor_cleanup_event_log_for_actions(
+    operation_id: &str,
+    actions: &[DoctorAction],
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+    receipt_correlation_id: Option<&str>,
+    status: &str,
+) -> DoctorEventLogMetadata {
+    let mut events = Vec::new();
+    push_doctor_event(
+        &mut events,
+        doctor_action_event_draft(
+            operation_id,
+            DoctorRepairMode::CleanupApply,
+            None,
+            "operation_started",
+            Some(0),
+            "cleanup operation started",
+            receipt_correlation_id,
+        ),
+    );
+    for action in actions {
+        push_doctor_event(
+            &mut events,
+            doctor_action_event_draft(
+                operation_id,
+                DoctorRepairMode::CleanupApply,
+                Some(action),
+                &format!("action_{}", doctor_action_status_label(action.status)),
+                match (started_at_ms, finished_at_ms) {
+                    (Some(started), Some(finished)) => Some(finished.saturating_sub(started)),
+                    _ => None,
+                },
+                format!(
+                    "cleanup action {} {}",
+                    action.action_kind,
+                    doctor_action_status_label(action.status)
+                ),
+                receipt_correlation_id,
+            ),
+        );
+    }
+    push_doctor_event(
+        &mut events,
+        doctor_action_event_draft(
+            operation_id,
+            DoctorRepairMode::CleanupApply,
+            None,
+            "operation_finished",
+            match (started_at_ms, finished_at_ms) {
+                (Some(started), Some(finished)) => Some(finished.saturating_sub(started)),
+                _ => None,
+            },
+            "cleanup operation finished",
+            receipt_correlation_id,
+        ),
+    );
+    doctor_event_log_from_events(status, events)
+}
+
+fn doctor_check_event_phase(status: &str) -> &'static str {
+    match status {
+        "pass" => "check_pass",
+        "warn" => "check_warn",
+        "fail" => "check_fail",
+        _ => "check_unknown",
+    }
+}
+
+fn doctor_operation_event_log_for_checks(
+    operation_id: &str,
+    checks: &[DoctorCheckReport],
+    fix_requested: bool,
+    elapsed_ms: u64,
+    status: &str,
+) -> DoctorEventLogMetadata {
+    let mode = if fix_requested {
+        DoctorRepairMode::RepairApply
+    } else {
+        DoctorRepairMode::Check
+    };
+    let operation_label = if fix_requested {
+        "doctor repair"
+    } else {
+        "doctor check"
+    };
+    let mut events = Vec::new();
+    push_doctor_event(
+        &mut events,
+        doctor_status_event_draft(
+            operation_id,
+            mode,
+            "operation_started",
+            None,
+            Some(0),
+            format!("{operation_label} started"),
+            Vec::new(),
+        ),
+    );
+    for check in checks {
+        let blocked_reasons = if check.status == "pass" {
+            Vec::new()
+        } else {
+            vec![
+                format!("check_status:{}", check.status),
+                format!("anomaly:{}", doctor_serde_label(check.anomaly_class)),
+            ]
+        };
+        push_doctor_event(
+            &mut events,
+            doctor_status_event_draft(
+                operation_id,
+                mode,
+                doctor_check_event_phase(&check.status),
+                Some(check.affected_asset_class),
+                None,
+                format!("{operation_label} {} {}", check.name, check.status),
+                blocked_reasons,
+            ),
+        );
+    }
+    push_doctor_event(
+        &mut events,
+        doctor_status_event_draft(
+            operation_id,
+            mode,
+            "operation_finished",
+            None,
+            Some(elapsed_ms.min(i64::MAX as u64) as i64),
+            format!("{operation_label} finished"),
+            Vec::new(),
+        ),
+    );
+    doctor_event_log_from_events(status, events)
+}
+
+fn doctor_check_operation_id(
+    checks: &[DoctorCheckReport],
+    fix_requested: bool,
+    operation_outcome: &DoctorOperationOutcomeReport,
+    not_initialized: bool,
+) -> String {
+    doctor_canonical_blake3(
+        "doctor-operation-v1",
+        serde_json::json!({
+            "schema_version": 1,
+            "mode": if fix_requested {
+                DoctorRepairMode::RepairApply
+            } else {
+                DoctorRepairMode::Check
+            },
+            "fix_requested": fix_requested,
+            "not_initialized": not_initialized,
+            "operation_outcome_kind": operation_outcome.kind,
+            "checks": checks
+                .iter()
+                .map(|check| serde_json::json!({
+                    "name": check.name,
+                    "status": check.status,
+                    "anomaly_class": check.anomaly_class,
+                    "health_class": check.health_class,
+                    "affected_asset_class": check.affected_asset_class,
+                    "fix_available": check.fix_available,
+                    "fix_applied": check.fix_applied,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    )
 }
 
 fn cleanup_apply_outcome_kind(result: &DiagCleanupApplyResult) -> DoctorRepairOutcomeKind {
@@ -17818,6 +18174,14 @@ fn finalize_cleanup_apply_contract(
         .iter()
         .map(|action| action.verification_outcome.clone())
         .collect::<Vec<_>>();
+    let event_log = doctor_cleanup_event_log_for_actions(
+        &plan.plan_fingerprint,
+        &actual_actions,
+        result.operation_started_at_ms,
+        result.operation_finished_at_ms,
+        Some("doctor_cleanup_apply_v1"),
+        "embedded_receipt_events",
+    );
     let remaining_risk = actual_actions
         .iter()
         .flat_map(|action| action.remaining_risk.clone())
@@ -17857,7 +18221,7 @@ fn finalize_cleanup_apply_contract(
         rejected_authorities: plan.rejected_authorities.clone(),
         verification_outcomes,
         remaining_risk,
-        event_log: plan.event_log.clone(),
+        event_log,
         forensic_bundle: plan.forensic_bundle.clone(),
         artifact_manifest: artifact_manifest.clone(),
         artifact_checksums,
@@ -20077,6 +20441,213 @@ mod doctor_asset_taxonomy_tests {
         assert!(
             !gate.passed,
             "safety invariant failed: cleanup_apply gate must fail closed when mode, taxonomy, and path guards all reject"
+        );
+    }
+
+    #[test]
+    fn doctor_cleanup_event_log_orders_hash_chain_and_correlates_receipts() {
+        let data_dir = Path::new("/tmp/cass");
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let mut result = DiagCleanupApplyResult {
+            mode: DoctorRepairMode::CleanupApply,
+            approval_requirement: DoctorApprovalRequirement::ApprovalFingerprint,
+            requested: true,
+            operation_started_at_ms: Some(1_700_000_002_000),
+            operation_finished_at_ms: Some(1_700_000_002_075),
+            approval_fingerprint: "cleanup-v1-events".to_string(),
+            pruned_asset_count: 1,
+            reclaimed_bytes: 42,
+            actions: vec![DiagCleanupApplyAction {
+                asset_safety: doctor_asset_safety(DoctorAssetClass::RetainedPublishBackup),
+                artifact_kind: "retained_publish_backup".to_string(),
+                path: "/tmp/cass/index/.lexical-publish-backups/old".to_string(),
+                generation_id: None,
+                shard_id: None,
+                disposition: None,
+                reason: "outside retention cap".to_string(),
+                planned_reclaimable_bytes: 42,
+                reclaimed_bytes: 42,
+                applied: true,
+                skipped: false,
+                skip_reason: None,
+            }],
+            ..DiagCleanupApplyResult::default()
+        };
+
+        finalize_cleanup_apply_contract(&mut result, data_dir, &db_path, &index_path);
+
+        let plan = result.plan.as_ref().expect("cleanup apply plan");
+        assert_eq!(plan.event_log.status, "embedded_planned_events");
+        assert_eq!(plan.event_log.event_count, 3);
+        assert_eq!(
+            plan.event_log.events[1].phase, "action_planned",
+            "event invariant failed: planned cleanup event stream should record planned action phase before receipt execution"
+        );
+        assert!(
+            plan.event_log.events[1].receipt_correlation_id.is_none(),
+            "event invariant failed: dry-run/plan events must not claim receipt correlation before apply"
+        );
+
+        let event_log = &result.receipt.event_log;
+        assert_eq!(event_log.status, "embedded_receipt_events");
+        assert_eq!(
+            event_log.event_count, 3,
+            "event invariant failed: one cleanup action should produce start/action/finish events"
+        );
+        assert_eq!(
+            event_log.hash_chain_tip.as_deref(),
+            event_log.events.last().map(|event| event.event_id.as_str()),
+            "event invariant failed: hash_chain_tip must point at the final event"
+        );
+        assert!(
+            event_log
+                .checksum_blake3
+                .as_deref()
+                .is_some_and(|checksum| { checksum.starts_with("doctor-event-log-v1-") }),
+            "event invariant failed: receipt event log must include a deterministic checksum"
+        );
+
+        let start = &event_log.events[0];
+        assert_eq!(start.phase, "operation_started");
+        assert!(start.previous_event_hash.is_none());
+        assert_eq!(start.operation_id, result.receipt.plan_fingerprint);
+        assert_eq!(
+            doctor_event_id(start),
+            start.event_id,
+            "event invariant failed: operation start event id must be canonical and reproducible"
+        );
+
+        let action_event = &event_log.events[1];
+        let receipt_action = &result.receipt.actions[0];
+        assert_eq!(
+            action_event.previous_event_hash.as_deref(),
+            Some(start.event_id.as_str()),
+            "event invariant failed: action event must chain from operation start"
+        );
+        assert_eq!(action_event.phase, "action_applied");
+        assert_eq!(
+            action_event.action_id.as_deref(),
+            Some(receipt_action.action_id.as_str())
+        );
+        assert_eq!(
+            action_event.redacted_target_path.as_deref(),
+            Some("[cass-data]/index/.lexical-publish-backups/old"),
+            "redaction invariant failed: event logs must store redacted target paths, not full sensitive paths"
+        );
+        assert!(
+            !serde_json::to_string(action_event)
+                .expect("serialize event")
+                .contains("/tmp/cass/index"),
+            "redaction invariant failed: event log leaked the full cleanup target path"
+        );
+        assert_eq!(action_event.safety_gate_passed, Some(true));
+        assert!(action_event.blocked_reasons.is_empty());
+        assert_eq!(
+            action_event.receipt_correlation_id.as_deref(),
+            Some("doctor_cleanup_apply_v1")
+        );
+        assert_eq!(
+            action_event.artifact_ids,
+            vec![receipt_action.artifacts[0].artifact_id.clone()],
+            "event invariant failed: action event must correlate with receipt artifact ids"
+        );
+        assert_eq!(
+            doctor_event_id(action_event),
+            action_event.event_id,
+            "event invariant failed: action event id must be canonical and reproducible"
+        );
+
+        let finish = &event_log.events[2];
+        assert_eq!(
+            finish.previous_event_hash.as_deref(),
+            Some(action_event.event_id.as_str()),
+            "event invariant failed: finish event must chain from the action event"
+        );
+        assert_eq!(finish.phase, "operation_finished");
+        assert_eq!(finish.elapsed_ms, Some(75));
+        assert_eq!(
+            doctor_event_id(finish),
+            finish.event_id,
+            "event invariant failed: operation finish event id must be canonical and reproducible"
+        );
+    }
+
+    #[test]
+    fn doctor_operation_event_log_records_checks_without_sensitive_paths() {
+        let check_reports = vec![doctor_check_report(
+            "operation_state",
+            "warn",
+            "Doctor mutation blocked: /tmp/cass/doctor/events/pending.lock",
+            false,
+            false,
+        )];
+        let outcome = doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::OkReadOnlyDiagnosed,
+            "read-only doctor surfaced an operation-state warning".to_string(),
+            "recorded diagnostic event log".to_string(),
+            "no mutation was attempted".to_string(),
+            DoctorDataLossRisk::Low,
+            Some("cass doctor --json".to_string()),
+            None,
+        );
+        let operation_id = doctor_check_operation_id(&check_reports, false, &outcome, false);
+        let event_log = doctor_operation_event_log_for_checks(
+            &operation_id,
+            &check_reports,
+            false,
+            25,
+            "embedded_operation_events",
+        );
+
+        assert_eq!(event_log.status, "embedded_operation_events");
+        assert_eq!(event_log.event_count, 3);
+        assert_eq!(
+            event_log.events[0].phase, "operation_started",
+            "event invariant failed: read-only doctor event log should begin with an operation start"
+        );
+        assert_eq!(
+            event_log.events[1].phase, "check_warn",
+            "event invariant failed: warning checks need a stable branchable phase"
+        );
+        assert_eq!(
+            event_log.events[1].mode,
+            DoctorRepairMode::Check,
+            "event invariant failed: read-only doctor checks must not masquerade as mutating repairs"
+        );
+        assert_eq!(
+            event_log.events[1].asset_class,
+            Some(DoctorAssetClass::OperationReceipt),
+            "event invariant failed: check events should preserve the affected asset class for triage"
+        );
+        assert!(
+            event_log.events[1]
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason == "check_status:warn"),
+            "event invariant failed: warning check event should carry a machine-readable status blocker"
+        );
+        assert_eq!(event_log.events[2].elapsed_ms, Some(25));
+        assert_eq!(
+            event_log.hash_chain_tip.as_deref(),
+            event_log.events.last().map(|event| event.event_id.as_str())
+        );
+        let mut retimed_events = event_log.events.clone();
+        retimed_events[2].elapsed_ms = Some(999);
+        assert_eq!(
+            doctor_event_id(&retimed_events[2]),
+            event_log.events[2].event_id,
+            "event invariant failed: volatile elapsed telemetry must not change event identity"
+        );
+        assert_eq!(
+            doctor_event_log_checksum(&retimed_events),
+            event_log.checksum_blake3.clone().expect("event checksum"),
+            "event invariant failed: volatile elapsed telemetry must not change event-log checksum"
+        );
+        let encoded = serde_json::to_string(&event_log).expect("event log json");
+        assert!(
+            !encoded.contains("/tmp/cass"),
+            "redaction invariant failed: check event log must not leak sensitive paths from diagnostic messages"
         );
     }
 
@@ -24877,6 +25448,20 @@ fn run_doctor(
     let operation_exit_code_kind = operation_outcome.exit_code_kind;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
+    let operation_event_log = cleanup_apply_result
+        .as_ref()
+        .map(|result| result.receipt.event_log.clone())
+        .unwrap_or_else(|| {
+            let operation_id =
+                doctor_check_operation_id(&check_reports, fix, &operation_outcome, not_initialized);
+            doctor_operation_event_log_for_checks(
+                &operation_id,
+                &check_reports,
+                fix,
+                elapsed_ms,
+                "embedded_operation_events",
+            )
+        });
     let all_pass = checks.iter().all(|c| c.status == "pass");
     let healthy = fail_count == 0 && !not_initialized;
     let doctor_status = if not_initialized {
@@ -24914,6 +25499,7 @@ fn run_doctor(
             "auto_fix_actions": auto_fix_actions,
             "operation_outcome": operation_outcome,
             "operation_state": operation_state,
+            "event_log": operation_event_log,
             "asset_taxonomy": doctor_asset_taxonomy_report(),
             "anomaly_taxonomy": doctor_anomaly_taxonomy_report(),
             "repair_contract": doctor_repair_contract_report(),
@@ -27052,7 +27638,31 @@ fn response_schema_doctor_event_log_metadata() -> serde_json::Value {
             "path": { "type": ["string", "null"] },
             "checksum_blake3": { "type": ["string", "null"] },
             "hash_chain_tip": { "type": ["string", "null"] },
-            "status": { "type": "string" }
+            "status": { "type": "string" },
+            "event_count": { "type": "integer" },
+            "events": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "schema_version": { "type": "integer" },
+                        "event_id": { "type": "string" },
+                        "previous_event_hash": { "type": ["string", "null"] },
+                        "operation_id": { "type": "string" },
+                        "action_id": { "type": ["string", "null"] },
+                        "phase": { "type": "string" },
+                        "mode": { "type": "string" },
+                        "asset_class": { "type": ["string", "null"] },
+                        "redacted_target_path": { "type": ["string", "null"] },
+                        "elapsed_ms": { "type": ["integer", "null"] },
+                        "progress_label": { "type": "string" },
+                        "safety_gate_passed": { "type": ["boolean", "null"] },
+                        "blocked_reasons": { "type": "array", "items": { "type": "string" } },
+                        "receipt_correlation_id": { "type": ["string", "null"] },
+                        "artifact_ids": { "type": "array", "items": { "type": "string" } }
+                    }
+                }
+            }
         }
     })
 }
@@ -28442,6 +29052,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "auto_fix_actions": { "type": "array", "items": { "type": "string" } },
                 "operation_outcome": response_schema_doctor_operation_outcome(),
                 "operation_state": response_schema_doctor_operation_state(),
+                "event_log": response_schema_doctor_event_log_metadata(),
                 "asset_taxonomy": response_schema_opaque_object_array(),
                 "anomaly_taxonomy": response_schema_opaque_object_array(),
                 "repair_contract": response_schema_opaque_object(),
@@ -28474,7 +29085,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     }
                 }
             },
-            "required": ["status", "health_class", "healthy", "initialized", "operation_outcome", "operation_state", "source_authority", "checks"]
+            "required": ["status", "health_class", "healthy", "initialized", "operation_outcome", "operation_state", "event_log", "source_authority", "checks"]
         }),
     );
 

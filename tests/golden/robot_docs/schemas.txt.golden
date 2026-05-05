@@ -113,6 +113,13 @@ schemas: (auto-generated from contract)
         - started_at_ms: ?
         - verification_outcomes: array
       - retry_safety: string
+    - event_log: object
+      - checksum_blake3: ?
+      - event_count: integer
+      - events: array
+      - hash_chain_tip: ?
+      - path: ?
+      - status: string
     - explanation: ?
     - failures: integer
     - health_class: string

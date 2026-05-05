@@ -2651,6 +2651,115 @@
             "notes"
           ]
         },
+        "event_log": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "checksum_blake3": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hash_chain_tip": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": "string"
+            },
+            "event_count": {
+              "type": "integer"
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "schema_version": {
+                    "type": "integer"
+                  },
+                  "event_id": {
+                    "type": "string"
+                  },
+                  "previous_event_hash": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "operation_id": {
+                    "type": "string"
+                  },
+                  "action_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "phase": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "string"
+                  },
+                  "asset_class": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "redacted_target_path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "elapsed_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "progress_label": {
+                    "type": "string"
+                  },
+                  "safety_gate_passed": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "blocked_reasons": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "receipt_correlation_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "artifact_ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "asset_taxonomy": {
           "type": "array",
           "items": {
@@ -3779,6 +3888,89 @@
                     },
                     "status": {
                       "type": "string"
+                    },
+                    "event_count": {
+                      "type": "integer"
+                    },
+                    "events": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "schema_version": {
+                            "type": "integer"
+                          },
+                          "event_id": {
+                            "type": "string"
+                          },
+                          "previous_event_hash": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "operation_id": {
+                            "type": "string"
+                          },
+                          "action_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "phase": {
+                            "type": "string"
+                          },
+                          "mode": {
+                            "type": "string"
+                          },
+                          "asset_class": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "redacted_target_path": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "elapsed_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "progress_label": {
+                            "type": "string"
+                          },
+                          "safety_gate_passed": {
+                            "type": [
+                              "boolean",
+                              "null"
+                            ]
+                          },
+                          "blocked_reasons": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "receipt_correlation_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "artifact_ids": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      }
                     }
                   }
                 },
@@ -3947,6 +4139,89 @@
                     },
                     "status": {
                       "type": "string"
+                    },
+                    "event_count": {
+                      "type": "integer"
+                    },
+                    "events": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "schema_version": {
+                            "type": "integer"
+                          },
+                          "event_id": {
+                            "type": "string"
+                          },
+                          "previous_event_hash": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "operation_id": {
+                            "type": "string"
+                          },
+                          "action_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "phase": {
+                            "type": "string"
+                          },
+                          "mode": {
+                            "type": "string"
+                          },
+                          "asset_class": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "redacted_target_path": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "elapsed_ms": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "progress_label": {
+                            "type": "string"
+                          },
+                          "safety_gate_passed": {
+                            "type": [
+                              "boolean",
+                              "null"
+                            ]
+                          },
+                          "blocked_reasons": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "receipt_correlation_id": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "artifact_ids": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      }
                     }
                   }
                 },
@@ -4432,6 +4707,7 @@
         "initialized",
         "operation_outcome",
         "operation_state",
+        "event_log",
         "source_authority",
         "checks"
       ]
