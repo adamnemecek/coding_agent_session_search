@@ -18417,6 +18417,8 @@ enum DoctorFsMutationKind {
     #[default]
     PruneCleanupTarget,
     RemoveStaleLegacyIndexLock,
+    #[allow(dead_code)]
+    CopyFileToStaging,
 }
 
 impl DoctorFsMutationKind {
@@ -18426,6 +18428,7 @@ impl DoctorFsMutationKind {
             | DoctorFsMutationKind::RemoveStaleLegacyIndexLock => {
                 DoctorAssetOperation::PruneReclaim
             }
+            DoctorFsMutationKind::CopyFileToStaging => DoctorAssetOperation::Copy,
         }
     }
 }
@@ -18437,10 +18440,13 @@ struct DoctorFsMutationRequest<'a> {
     mutation_kind: DoctorFsMutationKind,
     mode: DoctorRepairMode,
     asset_class: DoctorAssetClass,
+    source_path: Option<&'a Path>,
     target_path: &'a Path,
     data_dir: &'a Path,
     db_path: &'a Path,
     index_path: &'a Path,
+    staging_root: Option<&'a Path>,
+    expected_source_blake3: Option<&'a str>,
     planned_bytes: u64,
     required_min_age_seconds: Option<u64>,
 }
@@ -18453,8 +18459,22 @@ struct DoctorFsMutationReceipt {
     mutation_kind: DoctorFsMutationKind,
     mode: DoctorRepairMode,
     asset_class: DoctorAssetClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redacted_source_path: Option<String>,
     target_path: String,
     redacted_target_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    staging_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redacted_staging_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_source_blake3: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_source_blake3: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_target_blake3: Option<String>,
     planned_bytes: u64,
     affected_bytes: u64,
     status: DoctorActionStatus,
@@ -19029,10 +19049,13 @@ fn apply_diag_quarantine_cleanup(
             mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
             mode: DoctorRepairMode::CleanupApply,
             asset_class,
+            source_path: None,
             target_path: &path,
             data_dir,
             db_path,
             index_path,
+            staging_root: None,
+            expected_source_blake3: None,
             planned_bytes: action.planned_reclaimable_bytes,
             required_min_age_seconds: None,
         });
@@ -19141,10 +19164,13 @@ fn apply_diag_quarantine_cleanup(
                 mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
                 mode: DoctorRepairMode::CleanupApply,
                 asset_class,
+                source_path: None,
                 target_path: &entry.path,
                 data_dir,
                 db_path,
                 index_path,
+                staging_root: None,
+                expected_source_blake3: None,
                 planned_bytes: action.planned_reclaimable_bytes,
                 required_min_age_seconds: None,
             });
@@ -19227,11 +19253,24 @@ fn execute_doctor_fs_mutation(request: DoctorFsMutationRequest<'_>) -> DoctorFsM
         mutation_kind: request.mutation_kind,
         mode: request.mode,
         asset_class: request.asset_class,
+        source_path: request
+            .source_path
+            .map(|source| source.display().to_string()),
+        redacted_source_path: request
+            .source_path
+            .map(|source| doctor_redacted_path(&source.display().to_string(), request.data_dir)),
         target_path: request.target_path.display().to_string(),
         redacted_target_path: doctor_redacted_path(
             &request.target_path.display().to_string(),
             request.data_dir,
         ),
+        staging_root: request.staging_root.map(|root| root.display().to_string()),
+        redacted_staging_root: request
+            .staging_root
+            .map(|root| doctor_redacted_path(&root.display().to_string(), request.data_dir)),
+        expected_source_blake3: request.expected_source_blake3.map(ToString::to_string),
+        actual_source_blake3: None,
+        actual_target_blake3: None,
         planned_bytes: request.planned_bytes,
         affected_bytes: 0,
         status: DoctorActionStatus::Blocked,
@@ -19245,6 +19284,9 @@ fn execute_doctor_fs_mutation(request: DoctorFsMutationRequest<'_>) -> DoctorFsM
         }
         DoctorFsMutationKind::RemoveStaleLegacyIndexLock => {
             execute_doctor_remove_stale_legacy_index_lock(request, receipt)
+        }
+        DoctorFsMutationKind::CopyFileToStaging => {
+            execute_doctor_copy_file_to_staging(request, receipt)
         }
     }
 }
@@ -19409,6 +19451,178 @@ fn execute_doctor_remove_stale_legacy_index_lock(
     receipt
 }
 
+fn execute_doctor_copy_file_to_staging(
+    request: DoctorFsMutationRequest<'_>,
+    mut receipt: DoctorFsMutationReceipt,
+) -> DoctorFsMutationReceipt {
+    receipt
+        .precondition_checks
+        .push("mutation_kind_copy_file_to_staging".to_string());
+
+    if !doctor_repair_mode_allows_asset_operation_mutation(
+        request.mode,
+        request.asset_class,
+        request.mutation_kind.asset_operation(),
+    ) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to copy asset class {:?}: mode {:?} does not allow copy mutation",
+            request.asset_class, request.mode
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("mode_allows_asset_operation".to_string());
+
+    let Some(source_path) = request.source_path else {
+        receipt
+            .blocked_reasons
+            .push("refusing to copy without a source path".to_string());
+        return receipt;
+    };
+    let Some(staging_root) = request.staging_root else {
+        receipt
+            .blocked_reasons
+            .push("refusing to copy without an approved staging root".to_string());
+        return receipt;
+    };
+
+    if !doctor_copy_source_path_is_safe(source_path, request.data_dir) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to copy unsafe source path {}",
+            source_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("source_path_confined_to_data_dir".to_string());
+
+    let Some(parent) = request.target_path.parent() else {
+        receipt.blocked_reasons.push(format!(
+            "refusing to copy staging target without parent {}",
+            request.target_path.display()
+        ));
+        return receipt;
+    };
+    if !parent.is_dir() {
+        receipt.blocked_reasons.push(format!(
+            "refusing to copy staging target with missing parent {}",
+            parent.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_parent_exists".to_string());
+
+    if !doctor_staging_target_path_is_safe(request.target_path, staging_root, request.data_dir) {
+        receipt.blocked_reasons.push(format!(
+            "refusing to copy to unsafe staging target {}",
+            request.target_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_path_confined_to_staging_root".to_string());
+
+    if request.target_path.exists() {
+        receipt.blocked_reasons.push(format!(
+            "refusing to overwrite existing staging target {}",
+            request.target_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_does_not_exist".to_string());
+
+    let source_blake3 = match file_blake3_hex(source_path) {
+        Ok(hash) => hash,
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+            return receipt;
+        }
+    };
+    receipt.actual_source_blake3 = Some(source_blake3.clone());
+    receipt
+        .precondition_checks
+        .push("source_blake3_recorded".to_string());
+
+    if let Some(expected) = request.expected_source_blake3
+        && expected != source_blake3
+    {
+        receipt.blocked_reasons.push(format!(
+            "refusing to copy source {}: expected blake3 {expected}, observed {source_blake3}",
+            source_path.display()
+        ));
+        return receipt;
+    }
+    if request.expected_source_blake3.is_some() {
+        receipt
+            .precondition_checks
+            .push("expected_source_blake3_matched".to_string());
+    }
+
+    match std::fs::copy(source_path, request.target_path) {
+        Ok(bytes) => {
+            receipt.affected_bytes = bytes;
+            receipt
+                .precondition_checks
+                .push("filesystem_copy_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(format!(
+                "failed to copy {} to {}: {err}",
+                source_path.display(),
+                request.target_path.display()
+            ));
+            return receipt;
+        }
+    }
+
+    let target_blake3 = match file_blake3_hex(request.target_path) {
+        Ok(hash) => hash,
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+            return receipt;
+        }
+    };
+    receipt.actual_target_blake3 = Some(target_blake3.clone());
+    if target_blake3 != source_blake3 {
+        receipt.status = DoctorActionStatus::Failed;
+        receipt.blocked_reasons.push(format!(
+            "copied staging target {} hash mismatch: expected source blake3 {source_blake3}, observed target blake3 {target_blake3}",
+            request.target_path.display()
+        ));
+        return receipt;
+    }
+    receipt
+        .precondition_checks
+        .push("target_blake3_matched_source".to_string());
+
+    match std::fs::File::open(request.target_path).and_then(|file| file.sync_all()) {
+        Ok(()) => {
+            receipt.status = DoctorActionStatus::Applied;
+            receipt
+                .precondition_checks
+                .push("target_file_sync_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(format!(
+                "failed to sync copied staging target {}: {err}",
+                request.target_path.display()
+            ));
+        }
+    }
+    receipt
+}
+
 fn doctor_fs_mutation_action_id(
     mutation_kind: DoctorFsMutationKind,
     mode: DoctorRepairMode,
@@ -19426,6 +19640,25 @@ fn doctor_fs_mutation_action_id(
             "planned_bytes": planned_bytes,
         }),
     )
+}
+
+fn file_blake3_hex(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|err| format!("failed to open {} for blake3: {err}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("failed to read {} for blake3: {err}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn cleanup_target_path_is_safe(
@@ -19513,6 +19746,66 @@ fn legacy_index_lock_path_is_safe(path: &Path, data_dir: &Path) -> bool {
         return false;
     };
     canonical_parent == canonical_data_dir
+}
+
+fn doctor_copy_source_path_is_safe(path: &Path, data_dir: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    if !path.starts_with(data_dir) || path_has_symlink_below_root(path, data_dir) {
+        return false;
+    }
+    let Ok(canonical_path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(canonical_data_dir) = std::fs::canonicalize(data_dir) else {
+        return false;
+    };
+    canonical_path.starts_with(canonical_data_dir)
+}
+
+fn doctor_staging_target_path_is_safe(path: &Path, staging_root: &Path, data_dir: &Path) -> bool {
+    if path == staging_root
+        || !path.starts_with(staging_root)
+        || !staging_root.starts_with(data_dir)
+    {
+        return false;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let Ok(staging_metadata) = std::fs::symlink_metadata(staging_root) else {
+        return false;
+    };
+    if !staging_metadata.is_dir() || staging_metadata.file_type().is_symlink() {
+        return false;
+    }
+    if path_has_symlink_below_root(staging_root, data_dir) {
+        return false;
+    }
+    let parent = path.parent().unwrap_or(staging_root);
+    if !parent.exists() || existing_path_has_symlink_below_root(parent, staging_root) {
+        return false;
+    }
+    let Ok(canonical_data_dir) = std::fs::canonicalize(data_dir) else {
+        return false;
+    };
+    let Ok(canonical_staging_root) = std::fs::canonicalize(staging_root) else {
+        return false;
+    };
+    if !canonical_staging_root.starts_with(&canonical_data_dir) {
+        return false;
+    }
+    match std::fs::canonicalize(parent) {
+        Ok(canonical_parent) => canonical_parent.starts_with(canonical_staging_root),
+        Err(_) => false,
+    }
 }
 
 fn path_age_seconds(path: &Path) -> Option<u64> {
@@ -20854,10 +21147,13 @@ mod doctor_asset_taxonomy_tests {
             mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
             mode: DoctorRepairMode::CleanupApply,
             asset_class: DoctorAssetClass::RetainedPublishBackup,
+            source_path: None,
             target_path: &candidate,
             data_dir: &data_dir,
             db_path: &db_path,
             index_path: &index_path,
+            staging_root: None,
+            expected_source_blake3: None,
             planned_bytes,
             required_min_age_seconds: None,
         });
@@ -20920,10 +21216,13 @@ mod doctor_asset_taxonomy_tests {
             mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
             mode: DoctorRepairMode::CleanupApply,
             asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: None,
             target_path: &db_path,
             data_dir: &data_dir,
             db_path: &db_path,
             index_path: &index_path,
+            staging_root: None,
+            expected_source_blake3: None,
             planned_bytes: fs_dir_size(&db_path),
             required_min_age_seconds: None,
         });
@@ -20968,10 +21267,13 @@ mod doctor_asset_taxonomy_tests {
             mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
             mode: DoctorRepairMode::CleanupApply,
             asset_class: DoctorAssetClass::RetainedPublishBackup,
+            source_path: None,
             target_path: &missing_candidate,
             data_dir: &data_dir,
             db_path: &db_path,
             index_path: &index_path,
+            staging_root: None,
+            expected_source_blake3: None,
             planned_bytes: 1,
             required_min_age_seconds: None,
         });
@@ -21019,10 +21321,13 @@ mod doctor_asset_taxonomy_tests {
             mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
             mode: DoctorRepairMode::SafeAutoRun,
             asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+            source_path: None,
             target_path: &lock_path,
             data_dir: &data_dir,
             db_path: &db_path,
             index_path: &index_path,
+            staging_root: None,
+            expected_source_blake3: None,
             planned_bytes,
             required_min_age_seconds: None,
         });
@@ -21061,10 +21366,13 @@ mod doctor_asset_taxonomy_tests {
             mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
             mode: DoctorRepairMode::SafeAutoRun,
             asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+            source_path: None,
             target_path: &near_miss,
             data_dir: &data_dir,
             db_path: &db_path,
             index_path: &index_path,
+            staging_root: None,
+            expected_source_blake3: None,
             planned_bytes: fs_dir_size(&near_miss),
             required_min_age_seconds: None,
         });
@@ -21097,10 +21405,13 @@ mod doctor_asset_taxonomy_tests {
             mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
             mode: DoctorRepairMode::SafeAutoRun,
             asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+            source_path: None,
             target_path: &lock_path,
             data_dir: &data_dir,
             db_path: &db_path,
             index_path: &index_path,
+            staging_root: None,
+            expected_source_blake3: None,
             planned_bytes: fs_dir_size(&lock_path),
             required_min_age_seconds: Some(u64::MAX),
         });
@@ -21122,6 +21433,356 @@ mod doctor_asset_taxonomy_tests {
             "fresh lock must not reach filesystem removal"
         );
         assert!(lock_path.exists(), "fresh lock must not be removed");
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_copies_verified_source_to_staging_with_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+
+        let source_path = data_dir
+            .join("raw-mirror")
+            .join("v1")
+            .join("blobs")
+            .join("source.raw");
+        let source_bytes = b"{\"type\":\"message\",\"content\":\"preserve me\"}\n";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let staging_root = data_dir.join("doctor-staging").join("op-1");
+        let target_path = staging_root.join("candidate").join("source.raw");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create target parent");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-raw-mirror-source-to-staging",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Applied);
+        assert_eq!(receipt.operation_id, "reconstruct-promote-copy-source");
+        assert_eq!(receipt.action_id, "copy-raw-mirror-source-to-staging");
+        assert_eq!(
+            receipt.mutation_kind,
+            DoctorFsMutationKind::CopyFileToStaging
+        );
+        assert_eq!(receipt.asset_class, DoctorAssetClass::RawMirrorBlob);
+        assert_eq!(receipt.planned_bytes, source_bytes.len() as u64);
+        assert_eq!(receipt.affected_bytes, source_bytes.len() as u64);
+        assert_eq!(
+            receipt.expected_source_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            receipt.actual_source_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            receipt.actual_target_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            receipt.redacted_source_path.as_deref(),
+            Some("[cass-data]/raw-mirror/v1/blobs/source.raw")
+        );
+        assert_eq!(
+            receipt.redacted_target_path,
+            "[cass-data]/doctor-staging/op-1/candidate/source.raw"
+        );
+        assert_eq!(
+            receipt.redacted_staging_root.as_deref(),
+            Some("[cass-data]/doctor-staging/op-1")
+        );
+        for expected in [
+            "mutation_kind_copy_file_to_staging",
+            "mode_allows_asset_operation",
+            "source_path_confined_to_data_dir",
+            "target_path_confined_to_staging_root",
+            "target_does_not_exist",
+            "target_parent_exists",
+            "source_blake3_recorded",
+            "expected_source_blake3_matched",
+            "filesystem_copy_completed",
+            "target_blake3_matched_source",
+            "target_file_sync_completed",
+        ] {
+            assert!(
+                receipt
+                    .precondition_checks
+                    .iter()
+                    .any(|observed| observed == expected),
+                "missing copy receipt precondition {expected}: {:?}",
+                receipt.precondition_checks
+            );
+        }
+        assert_eq!(
+            std::fs::read(&target_path).expect("read copied target"),
+            source_bytes
+        );
+        assert!(
+            source_path.exists(),
+            "copy must preserve the source evidence"
+        );
+        assert!(
+            db_path.exists(),
+            "copy must not touch the canonical archive DB"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_refuses_to_overwrite_staging_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+
+        let source_path = data_dir.join("raw-mirror").join("source.raw");
+        let source_bytes = b"new staging bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let staging_root = data_dir.join("doctor-staging").join("op-overwrite");
+        let target_path = staging_root.join("candidate.raw");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create target parent");
+        std::fs::write(&target_path, b"existing staging bytes").expect("write existing target");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-existing-target",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("overwrite existing staging target")),
+            "overwrite refusal should name the existing target precondition: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_copy_completed"),
+            "blocked overwrite must not reach filesystem copy"
+        );
+        assert_eq!(
+            std::fs::read(&target_path).expect("read target"),
+            b"existing staging bytes"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_blocks_copy_with_missing_staging_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+
+        let source_path = data_dir.join("raw-mirror").join("source.raw");
+        let source_bytes = b"source bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let staging_root = data_dir.join("doctor-staging").join("op-missing-parent");
+        std::fs::create_dir_all(&staging_root).expect("create staging root");
+        let target_path = staging_root.join("missing").join("candidate.raw");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-missing-parent",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("missing parent")),
+            "missing staging parents must be refused explicitly before copy: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !target_path.exists(),
+            "blocked copy must not create parents"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_blocks_copy_when_source_hash_mismatches() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+
+        let source_path = data_dir.join("raw-mirror").join("source.raw");
+        let source_bytes = b"source bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let actual_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let staging_root = data_dir.join("doctor-staging").join("op-hash-mismatch");
+        let target_path = staging_root.join("candidate.raw");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create target parent");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-hash-mismatch",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some("doctor-test-wrong-source-hash"),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert_eq!(
+            receipt.actual_source_blake3.as_deref(),
+            Some(actual_source_blake3.as_str())
+        );
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("expected blake3")),
+            "source hash mismatch should be visible in the receipt: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_copy_completed"),
+            "hash mismatch must stop before filesystem copy"
+        );
+        assert!(
+            !target_path.exists(),
+            "hash mismatch must not create target"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_blocks_copy_target_outside_staging_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+
+        let source_path = data_dir.join("raw-mirror").join("source.raw");
+        let source_bytes = b"source bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let staging_root = data_dir.join("doctor-staging").join("op-outside");
+        std::fs::create_dir_all(&staging_root).expect("create staging root");
+        let outside_target_parent = data_dir.join("not-staging");
+        std::fs::create_dir_all(&outside_target_parent).expect("create outside parent");
+        let outside_target = outside_target_parent.join("candidate.raw");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-outside-staging",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &outside_target,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe staging target")),
+            "target outside staging root should be rejected with an explicit blocker: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "filesystem_copy_completed"),
+            "unsafe target must not reach filesystem copy"
+        );
+        assert!(
+            !outside_target.exists(),
+            "blocked copy must not write outside staging"
+        );
     }
 
     #[test]
@@ -22267,10 +22928,13 @@ mod cleanup_target_safety_tests {
             mutation_kind: DoctorFsMutationKind::PruneCleanupTarget,
             mode: DoctorRepairMode::CleanupApply,
             asset_class: DoctorAssetClass::RetainedPublishBackup,
+            source_path: None,
             target_path: &symlinked_candidate,
             data_dir: &data_dir,
             db_path: &db_path,
             index_path: &index_path,
+            staging_root: None,
+            expected_source_blake3: None,
             planned_bytes: fs_dir_size(&symlinked_candidate),
             required_min_age_seconds: None,
         });
@@ -22316,10 +22980,13 @@ mod cleanup_target_safety_tests {
             mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
             mode: DoctorRepairMode::SafeAutoRun,
             asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+            source_path: None,
             target_path: &lock_path,
             data_dir: &data_dir,
             db_path: &db_path,
             index_path: &index_path,
+            staging_root: None,
+            expected_source_blake3: None,
             planned_bytes: fs_dir_size(&lock_path),
             required_min_age_seconds: None,
         });
@@ -22337,6 +23004,176 @@ mod cleanup_target_safety_tests {
         assert!(
             outside_lock_target.exists(),
             "external symlink target must remain untouched"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_copy_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let outside_source = temp.path().join("outside-source.raw");
+        std::fs::write(&outside_source, b"external bytes").expect("write outside source");
+        let source_path = data_dir.join("raw-mirror").join("source.raw");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::os::unix::fs::symlink(&outside_source, &source_path)
+            .expect("create symlinked copy source");
+
+        let staging_root = data_dir.join("doctor-staging").join("copy-source-symlink");
+        let target_path = staging_root.join("candidate.raw");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create target parent");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-symlinked-source",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: None,
+            planned_bytes: fs_dir_size(&source_path),
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe source path")),
+            "executor must report symlinked copy sources as unsafe: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !target_path.exists(),
+            "executor must not copy through a symlinked source"
+        );
+        assert!(
+            outside_source.exists(),
+            "external symlink target must remain untouched"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_staging_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let source_path = data_dir.join("raw-mirror").join("source.raw");
+        let source_bytes = b"raw mirror bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let outside_staging = temp.path().join("outside-staging");
+        std::fs::create_dir_all(&outside_staging).expect("create outside staging");
+        let staging_root = data_dir.join("doctor-staging");
+        std::os::unix::fs::symlink(&outside_staging, &staging_root)
+            .expect("create symlinked staging root");
+        let target_path = staging_root.join("candidate.raw");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-symlinked-staging-root",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe staging target")),
+            "executor must report symlinked staging roots as unsafe: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !outside_staging.join("candidate.raw").exists(),
+            "executor must not write through a symlinked staging root"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_symlinked_staging_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let source_path = data_dir.join("raw-mirror").join("source.raw");
+        let source_bytes = b"raw mirror bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let staging_root = data_dir.join("doctor-staging").join("op-parent-symlink");
+        std::fs::create_dir_all(&staging_root).expect("create staging root");
+        let outside_parent = temp.path().join("outside-staging-parent");
+        std::fs::create_dir_all(&outside_parent).expect("create outside staging parent");
+        let symlinked_parent = staging_root.join("candidate-parent");
+        std::os::unix::fs::symlink(&outside_parent, &symlinked_parent)
+            .expect("create symlinked staging parent");
+        let target_path = symlinked_parent.join("candidate.raw");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-symlinked-staging-parent",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("unsafe staging target")),
+            "executor must report symlinked staging parents as unsafe: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            !outside_parent.join("candidate.raw").exists(),
+            "executor must not write through a symlinked staging parent"
         );
     }
 
@@ -25598,10 +26435,13 @@ fn run_doctor(
                     mutation_kind: DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
                     mode: DoctorRepairMode::SafeAutoRun,
                     asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+                    source_path: None,
                     target_path: &lock_path,
                     data_dir: &data_dir,
                     db_path: &db_path,
                     index_path: &index_path,
+                    staging_root: None,
+                    expected_source_blake3: None,
                     planned_bytes,
                     required_min_age_seconds: Some(3600),
                 });
