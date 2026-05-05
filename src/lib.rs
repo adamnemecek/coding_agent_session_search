@@ -8093,13 +8093,13 @@ fn search_lexical_self_heal_diagnosis(
             retryable: true,
         })?;
     let Some(checkpoint) = checkpoint else {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
             "lexical rebuild checkpoint missing",
         )));
     };
 
     if !stored_path_identity_matches(&checkpoint.db_path, db_path) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(format!(
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
             "lexical checkpoint references {}, but active database is {}",
             checkpoint.db_path,
             db_path.display()
@@ -8287,13 +8287,13 @@ fn ensure_lexical_assets_for_search(
 #[cfg(test)]
 mod search_lexical_self_heal_tests {
     use super::*;
+    use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::query::{FieldMask, SearchClient, SearchFilters};
     use crate::storage::sqlite::FrankenStorage;
 
-    fn seed_canonical_search_db(data_dir: &Path) -> PathBuf {
-        let db_path = data_dir.join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path).expect("open canonical db");
+    fn seed_search_db_at(db_path: &Path, content: &str, external_id: &str) {
+        let storage = FrankenStorage::open(db_path).expect("open canonical db");
         let agent = Agent {
             id: None,
             slug: "codex".to_string(),
@@ -8306,9 +8306,9 @@ mod search_lexical_self_heal_tests {
             id: None,
             agent_slug: "codex".to_string(),
             workspace: Some(PathBuf::from("/tmp/search-self-heal")),
-            external_id: Some("search-self-heal-conversation".to_string()),
+            external_id: Some(external_id.to_string()),
             title: Some("Search self heal".to_string()),
-            source_path: data_dir.join("session.jsonl"),
+            source_path: db_path.with_extension("jsonl"),
             started_at: Some(1_770_000_000_000),
             ended_at: Some(1_770_000_001_000),
             approx_tokens: None,
@@ -8319,8 +8319,7 @@ mod search_lexical_self_heal_tests {
                 role: MessageRole::User,
                 author: Some("tester".to_string()),
                 created_at: Some(1_770_000_000_000),
-                content: "autohealneedle should be searchable after derived-index repair"
-                    .to_string(),
+                content: content.to_string(),
                 extra_json: serde_json::json!({}),
                 snippets: Vec::new(),
             }],
@@ -8331,6 +8330,15 @@ mod search_lexical_self_heal_tests {
             .insert_conversation_tree(agent_id, None, &conversation)
             .expect("insert conversation");
         drop(storage);
+    }
+
+    fn seed_canonical_search_db(data_dir: &Path) -> PathBuf {
+        let db_path = data_dir.join("agent_search.db");
+        seed_search_db_at(
+            &db_path,
+            "autohealneedle should be searchable after derived-index repair",
+            "search-self-heal-conversation",
+        );
         db_path
     }
 
@@ -8339,6 +8347,36 @@ mod search_lexical_self_heal_tests {
         let storage = FrankenStorage::open(&db_path).expect("open empty canonical db");
         drop(storage);
         db_path
+    }
+
+    fn build_standalone_lexical_index_without_checkpoint(data_dir: &Path, content: &str) {
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let mut index =
+            crate::search::tantivy::TantivyIndex::open_or_create(&index_path).expect("open index");
+        let conversation = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("standalone-no-checkpoint".to_string()),
+            title: Some("Standalone lexical fixture".to_string()),
+            workspace: Some(PathBuf::from("/tmp/search-self-heal")),
+            source_path: data_dir.join("standalone.jsonl"),
+            started_at: Some(1_770_000_000_000),
+            ended_at: Some(1_770_000_001_000),
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: Some("tester".to_string()),
+                created_at: Some(1_770_000_000_000),
+                content: content.to_string(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+        index
+            .add_conversation(&conversation)
+            .expect("add standalone conversation");
+        index.commit().expect("commit standalone index");
     }
 
     #[test]
@@ -8423,6 +8461,133 @@ mod search_lexical_self_heal_tests {
             .expect("checkpoint present");
         assert_eq!(checkpoint.schema_hash, crate::search::tantivy::SCHEMA_HASH);
         assert!(checkpoint.completed);
+    }
+
+    #[test]
+    fn search_self_heal_rebuilds_when_checkpoint_references_different_db() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let old_db_path = data_dir.join("old_agent_search.db");
+        let db_path = data_dir.join("agent_search.db");
+        seed_search_db_at(
+            &old_db_path,
+            "oldautohealneedle exists only in the superseded database",
+            "old-search-self-heal-conversation",
+        );
+        seed_search_db_at(
+            &db_path,
+            "newautohealneedle exists only in the active database",
+            "new-search-self-heal-conversation",
+        );
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &old_db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("initial rebuild from old database");
+
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("search self-heal should rebuild for different active db");
+        assert_eq!(repair.action, "rebuilt-from-canonical-db");
+        assert_eq!(repair.indexed_docs, Some(1));
+
+        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
+            .expect("load rebuilt checkpoint")
+            .expect("checkpoint present");
+        assert!(stored_path_identity_matches(&checkpoint.db_path, &db_path));
+
+        let client = SearchClient::open(&index_path, Some(&db_path))
+            .expect("open search client")
+            .expect("repaired index should open");
+        let new_hits = client
+            .search(
+                "newautohealneedle",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect("query rebuilt active-db index");
+        assert_eq!(new_hits.len(), 1);
+        let old_hits = client
+            .search(
+                "oldautohealneedle",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect("query superseded-db term");
+        assert_eq!(old_hits.len(), 0);
+    }
+
+    #[test]
+    fn search_self_heal_rebuilds_when_checkpoint_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        build_standalone_lexical_index_without_checkpoint(
+            data_dir,
+            "orphanautohealneedle exists only in a standalone lexical artifact",
+        );
+        let db_path = data_dir.join("agent_search.db");
+        seed_search_db_at(
+            &db_path,
+            "checkpointmissingautohealneedle exists only in the active database",
+            "checkpoint-missing-search-self-heal-conversation",
+        );
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("search self-heal should rebuild when checkpoint is missing");
+        assert_eq!(repair.action, "rebuilt-from-canonical-db");
+        assert_eq!(repair.indexed_docs, Some(1));
+
+        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
+            .expect("load rebuilt checkpoint")
+            .expect("checkpoint present");
+        assert!(stored_path_identity_matches(&checkpoint.db_path, &db_path));
+
+        let client = SearchClient::open(&index_path, Some(&db_path))
+            .expect("open search client")
+            .expect("repaired index should open");
+        let active_hits = client
+            .search(
+                "checkpointmissingautohealneedle",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect("query active-db term");
+        assert_eq!(active_hits.len(), 1);
+        let orphan_hits = client
+            .search(
+                "orphanautohealneedle",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect("query standalone lexical term");
+        assert_eq!(orphan_hits.len(), 0);
     }
 
     #[test]
