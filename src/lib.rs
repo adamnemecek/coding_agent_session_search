@@ -12831,6 +12831,7 @@ struct DoctorPlanReceiptSchemaReport {
     fingerprint_algorithm: &'static str,
     plan_fingerprint_includes: Vec<&'static str>,
     receipt_required_fields: Vec<&'static str>,
+    action_statuses: Vec<DoctorActionStatus>,
     artifact_checksum_statuses: Vec<DoctorArtifactChecksumStatus>,
     drift_detection_statuses: Vec<DoctorDriftDetectionStatus>,
     redaction_contract: &'static str,
@@ -12923,6 +12924,7 @@ struct DoctorArtifactManifest {
     artifacts: Vec<DoctorArtifact>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 struct DoctorPlan {
     plan_kind: &'static str,
@@ -13286,6 +13288,7 @@ fn doctor_plan_receipt_schema_report() -> DoctorPlanReceiptSchemaReport {
         fingerprint_algorithm: "blake3-canonical-json-v1",
         plan_fingerprint_includes: DOCTOR_PLAN_FINGERPRINT_FIELDS.to_vec(),
         receipt_required_fields: DOCTOR_RECEIPT_REQUIRED_FIELDS.to_vec(),
+        action_statuses: DOCTOR_ACTION_STATUS_VOCABULARY.to_vec(),
         artifact_checksum_statuses: DOCTOR_ARTIFACT_CHECKSUM_STATUS_VOCABULARY.to_vec(),
         drift_detection_statuses: DOCTOR_DRIFT_DETECTION_STATUS_VOCABULARY.to_vec(),
         redaction_contract: "robot receipts may expose existing doctor paths; support bundles must redact before export",
@@ -13328,6 +13331,471 @@ fn doctor_repair_contract_report() -> DoctorRepairContractReport {
     }
 }
 
+fn doctor_now_ms() -> i64 {
+    system_time_to_unix_ms(std::time::SystemTime::now()).unwrap_or(0)
+}
+
+fn doctor_canonical_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(doctor_canonical_json_value)
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key, doctor_canonical_json_value(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        other => other,
+    }
+}
+
+fn doctor_canonical_blake3(prefix: &str, value: serde_json::Value) -> String {
+    let canonical = doctor_canonical_json_value(value);
+    let encoded = serde_json::to_vec(&canonical).unwrap_or_default();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&encoded);
+    format!("{prefix}-{}", hasher.finalize().to_hex())
+}
+
+fn doctor_redacted_path(path: &str, data_dir: &Path) -> String {
+    let path_ref = Path::new(path);
+    if let Ok(relative) = path_ref.strip_prefix(data_dir) {
+        if relative.as_os_str().is_empty() {
+            return "[cass-data]".to_string();
+        }
+        return format!("[cass-data]/{}", relative.display());
+    }
+    path_ref
+        .file_name()
+        .map(|name| format!("[external]/{}", name.to_string_lossy()))
+        .unwrap_or_else(|| "[external]".to_string())
+}
+
+fn doctor_artifact_checksum_status(
+    exists: bool,
+    expected_content_blake3: Option<&str>,
+    actual_content_blake3: Option<&str>,
+) -> DoctorArtifactChecksumStatus {
+    if !exists {
+        DoctorArtifactChecksumStatus::Missing
+    } else {
+        match (expected_content_blake3, actual_content_blake3) {
+            (Some(expected), Some(actual)) if expected == actual => {
+                DoctorArtifactChecksumStatus::Matched
+            }
+            (Some(_), Some(_)) => DoctorArtifactChecksumStatus::Mismatched,
+            _ => DoctorArtifactChecksumStatus::NotRecorded,
+        }
+    }
+}
+
+fn doctor_action_status_label(status: DoctorActionStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn doctor_artifact_descriptor_blake3(
+    artifact_kind: &str,
+    asset_class: DoctorAssetClass,
+    path: &str,
+    size_bytes: Option<u64>,
+) -> String {
+    doctor_canonical_blake3(
+        "doctor-artifact-descriptor-v1",
+        serde_json::json!({
+            "artifact_kind": artifact_kind,
+            "asset_class": asset_class,
+            "path": path,
+            "size_bytes": size_bytes,
+        }),
+    )
+}
+
+fn doctor_artifact_from_cleanup_action(
+    action: &DiagCleanupApplyAction,
+    data_dir: &Path,
+) -> DoctorArtifact {
+    let exists = action.applied || Path::new(&action.path).exists();
+    let size_bytes = Some(action.planned_reclaimable_bytes);
+    let checksum_status = doctor_artifact_checksum_status(exists, None, None);
+    DoctorArtifact {
+        artifact_id: doctor_canonical_blake3(
+            "doctor-artifact-v1",
+            serde_json::json!({
+                "artifact_kind": action.artifact_kind,
+                "asset_class": action.asset_safety.asset_class,
+                "path": action.path,
+                "generation_id": action.generation_id,
+                "shard_id": action.shard_id,
+                "planned_reclaimable_bytes": action.planned_reclaimable_bytes,
+            }),
+        ),
+        artifact_kind: action.artifact_kind.clone(),
+        asset_class: action.asset_safety.asset_class,
+        path: action.path.clone(),
+        redacted_path: doctor_redacted_path(&action.path, data_dir),
+        exists,
+        size_bytes,
+        descriptor_blake3: doctor_artifact_descriptor_blake3(
+            &action.artifact_kind,
+            action.asset_safety.asset_class,
+            &action.path,
+            size_bytes,
+        ),
+        expected_content_blake3: None,
+        actual_content_blake3: None,
+        checksum_status,
+    }
+}
+
+fn doctor_manifest_drift_status(artifacts: &[DoctorArtifact]) -> DoctorDriftDetectionStatus {
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.checksum_status == DoctorArtifactChecksumStatus::Missing)
+    {
+        DoctorDriftDetectionStatus::MissingArtifact
+    } else if artifacts
+        .iter()
+        .any(|artifact| artifact.checksum_status == DoctorArtifactChecksumStatus::Mismatched)
+    {
+        DoctorDriftDetectionStatus::ChecksumMismatch
+    } else if !artifacts.is_empty()
+        && artifacts
+            .iter()
+            .all(|artifact| artifact.checksum_status == DoctorArtifactChecksumStatus::Matched)
+    {
+        DoctorDriftDetectionStatus::Verified
+    } else {
+        DoctorDriftDetectionStatus::NotChecked
+    }
+}
+
+fn doctor_artifact_manifest(artifacts: Vec<DoctorArtifact>) -> DoctorArtifactManifest {
+    let drift_detection_status = doctor_manifest_drift_status(&artifacts);
+    let manifest_blake3 = doctor_canonical_blake3(
+        "doctor-artifact-manifest-v1",
+        serde_json::json!({
+            "schema_version": 1,
+            "artifacts": artifacts,
+            "drift_detection_status": drift_detection_status,
+        }),
+    );
+    DoctorArtifactManifest {
+        schema_version: 1,
+        artifact_count: artifacts.len(),
+        manifest_blake3,
+        drift_detection_status,
+        artifacts,
+    }
+}
+
+fn doctor_cleanup_coverage_snapshot(
+    generation_count: usize,
+    reclaim_candidate_count: usize,
+    reclaimable_bytes: u64,
+    retained_bytes: u64,
+    actions: &[DiagCleanupApplyAction],
+) -> DoctorCoverageSnapshot {
+    let mut covered_asset_classes: Vec<_> = actions
+        .iter()
+        .map(|action| action.asset_safety.asset_class)
+        .collect();
+    covered_asset_classes.sort_by_key(|class| format!("{class:?}"));
+    covered_asset_classes.dedup();
+    DoctorCoverageSnapshot {
+        generation_count,
+        reclaim_candidate_count,
+        reclaimable_bytes,
+        retained_bytes,
+        artifact_count: actions.len(),
+        covered_asset_classes,
+    }
+}
+
+fn doctor_safety_gate_for_cleanup_action(
+    action: &DiagCleanupApplyAction,
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    approval_fingerprint: &str,
+) -> DoctorSafetyGate {
+    let asset_class = action.asset_safety.asset_class;
+    let allowed_by_mode =
+        doctor_repair_mode_allows_asset_mutation(DoctorRepairMode::CleanupApply, asset_class);
+    let allowed_by_taxonomy = doctor_asset_safe_to_gc(asset_class, true);
+    let path_safe = action.applied
+        || cleanup_target_path_is_safe(Path::new(&action.path), data_dir, db_path, index_path);
+    let mut blocked_reasons = Vec::new();
+    if !allowed_by_mode {
+        blocked_reasons.push("mode_disallows_asset_class".to_string());
+    }
+    if !allowed_by_taxonomy {
+        blocked_reasons.push("taxonomy_disallows_automatic_reclaim".to_string());
+    }
+    if !path_safe {
+        blocked_reasons.push("unsafe_or_missing_path".to_string());
+    }
+    if let Some(skip_reason) = action.skip_reason.as_ref() {
+        blocked_reasons.push(skip_reason.clone());
+    }
+    DoctorSafetyGate {
+        mode: DoctorRepairMode::CleanupApply,
+        asset_class,
+        allowed_by_mode,
+        allowed_by_taxonomy,
+        path_safe,
+        approval_requirement: DoctorApprovalRequirement::ApprovalFingerprint,
+        approval_fingerprint: approval_fingerprint.to_string(),
+        passed: blocked_reasons.is_empty(),
+        blocked_reasons,
+    }
+}
+
+fn doctor_action_from_cleanup_action(
+    action: &DiagCleanupApplyAction,
+    status: DoctorActionStatus,
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    approval_fingerprint: &str,
+) -> DoctorAction {
+    let artifact = doctor_artifact_from_cleanup_action(action, data_dir);
+    let safety_gate = doctor_safety_gate_for_cleanup_action(
+        action,
+        data_dir,
+        db_path,
+        index_path,
+        approval_fingerprint,
+    );
+    let mut remaining_risk = Vec::new();
+    if matches!(
+        status,
+        DoctorActionStatus::Skipped | DoctorActionStatus::Blocked | DoctorActionStatus::Failed
+    ) {
+        remaining_risk.push(
+            action
+                .skip_reason
+                .clone()
+                .unwrap_or_else(|| "planned cleanup did not apply".to_string()),
+        );
+    }
+    let authority_decision = if safety_gate.passed {
+        "allowed_by_taxonomy_and_path_gate"
+    } else {
+        "blocked_by_taxonomy_or_path_gate"
+    }
+    .to_string();
+    let selected_authorities = vec![
+        "doctor_asset_taxonomy_v1".to_string(),
+        "lexical_cleanup_dry_run_v1".to_string(),
+    ];
+    let rejected_authorities = if safety_gate.passed {
+        Vec::new()
+    } else {
+        safety_gate.blocked_reasons.clone()
+    };
+    let verification_outcome = match status {
+        DoctorActionStatus::Planned => "pending_apply",
+        DoctorActionStatus::Applied => "applied",
+        DoctorActionStatus::Skipped => "skipped",
+        DoctorActionStatus::Blocked => "blocked",
+        DoctorActionStatus::Failed => "failed",
+        DoctorActionStatus::Refused => "refused",
+    }
+    .to_string();
+    let bytes_pruned = if status == DoctorActionStatus::Applied {
+        action.reclaimed_bytes
+    } else {
+        0
+    };
+    let action_id = doctor_canonical_blake3(
+        "doctor-action-v1",
+        serde_json::json!({
+            "action_kind": action.artifact_kind,
+            "mode": DoctorRepairMode::CleanupApply,
+            "asset_class": action.asset_safety.asset_class,
+            "target_path": action.path,
+            "generation_id": action.generation_id,
+            "shard_id": action.shard_id,
+            "planned_bytes": action.planned_reclaimable_bytes,
+            "reason": action.reason,
+        }),
+    );
+    DoctorAction {
+        action_id,
+        action_kind: action.artifact_kind.clone(),
+        status,
+        mode: DoctorRepairMode::CleanupApply,
+        asset_class: action.asset_safety.asset_class,
+        target_path: action.path.clone(),
+        redacted_target_path: doctor_redacted_path(&action.path, data_dir),
+        reason: action.reason.clone(),
+        authority_decision,
+        selected_authorities,
+        rejected_authorities,
+        safety_gate,
+        planned_bytes: action.planned_reclaimable_bytes,
+        bytes_copied: 0,
+        bytes_moved: 0,
+        bytes_pruned,
+        backup_paths: Vec::new(),
+        verification_outcome,
+        remaining_risk,
+        artifacts: vec![artifact],
+    }
+}
+
+fn doctor_sorted_cleanup_actions(actions: &[DiagCleanupApplyAction]) -> Vec<DiagCleanupApplyAction> {
+    let mut sorted = actions.to_vec();
+    sorted.sort_by(|left, right| {
+        (
+            left.artifact_kind.as_str(),
+            left.path.as_str(),
+            left.generation_id.as_deref().unwrap_or(""),
+            left.shard_id.as_deref().unwrap_or(""),
+            format!("{:?}", left.asset_safety.asset_class),
+        )
+            .cmp(&(
+                right.artifact_kind.as_str(),
+                right.path.as_str(),
+                right.generation_id.as_deref().unwrap_or(""),
+                right.shard_id.as_deref().unwrap_or(""),
+                format!("{:?}", right.asset_safety.asset_class),
+            ))
+    });
+    sorted
+}
+
+fn doctor_cleanup_plan_fingerprint(plan: &DoctorPlan) -> String {
+    doctor_canonical_blake3(
+        "doctor-plan-v1",
+        serde_json::json!({
+            "plan_kind": plan.plan_kind,
+            "schema_version": plan.schema_version,
+            "mode": plan.mode,
+            "approval_requirement": plan.approval_requirement,
+            "approval_fingerprint": plan.approval_fingerprint,
+            "outcome_contract": plan.outcome_contract,
+            "coverage_before": plan.coverage_before,
+            "safety_gates": plan.safety_gates,
+            "actions": plan.actions,
+            "artifact_manifest": plan.artifact_manifest,
+            "selected_authorities": plan.selected_authorities,
+            "rejected_authorities": plan.rejected_authorities,
+            "blocked_reasons": plan.blocked_reasons,
+            "remaining_risk": plan.remaining_risk,
+        }),
+    )
+}
+
+fn build_cleanup_doctor_plan(
+    result: &DiagCleanupApplyResult,
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+) -> DoctorPlan {
+    let sorted_actions = doctor_sorted_cleanup_actions(&result.actions);
+    let actions: Vec<_> = sorted_actions
+        .iter()
+        .map(|action| {
+            doctor_action_from_cleanup_action(
+                action,
+                DoctorActionStatus::Planned,
+                data_dir,
+                db_path,
+                index_path,
+                &result.approval_fingerprint,
+            )
+        })
+        .collect();
+    let artifacts = actions
+        .iter()
+        .flat_map(|action| action.artifacts.clone())
+        .collect::<Vec<_>>();
+    let safety_gates = actions
+        .iter()
+        .map(|action| action.safety_gate.clone())
+        .collect::<Vec<_>>();
+    let selected_authorities = vec![
+        "doctor_asset_taxonomy_v1".to_string(),
+        "doctor_repair_mode_policy_v1".to_string(),
+        "lexical_cleanup_dry_run_v1".to_string(),
+    ];
+    let remaining_risk = if result.blocked_reasons.is_empty() {
+        Vec::new()
+    } else {
+        result.blocked_reasons.clone()
+    };
+    let mut plan = DoctorPlan {
+        plan_kind: "doctor_cleanup_apply_plan_v1",
+        schema_version: 1,
+        mode: DoctorRepairMode::CleanupApply,
+        approval_requirement: DoctorApprovalRequirement::ApprovalFingerprint,
+        approval_fingerprint: result.approval_fingerprint.clone(),
+        plan_fingerprint: String::new(),
+        fingerprint_algorithm: "blake3-canonical-json-v1",
+        outcome_contract: result.outcome_kind,
+        coverage_before: doctor_cleanup_coverage_snapshot(
+            result.before_generation_count,
+            result.before_reclaim_candidate_count,
+            result.before_reclaimable_bytes,
+            result.before_retained_bytes,
+            &sorted_actions,
+        ),
+        safety_gates,
+        actions,
+        artifact_manifest: doctor_artifact_manifest(artifacts),
+        event_log: DoctorEventLogMetadata {
+            status: "not_written_in_current_doctor_slice".to_string(),
+            ..DoctorEventLogMetadata::default()
+        },
+        forensic_bundle: DoctorForensicBundleMetadata {
+            status: "not_captured_in_current_doctor_slice".to_string(),
+            ..DoctorForensicBundleMetadata::default()
+        },
+        selected_authorities,
+        rejected_authorities: Vec::new(),
+        blocked_reasons: result.blocked_reasons.clone(),
+        remaining_risk,
+    };
+    plan.plan_fingerprint = doctor_cleanup_plan_fingerprint(&plan);
+    plan
+}
+
+fn doctor_cleanup_action_status(action: &DiagCleanupApplyAction) -> DoctorActionStatus {
+    if action.applied {
+        DoctorActionStatus::Applied
+    } else if action.skipped {
+        DoctorActionStatus::Skipped
+    } else {
+        DoctorActionStatus::Blocked
+    }
+}
+
+fn doctor_action_status_counts(actions: &[DoctorAction]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for status in DOCTOR_ACTION_STATUS_VOCABULARY {
+        counts.insert(doctor_action_status_label(*status), 0);
+    }
+    for action in actions {
+        *counts
+            .entry(doctor_action_status_label(action.status))
+            .or_default() += 1;
+    }
+    counts
+}
+
 fn cleanup_apply_outcome_kind(result: &DiagCleanupApplyResult) -> DoctorRepairOutcomeKind {
     if !result.blocked_reasons.is_empty() && result.pruned_asset_count == 0 {
         DoctorRepairOutcomeKind::Blocked
@@ -13359,19 +13827,71 @@ fn cleanup_apply_retry_safety(result: &DiagCleanupApplyResult) -> DoctorRepairRe
     }
 }
 
-fn finalize_cleanup_apply_contract(result: &mut DiagCleanupApplyResult) {
+fn finalize_cleanup_apply_contract(
+    result: &mut DiagCleanupApplyResult,
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+) {
     result.mode = DoctorRepairMode::CleanupApply;
     result.approval_requirement = DoctorApprovalRequirement::ApprovalFingerprint;
     result.outcome_kind = cleanup_apply_outcome_kind(result);
     result.retry_safety = cleanup_apply_retry_safety(result);
     result.planned_actions = result.actions.clone();
+    if result.operation_finished_at_ms.is_none() {
+        result.operation_finished_at_ms = Some(doctor_now_ms());
+    }
+    let plan = build_cleanup_doctor_plan(result, data_dir, db_path, index_path);
+    let actual_actions = doctor_sorted_cleanup_actions(&result.actions)
+        .iter()
+        .map(|action| {
+            doctor_action_from_cleanup_action(
+                action,
+                doctor_cleanup_action_status(action),
+                data_dir,
+                db_path,
+                index_path,
+                &result.approval_fingerprint,
+            )
+        })
+        .collect::<Vec<_>>();
+    let artifact_checksums = actual_actions
+        .iter()
+        .flat_map(|action| action.artifacts.clone())
+        .collect::<Vec<_>>();
+    let artifact_manifest = doctor_artifact_manifest(artifact_checksums.clone());
+    let action_status_counts = doctor_action_status_counts(&actual_actions);
+    let coverage_after = doctor_cleanup_coverage_snapshot(
+        result.after_generation_count,
+        result.after_reclaim_candidate_count,
+        result.after_reclaimable_bytes,
+        result.after_retained_bytes,
+        &result.actions,
+    );
+    let duration_ms = match (result.operation_started_at_ms, result.operation_finished_at_ms) {
+        (Some(started), Some(finished)) => Some(finished.saturating_sub(started)),
+        _ => None,
+    };
+    let verification_outcomes = actual_actions
+        .iter()
+        .map(|action| action.verification_outcome.clone())
+        .collect::<Vec<_>>();
+    let remaining_risk = actual_actions
+        .iter()
+        .flat_map(|action| action.remaining_risk.clone())
+        .chain(result.blocked_reasons.clone())
+        .collect::<Vec<_>>();
+    result.plan = Some(plan.clone());
     result.receipt = DoctorRepairReceipt {
         receipt_kind: "doctor_cleanup_apply_v1",
         schema_version: 1,
         mode: result.mode,
         outcome_kind: result.outcome_kind,
         approval_fingerprint: result.approval_fingerprint.clone(),
-        plan_fingerprint: result.approval_fingerprint.clone(),
+        plan_fingerprint: plan.plan_fingerprint.clone(),
+        started_at_ms: result.operation_started_at_ms,
+        finished_at_ms: result.operation_finished_at_ms,
+        duration_ms,
         planned_action_count: result.planned_actions.len(),
         applied_action_count: result
             .planned_actions
@@ -13383,6 +13903,7 @@ fn finalize_cleanup_apply_contract(result: &mut DiagCleanupApplyResult) {
             .iter()
             .filter(|action| action.skipped)
             .count(),
+        failed_action_count: *action_status_counts.get("failed").unwrap_or(&0),
         bytes_planned: result
             .planned_actions
             .iter()
@@ -13390,6 +13911,19 @@ fn finalize_cleanup_apply_contract(result: &mut DiagCleanupApplyResult) {
             .sum(),
         bytes_pruned: result.reclaimed_bytes,
         reclaimed_bytes: result.reclaimed_bytes,
+        selected_authorities: plan.selected_authorities.clone(),
+        rejected_authorities: plan.rejected_authorities.clone(),
+        verification_outcomes,
+        remaining_risk,
+        event_log: plan.event_log.clone(),
+        forensic_bundle: plan.forensic_bundle.clone(),
+        artifact_manifest: artifact_manifest.clone(),
+        artifact_checksums,
+        drift_detection_status: artifact_manifest.drift_detection_status,
+        coverage_before: plan.coverage_before.clone(),
+        coverage_after,
+        actions: actual_actions,
+        action_status_counts,
         blocked_reasons: result.blocked_reasons.clone(),
         ..DoctorRepairReceipt::default()
     };
@@ -13508,8 +14042,12 @@ struct DiagCleanupApplyResult {
     reclaimed_bytes: u64,
     before_inventory: DiagCleanupApplyInventory,
     after_inventory: DiagCleanupApplyInventory,
+    operation_started_at_ms: Option<i64>,
+    operation_finished_at_ms: Option<i64>,
     planned_actions: Vec<DiagCleanupApplyAction>,
     actions: Vec<DiagCleanupApplyAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<DoctorPlan>,
     receipt: DoctorRepairReceipt,
     warnings: Vec<String>,
 }
@@ -14049,6 +14587,7 @@ fn apply_diag_quarantine_cleanup(
         mode: DoctorRepairMode::CleanupApply,
         approval_requirement: DoctorApprovalRequirement::ApprovalFingerprint,
         requested: true,
+        operation_started_at_ms: Some(doctor_now_ms()),
         approval_fingerprint: plan.approval_fingerprint.clone(),
         apply_allowed: !rebuild_active
             && (safe_retained_publish_backup_count > 0 || apply_gate.apply_allowed),
@@ -14074,7 +14613,7 @@ fn apply_diag_quarantine_cleanup(
     if rebuild_active {
         let after = collect_diag_quarantine_report(data_dir, index_path);
         fill_cleanup_after_summary(&mut result, &after);
-        finalize_cleanup_apply_contract(&mut result);
+        finalize_cleanup_apply_contract(&mut result, data_dir, db_path, index_path);
         return result;
     }
 
@@ -14231,7 +14770,7 @@ fn apply_diag_quarantine_cleanup(
     let after = collect_diag_quarantine_report(data_dir, index_path);
     fill_cleanup_after_summary(&mut result, &after);
     result.applied = result.pruned_asset_count > 0;
-    finalize_cleanup_apply_contract(&mut result);
+    finalize_cleanup_apply_contract(&mut result, data_dir, db_path, index_path);
     result
 }
 
@@ -14697,10 +15236,15 @@ mod doctor_asset_taxonomy_tests {
 
     #[test]
     fn cleanup_apply_outcome_and_receipt_are_structured() {
+        let data_dir = Path::new("/tmp/cass");
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
         let mut result = DiagCleanupApplyResult {
             mode: DoctorRepairMode::CleanupApply,
             approval_requirement: DoctorApprovalRequirement::ApprovalFingerprint,
             requested: true,
+            operation_started_at_ms: Some(1_700_000_000_000),
+            operation_finished_at_ms: Some(1_700_000_000_125),
             approval_fingerprint: "cleanup-v1-test".to_string(),
             pruned_asset_count: 1,
             reclaimed_bytes: 42,
@@ -14721,11 +15265,19 @@ mod doctor_asset_taxonomy_tests {
             ..DiagCleanupApplyResult::default()
         };
 
-        finalize_cleanup_apply_contract(&mut result);
+        finalize_cleanup_apply_contract(&mut result, data_dir, &db_path, &index_path);
 
         assert_eq!(result.outcome_kind, DoctorRepairOutcomeKind::Applied);
         assert_eq!(result.retry_safety, DoctorRepairRetrySafety::SafeToRetry);
         assert_eq!(result.planned_actions.len(), 1);
+        assert_eq!(
+            result
+                .plan
+                .as_ref()
+                .expect("cleanup apply plan")
+                .approval_fingerprint,
+            "cleanup-v1-test"
+        );
         assert_eq!(result.receipt.receipt_kind, "doctor_cleanup_apply_v1");
         assert_eq!(result.receipt.mode, DoctorRepairMode::CleanupApply);
         assert_eq!(
@@ -14733,14 +15285,25 @@ mod doctor_asset_taxonomy_tests {
             DoctorRepairOutcomeKind::Applied
         );
         assert_eq!(result.receipt.approval_fingerprint, "cleanup-v1-test");
+        assert_eq!(result.receipt.started_at_ms, Some(1_700_000_000_000));
+        assert_eq!(result.receipt.finished_at_ms, Some(1_700_000_000_125));
+        assert_eq!(result.receipt.duration_ms, Some(125));
         assert_eq!(result.receipt.planned_action_count, 1);
         assert_eq!(result.receipt.applied_action_count, 1);
         assert_eq!(result.receipt.reclaimed_bytes, 42);
+        assert_eq!(result.receipt.bytes_planned, 42);
+        assert_eq!(result.receipt.bytes_pruned, 42);
+        assert_eq!(
+            result.receipt.plan_fingerprint,
+            result.plan.as_ref().unwrap().plan_fingerprint
+        );
 
         let mut partially_blocked = DiagCleanupApplyResult {
             mode: DoctorRepairMode::CleanupApply,
             approval_requirement: DoctorApprovalRequirement::ApprovalFingerprint,
             requested: true,
+            operation_started_at_ms: Some(1_700_000_001_000),
+            operation_finished_at_ms: Some(1_700_000_001_010),
             approval_fingerprint: "cleanup-v1-partial".to_string(),
             pruned_asset_count: 1,
             reclaimed_bytes: 42,
@@ -14749,7 +15312,7 @@ mod doctor_asset_taxonomy_tests {
             ..DiagCleanupApplyResult::default()
         };
 
-        finalize_cleanup_apply_contract(&mut partially_blocked);
+        finalize_cleanup_apply_contract(&mut partially_blocked, data_dir, &db_path, &index_path);
 
         assert_eq!(
             partially_blocked.outcome_kind,
