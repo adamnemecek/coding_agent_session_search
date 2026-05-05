@@ -1,7 +1,6 @@
 mod util;
 
 use serde_json::Value;
-use std::path::Path;
 use util::doctor_fixture::{
     DoctorFixtureArtifact, DoctorFixtureFactory, DoctorFixtureScenario, DoctorProviderSpec,
 };
@@ -44,6 +43,7 @@ fn doctor_fixture_factory_provider_matrix_never_targets_real_agent_homes() {
     let mut factory = DoctorFixtureFactory::new("provider-matrix");
     factory.add_all_provider_source_trees();
     factory.validate_manifest().expect("manifest valid");
+    let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
 
     assert_eq!(
         factory.manifest().provider_set.len(),
@@ -57,11 +57,14 @@ fn doctor_fixture_factory_provider_matrix_never_targets_real_agent_homes() {
             "provider fixture wrote outside temp root: {}",
             artifact.relative_path
         );
-        assert!(
-            !absolute.starts_with(Path::new("/home")) && !absolute.starts_with(Path::new("/Users")),
-            "provider fixture must not write to real agent homes: {}",
-            absolute.display()
-        );
+        if let Some(real_home) = &real_home {
+            assert!(
+                !absolute.starts_with(real_home.join(".codex"))
+                    && !absolute.starts_with(real_home.join(".claude")),
+                "provider fixture must not write to real agent harness homes: {}",
+                absolute.display()
+            );
+        }
     }
 }
 
@@ -203,6 +206,8 @@ fn doctor_fixture_raw_mirror_keeps_source_id_distinct_from_origin_kind() {
         serde_json::from_slice(&std::fs::read(&manifest_path).expect("read raw mirror manifest"))
             .expect("parse raw mirror manifest");
 
+    assert_eq!(manifest["db_links"][0]["conversation_id"].as_i64(), Some(1));
+    assert_eq!(manifest["db_links"][0]["message_count"].as_u64(), Some(2));
     assert_eq!(manifest["source_id"].as_str(), Some("work-laptop"));
     assert_eq!(manifest["origin_kind"].as_str(), Some("ssh"));
     assert_eq!(manifest["origin_host"].as_str(), Some("work-laptop"));

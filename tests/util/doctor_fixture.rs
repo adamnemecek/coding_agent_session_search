@@ -287,7 +287,14 @@ impl DoctorFixtureFactory {
             self.manifest
                 .expected_source_inventory
                 .mirrored_source_count += 1;
-            let manifest = self.write_raw_mirror(provider, source_id, &source_path, source_bytes);
+            let manifest = self.write_raw_mirror(
+                provider,
+                source_id,
+                &source_path,
+                source_bytes,
+                conversation_id,
+                2,
+            );
             manifest["manifest_id"].as_str().map(ToOwned::to_owned)
         } else {
             None
@@ -507,6 +514,30 @@ impl DoctorFixtureFactory {
                 "doctor raw_mirror manifest_count should match fixture manifest"
             );
         }
+        if self.manifest.expected_coverage_state == "source-pruned-mirror-verified" {
+            assert_eq!(
+                payload["raw_mirror"]["status"].as_str(),
+                Some("verified"),
+                "doctor raw_mirror status should prove pruned-source evidence is verified"
+            );
+        }
+        if self
+            .manifest
+            .expected_anomalies
+            .iter()
+            .any(|anomaly| anomaly == "upstream-source-pruned")
+        {
+            assert!(
+                expected.missing_current_source_count > 0,
+                "upstream-source-pruned fixtures should declare a missing current source"
+            );
+            assert!(
+                payload["source_inventory"]["missing_current_source_count"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "doctor source_inventory should report the pruned upstream source"
+            );
+        }
     }
 
     fn insert_conversation(
@@ -557,6 +588,8 @@ impl DoctorFixtureFactory {
         source_id: &str,
         original_path: &Path,
         bytes: &[u8],
+        conversation_id: i64,
+        message_count: usize,
     ) -> Value {
         let blob_blake3 = blake3_hex(bytes);
         let blob_relative_path = format!("blobs/blake3/{}/{}.raw", &blob_blake3[..2], blob_blake3);
@@ -605,8 +638,8 @@ impl DoctorFixtureFactory {
                 "envelope_version": Value::Null
             },
             "db_links": [{
-                "conversation_id": Value::Null,
-                "message_count": 2,
+                "conversation_id": conversation_id,
+                "message_count": message_count,
                 "source_path": original_path.to_string_lossy(),
                 "started_at_ms": FIXTURE_BASE_TS_MS
             }],
@@ -650,6 +683,21 @@ impl DoctorFixtureFactory {
         );
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        if path.exists() {
+            let existing = fs::read(path).expect("read existing doctor fixture file");
+            assert_eq!(
+                existing,
+                bytes,
+                "doctor fixture refuses to overwrite existing fixture file with different bytes: {}",
+                path.display()
+            );
+            self.record_file(kind, path);
+            self.log(
+                "reuse_file",
+                &format!("{kind}:{}", self.relative_to_root(path)),
+            );
+            return;
         }
         fs::write(path, bytes).expect("write doctor fixture file");
         self.record_file(kind, path);

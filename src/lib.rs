@@ -14648,7 +14648,10 @@ fn doctor_verify_raw_mirror_manifest(
         None => DoctorArtifactChecksumStatus::NotRecorded,
     };
 
-    if path_has_symlink_below_root(&blob_path, root) {
+    if blob_path
+        .parent()
+        .is_none_or(|parent| existing_path_has_symlink_below_root(parent, root))
+    {
         return doctor_raw_mirror_loaded_invalid_manifest_report(
             data_dir,
             manifest_path,
@@ -16467,6 +16470,28 @@ fn path_has_symlink_below_root(path: &Path, root: &Path) -> bool {
     }
 }
 
+fn existing_path_has_symlink_below_root(path: &Path, root: &Path) -> bool {
+    let mut current = path;
+    loop {
+        if current == root {
+            return false;
+        }
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+        let Some(parent) = current.parent() else {
+            return true;
+        };
+        if parent == current {
+            return true;
+        }
+        current = parent;
+    }
+}
+
 #[cfg(test)]
 mod doctor_asset_taxonomy_tests {
     use super::*;
@@ -17456,6 +17481,41 @@ mod doctor_asset_taxonomy_tests {
         assert_eq!(
             report.summary.verified_blob_count, 0,
             "a blob reached through a symlinked parent must not count as verified evidence"
+        );
+    }
+
+    #[test]
+    fn raw_mirror_report_counts_missing_blob_without_relabeling_manifest_invalid() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = data_dir.join("sessions/source.jsonl");
+        let bytes = b"{\"type\":\"message\",\"text\":\"missing blob\"}\n";
+        let manifest =
+            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
+        let root = doctor_raw_mirror_root(&data_dir);
+        let manifest_path = root.join(doctor_raw_mirror_manifest_relative_path(
+            &manifest.manifest_id,
+        ));
+        std::fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
+            .expect("create manifest parent");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+        )
+        .expect("write raw mirror manifest without blob");
+
+        let report = collect_doctor_raw_mirror_report(&data_dir);
+        assert_eq!(report.status, "warn");
+        assert_eq!(report.summary.manifest_count, 1);
+        assert_eq!(report.summary.missing_blob_count, 1);
+        assert_eq!(
+            report.summary.invalid_manifest_count, 0,
+            "a correctly formed manifest with an absent blob should diagnose missing evidence, not manifest corruption"
+        );
+        assert_eq!(report.manifests[0].status, "missing_blob");
+        assert_eq!(
+            report.manifests[0].blob_checksum_status,
+            DoctorArtifactChecksumStatus::Missing
         );
     }
 
