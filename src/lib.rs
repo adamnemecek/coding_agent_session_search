@@ -8210,7 +8210,9 @@ fn ensure_lexical_assets_for_search(
     let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
     let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
     if initial_rebuild_active {
-        if initial_index_exists {
+        if initial_index_exists
+            && search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none()
+        {
             return Ok(SearchLexicalSelfHeal {
                 action: "active-rebuild-searching-existing-index",
                 reason: Some("lexical repair is already running".to_string()),
@@ -8224,15 +8226,17 @@ fn ensure_lexical_assets_for_search(
             index_path,
             search_active_rebuild_wait_duration(timeout_ms, started_at),
         );
-        return if waited {
-            Ok(SearchLexicalSelfHeal {
+        if !waited {
+            return Err(search_lock_busy_error(data_dir));
+        }
+
+        if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+            return Ok(SearchLexicalSelfHeal {
                 action: "waited-for-active-rebuild",
                 reason: Some("foreground search waited for active lexical repair".to_string()),
                 indexed_docs: None,
-            })
-        } else {
-            Err(search_lock_busy_error(data_dir))
-        };
+            });
+        }
     }
 
     let Some(diagnosis) = search_lexical_self_heal_diagnosis(index_path, db_path)? else {
