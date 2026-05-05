@@ -16266,7 +16266,7 @@ fn doctor_source_authority_coverage_delta(
         unknown_mapping_count: source_inventory.unknown_mapping_count,
         raw_mirror_db_link_count,
         visible_local_source_minus_archive: visible_local_source_conversation_count as i64
-            - source_inventory.local_source_count as i64,
+            - source_inventory.total_indexed_conversations as i64,
         raw_mirror_links_minus_archive: raw_mirror_db_link_count as i64
             - source_inventory.total_indexed_conversations as i64,
     }
@@ -16373,8 +16373,9 @@ fn build_doctor_source_authority_report(
             DoctorSourceAuthorityKind::VerifiedRawMirror,
             DoctorSourceAuthorityDecision::Refused,
             format!(
-                "raw mirror is not trusted for archive repair: status={}, checksum_status={:?}",
-                raw_mirror.status, checksum_evidence.summary_status
+                "raw mirror is not trusted for archive repair: status={}, checksum_status={}",
+                raw_mirror.status,
+                doctor_artifact_checksum_status_label(checksum_evidence.summary_status)
             ),
             coverage_delta.raw_mirror_links_minus_archive,
             freshness_delta.raw_mirror_capture_minus_archive_db_ms,
@@ -16488,6 +16489,13 @@ fn doctor_artifact_checksum_status(
 }
 
 fn doctor_action_status_label(status: DoctorActionStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn doctor_artifact_checksum_status_label(status: DoctorArtifactChecksumStatus) -> String {
     serde_json::to_value(status)
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
@@ -18186,6 +18194,18 @@ mod doctor_asset_taxonomy_tests {
         DoctorOperationOutcomeKind::RequiresManualReview,
     ];
 
+    const ALL_DOCTOR_SOURCE_AUTHORITIES: &[DoctorSourceAuthorityKind] = &[
+        DoctorSourceAuthorityKind::CanonicalArchiveDb,
+        DoctorSourceAuthorityKind::VerifiedRawMirror,
+        DoctorSourceAuthorityKind::VerifiedBackupBundle,
+        DoctorSourceAuthorityKind::VerifiedCandidateArchive,
+        DoctorSourceAuthorityKind::LiveUpstreamSource,
+        DoctorSourceAuthorityKind::RemoteSyncCopy,
+        DoctorSourceAuthorityKind::DerivedLexicalIndex,
+        DoctorSourceAuthorityKind::DerivedSemanticIndex,
+        DoctorSourceAuthorityKind::SupportBundle,
+    ];
+
     #[test]
     fn doctor_asset_taxonomy_explicitly_covers_every_class_and_operation() {
         let policy_classes: HashSet<_> = DOCTOR_ASSET_POLICY_TABLE
@@ -19215,6 +19235,134 @@ mod doctor_asset_taxonomy_tests {
         assert!(
             payload["source_inventory"]["providers"].is_array(),
             "source_inventory JSON should remain parseable and array-backed"
+        );
+    }
+
+    #[test]
+    fn doctor_source_authority_matrix_covers_every_kind_and_refuses_derived_outputs() {
+        let policy_kinds: HashSet<_> = DOCTOR_SOURCE_AUTHORITY_POLICY_TABLE
+            .iter()
+            .map(|policy| policy.authority)
+            .collect();
+        let expected_kinds: HashSet<_> =
+            ALL_DOCTOR_SOURCE_AUTHORITIES.iter().copied().collect();
+        assert_eq!(
+            policy_kinds, expected_kinds,
+            "every source authority kind must have an explicit precedence policy"
+        );
+        assert_eq!(
+            DOCTOR_SOURCE_AUTHORITY_POLICY_TABLE.len(),
+            policy_kinds.len(),
+            "source authority policy table must not contain duplicate authorities"
+        );
+
+        let lexical = doctor_source_authority_policy(DoctorSourceAuthorityKind::DerivedLexicalIndex);
+        assert!(lexical.repairs.is_empty());
+        assert_eq!(
+            lexical.decision_when_valid,
+            DoctorSourceAuthorityDecision::Refused,
+            "derived lexical indexes are repair targets, not archive authorities"
+        );
+
+        let candidate =
+            doctor_source_authority_policy(DoctorSourceAuthorityKind::VerifiedCandidateArchive);
+        assert!(
+            candidate
+                .required_evidence
+                .contains(&"coverage-nondecreasing"),
+            "candidate promotion must require non-decreasing coverage"
+        );
+        assert_eq!(
+            candidate.decision_when_valid,
+            DoctorSourceAuthorityDecision::Promotable
+        );
+    }
+
+    #[test]
+    fn doctor_source_authority_report_rejects_pruned_live_source_but_keeps_verified_mirror() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"db placeholder").expect("write db placeholder");
+        let missing_source = data_dir.join("sessions/pruned.jsonl");
+        let rows = vec![DoctorSourceInventoryDbRow {
+            provider: "codex".to_string(),
+            source_path: Some(missing_source.display().to_string()),
+            source_id: "local".to_string(),
+            origin_host: None,
+            origin_kind: Some("local".to_string()),
+            conversation_count: 1,
+        }];
+        let source_inventory =
+            build_doctor_source_inventory_report(&data_dir, true, None, rows, Vec::new());
+        let bytes = b"{\"type\":\"message\",\"content\":\"preserved\"}\n";
+        let manifest = raw_mirror_test_manifest(
+            &data_dir,
+            "codex",
+            "local",
+            &missing_source,
+            bytes,
+            vec![DoctorRawMirrorDbLink {
+                conversation_id: Some(1),
+                message_count: Some(1),
+                source_path: Some(missing_source.display().to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+            }],
+        );
+        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
+
+        assert_eq!(
+            report.selected_authority,
+            Some(DoctorSourceAuthorityKind::CanonicalArchiveDb)
+        );
+        assert!(
+            report.selected_authorities.iter().any(|candidate| {
+                candidate.authority == DoctorSourceAuthorityKind::VerifiedRawMirror
+                    && candidate.decision == DoctorSourceAuthorityDecision::CandidateOnly
+                    && candidate.coverage_delta == 0
+            }),
+            "verified raw mirror should remain a candidate authority when upstream is pruned: {report:#?}"
+        );
+        assert!(
+            report.rejected_authorities.iter().any(|candidate| {
+                candidate.authority == DoctorSourceAuthorityKind::LiveUpstreamSource
+                    && candidate.reason.contains("missing local conversation")
+                    && candidate.coverage_delta < 0
+                    && candidate
+                        .evidence
+                        .contains(&"coverage-shrinks-relative-to-archive".to_string())
+            }),
+            "pruned live source must be rejected with stable coverage evidence: {report:#?}"
+        );
+        assert_eq!(
+            report.checksum_evidence.summary_status,
+            DoctorArtifactChecksumStatus::Matched
+        );
+        assert_eq!(report.coverage_delta.raw_mirror_db_link_count, 1);
+    }
+
+    #[test]
+    fn doctor_source_authority_report_refuses_unverified_mirror_when_archive_missing() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let db_path = data_dir.join("agent_search.db");
+        let source_inventory =
+            build_doctor_source_inventory_report(&data_dir, false, None, Vec::new(), Vec::new());
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
+
+        assert_eq!(report.decision, DoctorSourceAuthorityDecision::Refused);
+        assert_eq!(report.selected_authority, None);
+        assert!(
+            report.rejected_authorities.iter().any(|candidate| {
+                candidate.authority == DoctorSourceAuthorityKind::VerifiedRawMirror
+                    && candidate.reason.contains("not trusted")
+                    && candidate.checksum_status == DoctorArtifactChecksumStatus::NotRecorded
+            }),
+            "missing mirror should fail closed instead of pretending live sources are authoritative: {report:#?}"
         );
     }
 
@@ -26115,6 +26263,101 @@ fn response_schema_doctor_raw_mirror() -> serde_json::Value {
     })
 }
 
+fn response_schema_doctor_source_authority() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Fail-closed source-authority precedence report. Robots should use selected_authority, rejected_authorities, coverage_delta, freshness_delta, and checksum_evidence before any repair or reconstruction.",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "decision": { "type": "string", "description": "read_only | candidate_only | promotable | refused" },
+            "selected_authority": { "type": ["string", "null"] },
+            "selected_authorities": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "authority": { "type": "string" },
+                        "decision": { "type": "string" },
+                        "reason": { "type": "string" },
+                        "repairs": { "type": "array", "items": { "type": "string" } },
+                        "coverage_delta": { "type": "integer" },
+                        "freshness_delta_ms": { "type": ["integer", "null"] },
+                        "checksum_status": { "type": "string" },
+                        "evidence": { "type": "array", "items": { "type": "string" } }
+                    }
+                }
+            },
+            "rejected_authorities": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "authority": { "type": "string" },
+                        "decision": { "type": "string" },
+                        "reason": { "type": "string" },
+                        "repairs": { "type": "array", "items": { "type": "string" } },
+                        "coverage_delta": { "type": "integer" },
+                        "freshness_delta_ms": { "type": ["integer", "null"] },
+                        "checksum_status": { "type": "string" },
+                        "evidence": { "type": "array", "items": { "type": "string" } }
+                    }
+                }
+            },
+            "coverage_delta": {
+                "type": "object",
+                "properties": {
+                    "archive_conversation_count": { "type": "integer" },
+                    "visible_local_source_conversation_count": { "type": "integer" },
+                    "missing_current_source_count": { "type": "integer" },
+                    "remote_source_count": { "type": "integer" },
+                    "unknown_mapping_count": { "type": "integer" },
+                    "raw_mirror_db_link_count": { "type": "integer" },
+                    "visible_local_source_minus_archive": { "type": "integer" },
+                    "raw_mirror_links_minus_archive": { "type": "integer" }
+                }
+            },
+            "freshness_delta": {
+                "type": "object",
+                "properties": {
+                    "archive_db_modified_at_ms": { "type": ["integer", "null"] },
+                    "newest_raw_mirror_capture_at_ms": { "type": ["integer", "null"] },
+                    "newest_raw_mirror_source_mtime_ms": { "type": ["integer", "null"] },
+                    "raw_mirror_capture_minus_archive_db_ms": { "type": ["integer", "null"] },
+                    "freshness_state": { "type": "string" }
+                }
+            },
+            "checksum_evidence": {
+                "type": "object",
+                "properties": {
+                    "raw_mirror_status": { "type": "string" },
+                    "raw_mirror_manifest_count": { "type": "integer" },
+                    "raw_mirror_verified_blob_count": { "type": "integer" },
+                    "raw_mirror_missing_blob_count": { "type": "integer" },
+                    "raw_mirror_checksum_mismatch_count": { "type": "integer" },
+                    "raw_mirror_manifest_checksum_mismatch_count": { "type": "integer" },
+                    "raw_mirror_manifest_checksum_not_recorded_count": { "type": "integer" },
+                    "raw_mirror_invalid_manifest_count": { "type": "integer" },
+                    "summary_status": { "type": "string" }
+                }
+            },
+            "matrix": { "type": "array", "items": response_schema_opaque_object() },
+            "notes": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": [
+            "schema_version",
+            "decision",
+            "selected_authority",
+            "selected_authorities",
+            "rejected_authorities",
+            "coverage_delta",
+            "freshness_delta",
+            "checksum_evidence",
+            "matrix",
+            "notes"
+        ]
+    })
+}
+
 fn response_schema_search_hit() -> serde_json::Value {
     response_schema_object([
         ("source_path", serde_json::json!({ "type": "string" })),
@@ -27023,6 +27266,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "repair_contract": response_schema_opaque_object(),
                 "source_inventory": response_schema_doctor_source_inventory(),
                 "raw_mirror": response_schema_doctor_raw_mirror(),
+                "source_authority": response_schema_doctor_source_authority(),
                 "quarantine": response_schema_opaque_object(),
                 "cleanup_apply": response_schema_doctor_cleanup_apply(),
                 "_meta": response_schema_opaque_object(),
@@ -27049,7 +27293,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     }
                 }
             },
-            "required": ["status", "health_class", "healthy", "initialized", "operation_outcome", "checks"]
+            "required": ["status", "health_class", "healthy", "initialized", "operation_outcome", "source_authority", "checks"]
         }),
     );
 
