@@ -19038,9 +19038,7 @@ enum DoctorFtsTableState {
     Missing { frankensqlite_error: String },
 }
 
-fn probe_doctor_fts_table(
-    conn: &crate::storage::sqlite::SendFrankenConnection,
-) -> DoctorFtsTableState {
+fn probe_doctor_fts_table(conn: &frankensqlite::Connection) -> DoctorFtsTableState {
     match conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
         Ok(_) => DoctorFtsTableState::QueryableViaFrankensqlite,
         Err(frankensqlite_error) => DoctorFtsTableState::Missing {
@@ -19106,8 +19104,7 @@ mod doctor_fts_tests {
              INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
              VALUES(7, 'retro investigation', 'retro', 'codex', '/ws', '/tmp/retro.jsonl', 42, '7');",
         )?;
-        let state =
-            probe_doctor_fts_table(&crate::storage::sqlite::SendFrankenConnection::new(conn));
+        let state = probe_doctor_fts_table(&conn);
         assert!(
             matches!(state, DoctorFtsTableState::QueryableViaFrankensqlite),
             "frankensqlite FTS table should be accepted by doctor: {state:?}"
@@ -19123,8 +19120,7 @@ mod doctor_fts_tests {
 
         let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
         create_search_schema(&conn)?;
-        let state =
-            probe_doctor_fts_table(&crate::storage::sqlite::SendFrankenConnection::new(conn));
+        let state = probe_doctor_fts_table(&conn);
         assert!(
             matches!(state, DoctorFtsTableState::Missing { .. }),
             "missing FTS table should be reported as missing: {state:?}"
@@ -20895,23 +20891,14 @@ fn run_doctor(
     }
 
     // 3. Check database exists and is readable
-    // Fix #128: Wrap the DB open in a timeout to prevent hanging on degraded databases.
+    // Fix #128: use the CLI read-only opener with a timeout to prevent hanging on degraded
+    // databases without dirtying precious archive evidence during a read-only doctor check.
     if db_path.exists() {
-        let db_open_result = {
-            let db_path_str = db_path.to_string_lossy().to_string();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(
-                    frankensqlite::Connection::open(&db_path_str)
-                        .map(crate::storage::sqlite::SendFrankenConnection::new),
-                );
-            });
-            rx.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| {
-                Err(frankensqlite::FrankenError::internal(
-                    "database open timed out after 30s (possible corruption or lock contention)",
-                ))
-            })
-        };
+        let db_open_result = open_franken_cli_read_db(
+            db_path.to_path_buf(),
+            "doctor database health",
+            Duration::from_secs(30),
+        );
         match db_open_result {
             Ok(conn) => {
                 use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
@@ -21009,12 +20996,13 @@ fn run_doctor(
                     add_check!("database", "fail", "Database query failed", true);
                     needs_rebuild = true;
                 }
+                let _ = close_franken_cli_read_db(conn, &db_path, "doctor database health");
             }
             Err(e) => {
                 add_check!(
                     "database",
                     "fail",
-                    format!("Cannot open database: {}", e),
+                    format!("Cannot open database: {}", e.message),
                     true
                 );
                 needs_rebuild = true;
@@ -21046,9 +21034,11 @@ fn run_doctor(
 
                 // Check if index is empty but database has data
                 if num_docs == 0 && db_ok {
-                    if let Ok(conn) =
-                        frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
-                    {
+                    if let Ok(conn) = open_franken_cli_read_db(
+                        db_path.to_path_buf(),
+                        "doctor index sync",
+                        Duration::from_secs(1),
+                    ) {
                         use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
                         if let Ok(msg_count) = conn.query_row_map(
                             "SELECT COUNT(*) FROM messages",
@@ -21068,6 +21058,7 @@ fn run_doctor(
                                 needs_rebuild = true;
                             }
                         }
+                        let _ = close_franken_cli_read_db(conn, &db_path, "doctor index sync");
                     }
                 }
             }
