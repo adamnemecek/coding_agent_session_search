@@ -19639,7 +19639,7 @@ fn execute_doctor_copy_file_to_staging(
         .precondition_checks
         .push("target_blake3_matched_source".to_string());
 
-    match std::fs::File::open(request.target_path).and_then(|file| file.sync_all()) {
+    match sync_file(request.target_path, "copied staging target") {
         Ok(()) => {
             receipt.status = DoctorActionStatus::Applied;
             receipt
@@ -19648,10 +19648,7 @@ fn execute_doctor_copy_file_to_staging(
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
-            receipt.blocked_reasons.push(format!(
-                "failed to sync copied staging target {}: {err}",
-                request.target_path.display()
-            ));
+            receipt.blocked_reasons.push(err);
         }
     }
     receipt
@@ -19830,7 +19827,7 @@ fn execute_doctor_promote_staged_file(
         .precondition_checks
         .push("target_blake3_matched_source".to_string());
 
-    match std::fs::File::open(request.target_path).and_then(|file| file.sync_all()) {
+    match sync_file(request.target_path, "promoted target") {
         Ok(()) => {
             receipt
                 .precondition_checks
@@ -19838,10 +19835,7 @@ fn execute_doctor_promote_staged_file(
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
-            receipt.blocked_reasons.push(format!(
-                "failed to sync promoted target {}: {err}",
-                request.target_path.display()
-            ));
+            receipt.blocked_reasons.push(err);
             return receipt;
         }
     }
@@ -20034,7 +20028,7 @@ fn execute_doctor_restore_staged_file(
         .precondition_checks
         .push("target_blake3_matched_source".to_string());
 
-    match std::fs::File::open(request.target_path).and_then(|file| file.sync_all()) {
+    match sync_file(request.target_path, "restored target") {
         Ok(()) => {
             receipt
                 .precondition_checks
@@ -20042,10 +20036,7 @@ fn execute_doctor_restore_staged_file(
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
-            receipt.blocked_reasons.push(format!(
-                "failed to sync restored target {}: {err}",
-                request.target_path.display()
-            ));
+            receipt.blocked_reasons.push(err);
             return receipt;
         }
     }
@@ -20247,7 +20238,7 @@ fn execute_doctor_move_file_to_quarantine(
         .precondition_checks
         .push("target_blake3_matched_source".to_string());
 
-    match std::fs::File::open(request.target_path).and_then(|file| file.sync_all()) {
+    match sync_file(request.target_path, "quarantined target") {
         Ok(()) => {
             receipt
                 .precondition_checks
@@ -20255,10 +20246,7 @@ fn execute_doctor_move_file_to_quarantine(
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
-            receipt.blocked_reasons.push(format!(
-                "failed to sync quarantined target {}: {err}",
-                request.target_path.display()
-            ));
+            receipt.blocked_reasons.push(err);
             return receipt;
         }
     }
@@ -20316,7 +20304,61 @@ fn file_blake3_hex(path: &Path) -> Result<String, String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    static DOCTOR_TEST_FAIL_NEXT_FILE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DOCTOR_TEST_FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn doctor_test_inject_next_file_sync_failure() {
+    DOCTOR_TEST_FAIL_NEXT_FILE_SYNC.with(|fail_next| fail_next.set(true));
+}
+
+#[cfg(test)]
+fn doctor_test_inject_next_directory_sync_failure() {
+    DOCTOR_TEST_FAIL_NEXT_DIRECTORY_SYNC.with(|fail_next| fail_next.set(true));
+}
+
+#[cfg(test)]
+fn doctor_test_take_next_file_sync_failure() -> bool {
+    DOCTOR_TEST_FAIL_NEXT_FILE_SYNC.with(|fail_next| fail_next.replace(false))
+}
+
+#[cfg(not(test))]
+fn doctor_test_take_next_file_sync_failure() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn doctor_test_take_next_directory_sync_failure() -> bool {
+    DOCTOR_TEST_FAIL_NEXT_DIRECTORY_SYNC.with(|fail_next| fail_next.replace(false))
+}
+
+#[cfg(not(test))]
+fn doctor_test_take_next_directory_sync_failure() -> bool {
+    false
+}
+
+fn sync_file(path: &Path, label: &str) -> Result<(), String> {
+    if doctor_test_take_next_file_sync_failure() {
+        return Err(format!(
+            "injected test failure syncing {label} {}",
+            path.display()
+        ));
+    }
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| format!("failed to sync {label} {}: {err}", path.display()))
+}
+
 fn sync_directory(path: &Path) -> Result<(), String> {
+    if doctor_test_take_next_directory_sync_failure() {
+        return Err(format!(
+            "injected test failure syncing directory {}",
+            path.display()
+        ));
+    }
     std::fs::File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|err| format!("failed to sync directory {}: {err}", path.display()))
@@ -23126,6 +23168,152 @@ mod doctor_asset_taxonomy_tests {
         assert!(
             !db_path.exists(),
             "blocked restore must not create live target"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_reports_restore_file_sync_failure_after_rename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        let staging_root = data_dir
+            .join("doctor-restore")
+            .join("restore-file-sync-fail");
+        let source_path = staging_root.join("candidate.db");
+        let source_bytes = b"restore candidate bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create staged restore parent");
+        std::fs::write(&source_path, source_bytes).expect("write staged restore source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        doctor_test_inject_next_file_sync_failure();
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "restore-apply-archive",
+            action_id: "restore-file-sync-fail",
+            mutation_kind: DoctorFsMutationKind::RestoreStagedFile,
+            mode: DoctorRepairMode::RestoreApply,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Failed);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("injected test failure syncing restored target")),
+            "restore file sync failure should be explicit: {:?}",
+            receipt.blocked_reasons
+        );
+        for expected in [
+            "filesystem_rename_completed",
+            "target_blake3_matched_source",
+        ] {
+            assert!(
+                receipt
+                    .precondition_checks
+                    .iter()
+                    .any(|observed| observed == expected),
+                "restore file-sync failure should record completed step {expected}: {:?}",
+                receipt.precondition_checks
+            );
+        }
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "target_file_sync_completed"),
+            "restore file-sync failure must not claim target sync completed"
+        );
+        assert!(
+            !source_path.exists(),
+            "post-rename sync failure should leave the staged source consumed"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read restored target after sync failure"),
+            source_bytes,
+            "failed receipt must still leave a recoverable target for inspection"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_reports_restore_parent_sync_failure_after_file_sync() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        let staging_root = data_dir
+            .join("doctor-restore")
+            .join("restore-dir-sync-fail");
+        let source_path = staging_root.join("candidate.db");
+        let source_bytes = b"restore candidate bytes";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create staged restore parent");
+        std::fs::write(&source_path, source_bytes).expect("write staged restore source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        doctor_test_inject_next_directory_sync_failure();
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "restore-apply-archive",
+            action_id: "restore-parent-sync-fail",
+            mutation_kind: DoctorFsMutationKind::RestoreStagedFile,
+            mode: DoctorRepairMode::RestoreApply,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&source_path),
+            target_path: &db_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Failed);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("injected test failure syncing directory")),
+            "restore parent sync failure should be explicit: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "target_file_sync_completed"),
+            "parent-sync failure should prove the restored target was fsynced first"
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "target_parent_sync_completed"),
+            "parent-sync failure must not claim directory sync completed"
+        );
+        assert!(
+            !source_path.exists(),
+            "post-rename parent sync failure should leave the staged source consumed"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read restored target after parent sync failure"),
+            source_bytes,
+            "failed receipt must leave a recoverable restored target for inspection"
         );
     }
 
