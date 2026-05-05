@@ -21859,6 +21859,68 @@ mod doctor_asset_taxonomy_tests {
     }
 
     #[test]
+    fn doctor_fs_mutation_executor_snapshots_archive_to_staging_without_deleting_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        let archive_bytes = b"precious canonical archive bytes";
+        std::fs::write(&db_path, archive_bytes).expect("write archive db placeholder");
+        let expected_source_blake3 = blake3::hash(archive_bytes).to_hex().to_string();
+
+        let staging_root = data_dir.join("doctor-staging").join("snapshot-op-1");
+        let target_path = staging_root.join("before").join("agent_search.db");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create snapshot target parent");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-snapshot",
+            action_id: "snapshot-archive-before-promote",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::CanonicalArchiveDb,
+            source_path: Some(&db_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: archive_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Applied);
+        assert_eq!(receipt.asset_class, DoctorAssetClass::CanonicalArchiveDb);
+        assert_eq!(
+            receipt.actual_source_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            receipt.actual_target_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            receipt.redacted_source_path.as_deref(),
+            Some("[cass-data]/agent_search.db")
+        );
+        assert_eq!(
+            receipt.redacted_target_path,
+            "[cass-data]/doctor-staging/snapshot-op-1/before/agent_search.db"
+        );
+        assert_eq!(
+            std::fs::read(&target_path).expect("read snapshot target"),
+            archive_bytes
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read original archive"),
+            archive_bytes,
+            "snapshot copy must preserve the precious source archive"
+        );
+    }
+
+    #[test]
     fn doctor_fs_mutation_executor_refuses_to_overwrite_staging_target() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
