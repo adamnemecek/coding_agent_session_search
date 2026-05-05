@@ -19943,6 +19943,144 @@ mod doctor_asset_taxonomy_tests {
     }
 
     #[test]
+    fn doctor_plan_fingerprint_covers_paths_authorities_asset_classes_and_hash_fields() {
+        let data_dir = Path::new("/tmp/cass");
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let result = DiagCleanupApplyResult {
+            mode: DoctorRepairMode::CleanupApply,
+            approval_requirement: DoctorApprovalRequirement::ApprovalFingerprint,
+            approval_fingerprint: "cleanup-v1-approval-a".to_string(),
+            before_generation_count: 1,
+            before_reclaim_candidate_count: 1,
+            before_reclaimable_bytes: 10,
+            before_retained_bytes: 0,
+            actions: vec![test_cleanup_action(
+                "/tmp/cass/index/.lexical-publish-backups/a",
+                10,
+            )],
+            ..DiagCleanupApplyResult::default()
+        };
+
+        let baseline = build_cleanup_doctor_plan(&result, data_dir, &db_path, &index_path);
+
+        let mut changed_path = result.clone();
+        changed_path.actions[0].path = "/tmp/cass/index/.lexical-publish-backups/b".to_string();
+        let changed_path_plan =
+            build_cleanup_doctor_plan(&changed_path, data_dir, &db_path, &index_path);
+        assert_ne!(
+            baseline.plan_fingerprint, changed_path_plan.plan_fingerprint,
+            "fingerprint invariant failed: field=actions.target_path \
+             expected safe behavior=changing cleanup target path must require a new approval"
+        );
+
+        let mut changed_action_class = result.clone();
+        changed_action_class.actions[0].artifact_kind = "failed_lexical_generation".to_string();
+        let changed_action_class_plan =
+            build_cleanup_doctor_plan(&changed_action_class, data_dir, &db_path, &index_path);
+        assert_ne!(
+            baseline.plan_fingerprint, changed_action_class_plan.plan_fingerprint,
+            "fingerprint invariant failed: field=actions.action_kind \
+             expected safe behavior=changing cleanup action class must require a new approval"
+        );
+
+        let mut changed_asset_class = result.clone();
+        changed_asset_class.actions[0].asset_safety =
+            doctor_asset_safety(DoctorAssetClass::ReclaimableDerivedCache);
+        let changed_asset_class_plan =
+            build_cleanup_doctor_plan(&changed_asset_class, data_dir, &db_path, &index_path);
+        assert_ne!(
+            baseline.plan_fingerprint, changed_asset_class_plan.plan_fingerprint,
+            "fingerprint invariant failed: field=actions.asset_class \
+             expected safe behavior=changing asset class must require a new approval"
+        );
+
+        let mut changed_approval = result.clone();
+        changed_approval.approval_fingerprint = "cleanup-v1-approval-b".to_string();
+        let changed_approval_plan =
+            build_cleanup_doctor_plan(&changed_approval, data_dir, &db_path, &index_path);
+        assert_ne!(
+            baseline.plan_fingerprint, changed_approval_plan.plan_fingerprint,
+            "fingerprint invariant failed: field=approval_fingerprint \
+             expected safe behavior=stale cleanup approval fingerprints must not match a new plan"
+        );
+
+        let mut changed_outcome = result.clone();
+        changed_outcome.outcome_kind = DoctorRepairOutcomeKind::Blocked;
+        let changed_outcome_plan =
+            build_cleanup_doctor_plan(&changed_outcome, data_dir, &db_path, &index_path);
+        assert_ne!(
+            baseline.plan_fingerprint, changed_outcome_plan.plan_fingerprint,
+            "fingerprint invariant failed: field=outcome_contract \
+             expected safe behavior=blocked versus clean plans require distinct approvals"
+        );
+
+        let mut changed_artifact_hash = baseline.clone();
+        changed_artifact_hash.artifact_manifest.artifacts[0].expected_content_blake3 =
+            Some("expected-content-hash-a".to_string());
+        let changed_artifact_hash_fingerprint =
+            doctor_cleanup_plan_fingerprint(&changed_artifact_hash);
+        assert_ne!(
+            baseline.plan_fingerprint, changed_artifact_hash_fingerprint,
+            "fingerprint invariant failed: field=artifact_manifest.artifacts.expected_content_blake3 \
+             expected safe behavior=artifact checksum/hash drift must require a new approval"
+        );
+    }
+
+    #[test]
+    fn doctor_cleanup_safety_gate_names_mode_taxonomy_and_path_blockers() {
+        let data_dir = Path::new("/tmp/cass");
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let mut action = test_cleanup_action("/tmp/outside/agent_search.db", 10);
+        action.artifact_kind = "canonical_archive_db".to_string();
+        action.asset_safety = doctor_asset_safety(DoctorAssetClass::CanonicalArchiveDb);
+
+        let gate = doctor_safety_gate_for_cleanup_action(
+            &action,
+            data_dir,
+            &db_path,
+            &index_path,
+            "cleanup-v1-approval",
+        );
+
+        assert_eq!(gate.mode, DoctorRepairMode::CleanupApply);
+        assert_eq!(gate.asset_class, DoctorAssetClass::CanonicalArchiveDb);
+        assert!(
+            !gate.allowed_by_mode,
+            "safety invariant failed: operation_kind=cleanup_apply \
+             asset_class=canonical_archive_db expected safe behavior=cleanup mode must not mutate canonical archive DB"
+        );
+        assert!(
+            !gate.allowed_by_taxonomy,
+            "safety invariant failed: asset_class=canonical_archive_db \
+             expected safe behavior=canonical archive DB is precious evidence, not automatic GC"
+        );
+        assert!(
+            !gate.path_safe,
+            "safety invariant failed: path_class=outside_data_dir \
+             expected safe behavior=cleanup must reject targets outside the cass data dir"
+        );
+        for expected in [
+            "mode_disallows_asset_class",
+            "taxonomy_disallows_automatic_reclaim",
+            "unsafe_or_missing_path",
+        ] {
+            assert!(
+                gate.blocked_reasons.iter().any(|reason| reason == expected),
+                "safety invariant failed: missing blocker={expected} \
+                 operation_kind=cleanup_apply asset_class=canonical_archive_db path_class=outside_data_dir \
+                 observed_blockers={:?}",
+                gate.blocked_reasons
+            );
+        }
+        assert!(
+            !gate.passed,
+            "safety invariant failed: cleanup_apply gate must fail closed when mode, taxonomy, and path guards all reject"
+        );
+    }
+
+    #[test]
     fn doctor_artifact_manifest_reports_checksum_mismatch_and_missing_artifacts() {
         let matched = DoctorArtifact {
             artifact_id: "matched".to_string(),
