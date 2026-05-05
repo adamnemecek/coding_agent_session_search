@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
 use super::docs::{DocLocation, GeneratedDoc};
-use super::encrypt::EncryptionConfig;
+use super::encrypt::{EncryptionConfig, validate_supported_payload_format};
 
 /// Files embedded from pages_assets at compile time
 const PAGES_ASSETS: &[(&str, &[u8])] = &[
@@ -243,10 +243,14 @@ impl BundleBuilder {
 
             // Copy payload into site/payload/
             let (chunk_count, is_encrypted) = match archive_config.as_encrypted() {
-                Some(_enc_config) => {
+                Some(enc_config) => {
                     progress("payload", "Copying encrypted payload...");
-                    let count =
-                        copy_payload_chunks(encrypted_dir, &payload_dir, &site_payload_dir)?;
+                    let count = copy_payload_chunks(
+                        encrypted_dir,
+                        &payload_dir,
+                        &site_payload_dir,
+                        enc_config,
+                    )?;
                     (count, true)
                 }
                 None => {
@@ -527,26 +531,40 @@ pub struct BundleResult {
     pub total_files: usize,
 }
 
-/// Copy payload chunks from source to destination
-fn copy_payload_chunks(src_root: &Path, src_dir: &Path, dest_dir: &Path) -> Result<usize> {
+/// Copy encrypted payload chunks from source to destination.
+///
+/// The archive config is the authority: copying by directory scan can publish
+/// stale chunks left behind by an earlier export.
+fn copy_payload_chunks(
+    src_root: &Path,
+    src_dir: &Path,
+    dest_dir: &Path,
+    config: &EncryptionConfig,
+) -> Result<usize> {
     ensure_regular_copy_directory_under_root(src_root, src_dir, "Encrypted payload directory")?;
+    validate_supported_payload_format(config)?;
 
     let mut count = 0;
 
-    for entry in fs::read_dir(src_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        let file_type = metadata.file_type();
-
-        if file_type.is_file() && path.extension().map(|e| e == "bin").unwrap_or(false) {
-            let Some(filename) = path.file_name() else {
-                continue; // Skip entries without valid filenames
-            };
-            let dest_path = dest_dir.join(filename);
-            fs::copy(&path, &dest_path)?;
-            count += 1;
+    for (idx, expected_file) in config.payload.files.iter().enumerate() {
+        let expected_path = format!("payload/chunk-{idx:05}.bin");
+        if expected_file != &expected_path {
+            bail!(
+                "Encrypted payload file entry {idx} must be {expected_path}, got {expected_file}"
+            );
         }
+
+        let rel_path = Path::new(expected_file);
+        let src_path = src_root.join(rel_path);
+        let label = format!("Encrypted payload chunk {expected_file}");
+        ensure_regular_copy_source_under_root(src_root, &src_path, &label)?;
+
+        let Some(filename) = rel_path.file_name() else {
+            bail!("Encrypted payload chunk path has no file name: {expected_file}");
+        };
+        let dest_path = dest_dir.join(filename);
+        fs::copy(&src_path, &dest_path)?;
+        count += 1;
     }
 
     Ok(count)
@@ -1091,6 +1109,25 @@ mod tests {
         serde_json::to_writer_pretty(BufWriter::new(file), &config).unwrap();
     }
 
+    fn encrypted_config_for_files(files: Vec<&str>) -> EncryptionConfig {
+        let chunk_count = files.len();
+        EncryptionConfig {
+            version: crate::pages::encrypt::SCHEMA_VERSION,
+            export_id: "export-123".to_string(),
+            base_nonce: "nonce".to_string(),
+            compression: "deflate".to_string(),
+            kdf_defaults: crate::pages::encrypt::Argon2Params::default(),
+            payload: crate::pages::encrypt::PayloadMeta {
+                chunk_size: 1024,
+                chunk_count,
+                total_compressed_size: 0,
+                total_plaintext_size: 0,
+                files: files.into_iter().map(str::to_string).collect(),
+            },
+            key_slots: Vec::new(),
+        }
+    }
+
     #[test]
     fn test_bundle_builder_default() {
         let builder = BundleBuilder::new();
@@ -1267,25 +1304,49 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_copy_payload_chunks_skips_symlinked_bin_files() {
+    fn test_copy_payload_chunks_copies_only_manifest_files() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let payload_dir = src.path().join("payload");
+        fs::create_dir_all(&payload_dir).unwrap();
+
+        fs::write(payload_dir.join("chunk-00000.bin"), "chunk").unwrap();
+        fs::write(payload_dir.join("chunk-99999.bin"), "stale chunk").unwrap();
+        fs::write(payload_dir.join("secret.bin"), "unlisted payload").unwrap();
+
+        let config = encrypted_config_for_files(vec!["payload/chunk-00000.bin"]);
+        let copied = copy_payload_chunks(src.path(), &payload_dir, dst.path(), &config).unwrap();
+        assert_eq!(copied, 1);
+        assert!(dst.path().join("chunk-00000.bin").exists());
+        assert!(!dst.path().join("chunk-99999.bin").exists());
+        assert!(!dst.path().join("secret.bin").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_payload_chunks_rejects_manifest_symlinked_chunk() {
         use std::os::unix::fs::symlink;
 
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
+        let payload_dir = src.path().join("payload");
+        fs::create_dir_all(&payload_dir).unwrap();
 
-        fs::write(src.path().join("chunk-0.bin"), "chunk").unwrap();
         fs::write(outside.path().join("secret.bin"), "secret").unwrap();
         symlink(
             outside.path().join("secret.bin"),
-            src.path().join("chunk-linked.bin"),
+            payload_dir.join("chunk-00000.bin"),
         )
         .unwrap();
 
-        let copied = copy_payload_chunks(src.path(), src.path(), dst.path()).unwrap();
-        assert_eq!(copied, 1);
-        assert!(dst.path().join("chunk-0.bin").exists());
-        assert!(!dst.path().join("chunk-linked.bin").exists());
+        let config = encrypted_config_for_files(vec!["payload/chunk-00000.bin"]);
+        let err = copy_payload_chunks(src.path(), &payload_dir, dst.path(), &config).unwrap_err();
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!dst.path().join("chunk-00000.bin").exists());
     }
 
     #[test]
@@ -1300,8 +1361,14 @@ mod tests {
         fs::write(outside.path().join("chunk-0.bin"), "outside chunk").unwrap();
         symlink(outside.path(), source.path().join("payload")).unwrap();
 
-        let err = copy_payload_chunks(source.path(), &source.path().join("payload"), dst.path())
-            .unwrap_err();
+        let config = encrypted_config_for_files(vec!["payload/chunk-00000.bin"]);
+        let err = copy_payload_chunks(
+            source.path(),
+            &source.path().join("payload"),
+            dst.path(),
+            &config,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("must not be a symlink"),
             "unexpected error: {err:#}"

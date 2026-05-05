@@ -174,6 +174,36 @@ mod tests {
     }
 
     #[test]
+    fn test_bundle_does_not_publish_unlisted_stale_payload_bins() -> Result<()> {
+        let temp = TempDir::new()?;
+        let encrypted_dir = temp.path().join("encrypted");
+        let bundle_dir = temp.path().join("bundle");
+
+        fs::create_dir_all(&encrypted_dir)?;
+        setup_encrypted_archive(&encrypted_dir)?;
+
+        let payload_dir = encrypted_dir.join("payload");
+        fs::write(
+            payload_dir.join("chunk-99999.bin"),
+            b"stale encrypted chunk",
+        )?;
+        fs::write(payload_dir.join("secret.bin"), b"unlisted payload file")?;
+
+        let builder = BundleBuilder::new();
+        let result = builder.build(&encrypted_dir, &bundle_dir, |_, _| {})?;
+
+        assert!(!result.site_dir.join("payload/chunk-99999.bin").exists());
+        assert!(!result.site_dir.join("payload/secret.bin").exists());
+
+        let integrity_content = fs::read_to_string(result.site_dir.join("integrity.json"))?;
+        let manifest: IntegrityManifest = serde_json::from_str(&integrity_content)?;
+        assert!(!manifest.files.contains_key("payload/chunk-99999.bin"));
+        assert!(!manifest.files.contains_key("payload/secret.bin"));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_bundle_generates_integrity_manifest() -> Result<()> {
         let temp = TempDir::new()?;
         let encrypted_dir = temp.path().join("encrypted");

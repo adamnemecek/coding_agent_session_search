@@ -422,10 +422,9 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
         ));
     }
 
-    // Validate chunk_count
-    if config.payload.chunk_count == 0 {
-        errors.push("chunk_count cannot be zero".to_string());
-    }
+    // Empty encrypted exports are valid: a zero-byte input produces an empty
+    // file list and the decryptors concatenate zero chunks into an empty DB
+    // byte buffer.
 
     // Validate files list matches chunk_count
     if config.payload.files.len() != config.payload.chunk_count {
@@ -1598,6 +1597,45 @@ mod tests {
         assert_eq!(result.status, "valid");
         assert!(result.checks.required_files.passed);
         assert!(result.checks.config_schema.passed);
+    }
+
+    #[test]
+    fn test_config_schema_allows_zero_chunk_encrypted_archive() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        fs::create_dir_all(&site_dir).unwrap();
+
+        let config = r#"{
+          "version": 2,
+          "export_id": "AAAAAAAAAAAAAAAAAAAAAA==",
+          "base_nonce": "AAAAAAAAAAAAAAAA",
+          "compression": "deflate",
+          "kdf_defaults": { "memory_kb": 65536, "iterations": 3, "parallelism": 4 },
+          "payload": {
+            "chunk_size": 1024,
+            "chunk_count": 0,
+            "total_compressed_size": 0,
+            "total_plaintext_size": 0,
+            "files": []
+          },
+          "key_slots": [{
+            "id": 0,
+            "slot_type": "password",
+            "kdf": "argon2id",
+            "salt": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "wrapped_dek": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "nonce": "AAAAAAAAAAAAAAAA",
+            "argon2_params": { "memory_kb": 65536, "iterations": 3, "parallelism": 4 }
+          }]
+        }"#;
+        fs::write(site_dir.join("config.json"), config).unwrap();
+
+        let result = check_config_schema(&site_dir);
+        assert!(
+            result.passed,
+            "zero-chunk encrypted config should match Rust/worker validators: {:?}",
+            result.details
+        );
     }
 
     #[test]
