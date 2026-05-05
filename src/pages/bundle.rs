@@ -1303,7 +1303,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn test_copy_payload_chunks_copies_only_manifest_files() {
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
