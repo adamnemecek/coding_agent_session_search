@@ -17,6 +17,7 @@ use std::process::Command;
 use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use url::Url;
 use walkdir::WalkDir;
 
 /// Maximum number of retry attempts for network operations
@@ -32,6 +33,7 @@ const ENV_CLOUDFLARE_ACCOUNT_ID: &str = "CLOUDFLARE_ACCOUNT_ID";
 const ENV_CLOUDFLARE_API_TOKEN: &str = "CLOUDFLARE_API_TOKEN";
 const ENV_CLOUDFLARE_API_BASE_URL: &str = "CLOUDFLARE_API_BASE_URL";
 const ENV_CF_API_BASE_URL: &str = "CF_API_BASE_URL";
+const DEFAULT_CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 
 /// Prerequisites for Cloudflare Pages deployment
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -759,9 +761,42 @@ const MAX_BUCKET_SIZE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_BUCKET_FILE_COUNT: usize = if cfg!(windows) { 1000 } else { 2000 };
 
 fn api_base_url() -> String {
-    dotenvy::var(ENV_CLOUDFLARE_API_BASE_URL)
+    let override_url = dotenvy::var(ENV_CLOUDFLARE_API_BASE_URL)
         .or_else(|_| dotenvy::var(ENV_CF_API_BASE_URL))
-        .unwrap_or_else(|_| "https://api.cloudflare.com/client/v4".to_string())
+        .ok();
+    configured_cloudflare_api_base_url(override_url.as_deref())
+}
+
+fn configured_cloudflare_api_base_url(override_url: Option<&str>) -> String {
+    let Some(url) = override_url.map(str::trim).filter(|url| !url.is_empty()) else {
+        return DEFAULT_CLOUDFLARE_API_BASE_URL.to_string();
+    };
+
+    if is_allowed_cloudflare_api_base_url(url) {
+        return url.trim_end_matches('/').to_string();
+    }
+
+    tracing::warn!(
+        "ignoring untrusted Cloudflare API base URL override; only https://api.cloudflare.com or http://localhost/127.0.0.1/[::1] test endpoints are allowed"
+    );
+    DEFAULT_CLOUDFLARE_API_BASE_URL.to_string()
+}
+
+fn is_allowed_cloudflare_api_base_url(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => host == "api.cloudflare.com" && parsed.port().is_none_or(|port| port == 443),
+        "http" => matches!(host, "127.0.0.1" | "localhost" | "::1"),
+        _ => false,
+    }
 }
 
 fn run_cloudflare_with_cx<T, F, Fut>(f: F) -> Result<T>
@@ -1545,6 +1580,63 @@ mod tests {
         assert_eq!(config.project_name, "cass-archive");
         assert!(config.custom_domain.is_none());
         assert!(config.create_if_missing);
+    }
+
+    #[test]
+    fn test_cloudflare_api_base_url_allows_official_https_and_loopback_http() {
+        assert!(is_allowed_cloudflare_api_base_url(
+            "https://api.cloudflare.com/client/v4"
+        ));
+        assert!(is_allowed_cloudflare_api_base_url(
+            "https://api.cloudflare.com:443/client/v4/"
+        ));
+        assert!(is_allowed_cloudflare_api_base_url(
+            "http://127.0.0.1:8787/client/v4"
+        ));
+        assert!(is_allowed_cloudflare_api_base_url(
+            "http://localhost:8787/client/v4"
+        ));
+        assert!(is_allowed_cloudflare_api_base_url(
+            "http://[::1]:8787/client/v4"
+        ));
+    }
+
+    #[test]
+    fn test_cloudflare_api_base_url_rejects_untrusted_hosts_and_credentials() {
+        assert!(!is_allowed_cloudflare_api_base_url(
+            "https://attacker.example.com/client/v4"
+        ));
+        assert!(!is_allowed_cloudflare_api_base_url(
+            "https://api.cloudflare.com.attacker.example/client/v4"
+        ));
+        assert!(!is_allowed_cloudflare_api_base_url(
+            "http://api.cloudflare.com/client/v4"
+        ));
+        assert!(!is_allowed_cloudflare_api_base_url(
+            "http://192.168.1.20:8787/client/v4"
+        ));
+        assert!(!is_allowed_cloudflare_api_base_url(
+            "https://token@api.cloudflare.com/client/v4"
+        ));
+        assert!(!is_allowed_cloudflare_api_base_url(
+            "file:///tmp/cloudflare-api"
+        ));
+    }
+
+    #[test]
+    fn test_configured_cloudflare_api_base_url_ignores_untrusted_override() {
+        assert_eq!(
+            configured_cloudflare_api_base_url(Some("https://attacker.example.com/client/v4")),
+            DEFAULT_CLOUDFLARE_API_BASE_URL
+        );
+        assert_eq!(
+            configured_cloudflare_api_base_url(Some("https://api.cloudflare.com/client/v4/")),
+            "https://api.cloudflare.com/client/v4"
+        );
+        assert_eq!(
+            configured_cloudflare_api_base_url(None),
+            DEFAULT_CLOUDFLARE_API_BASE_URL
+        );
     }
 
     #[test]

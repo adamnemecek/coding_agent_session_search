@@ -359,15 +359,31 @@ impl GitHubDeployer {
 /// Create a temporary directory
 fn create_temp_dir() -> Result<PathBuf> {
     let temp_base = std::env::temp_dir();
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
     let pid = std::process::id();
-    let dir_name = format!("cass-deploy-{}-{}", pid, timestamp);
-    let temp_dir = temp_base.join(dir_name);
-    std::fs::create_dir_all(&temp_dir)?;
-    Ok(temp_dir)
+    for attempt in 0..100 {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir_name = format!("cass-deploy-{pid}-{timestamp}-{attempt}");
+        let temp_dir = temp_base.join(dir_name);
+        match std::fs::create_dir(&temp_dir) {
+            Ok(()) => return Ok(temp_dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed creating GitHub deploy staging directory {}",
+                        temp_dir.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!(
+        "failed to allocate unique GitHub deploy staging directory under {}",
+        temp_base.display()
+    )
 }
 
 /// Get gh CLI version
@@ -523,21 +539,15 @@ fn clone_repo(repo_url: &str, dest: &Path) -> Result<()> {
 fn copy_bundle_to_repo(bundle_dir: &Path, repo_dir: &Path) -> Result<()> {
     let bundle_dir = super::resolve_site_dir(bundle_dir)?;
 
+    ensure_deploy_staging_dir(repo_dir)?;
+
     // Clear existing files (except .git)
-    if repo_dir.exists() {
-        for entry in std::fs::read_dir(repo_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.file_name().map(|n| n != ".git").unwrap_or(true) {
-                if path.is_dir() {
-                    std::fs::remove_dir_all(&path)?;
-                } else {
-                    std::fs::remove_file(&path)?;
-                }
-            }
+    for entry in std::fs::read_dir(repo_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.file_name().map(|n| n != ".git").unwrap_or(true) {
+            remove_repo_deploy_entry(&path)?;
         }
-    } else {
-        std::fs::create_dir_all(repo_dir)?;
     }
 
     // Copy bundle files
@@ -564,9 +574,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Result<()> {
-    if !dst.exists() {
-        std::fs::create_dir_all(dst)?;
-    }
+    ensure_deploy_staging_dir(dst)?;
 
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -602,6 +610,7 @@ fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Re
                 );
             }
 
+            ensure_deploy_file_destination(&dst_path)?;
             std::fs::copy(&canonical_target, &dst_path).with_context(|| {
                 format!(
                     "Failed copying symlink target {} to {} during deploy staging",
@@ -615,11 +624,112 @@ fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Re
         if file_type.is_dir() {
             copy_dir_recursive_inner(&src_path, &dst_path, canonical_base)?;
         } else if file_type.is_file() {
+            ensure_deploy_file_destination(&dst_path)?;
             std::fs::copy(&src_path, &dst_path)?;
         }
     }
 
     Ok(())
+}
+
+fn ensure_deploy_staging_dir(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "Refusing to use deploy staging directory through symlink: {}",
+                    path.display()
+                );
+            }
+            if !file_type.is_dir() {
+                bail!(
+                    "Refusing to use deploy staging path because it is not a directory: {}",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                {
+                    Ok(())
+                }
+                Ok(_) => bail!(
+                    "Refusing to use deploy staging path after create because it is not a real directory: {}",
+                    path.display()
+                ),
+                Err(err) => Err(err).with_context(|| {
+                    format!(
+                        "Failed inspecting deploy staging directory after create: {}",
+                        path.display()
+                    )
+                }),
+            }
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed inspecting deploy staging directory before copy: {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn ensure_deploy_file_destination(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "Refusing to write deploy file through symlink: {}",
+                    path.display()
+                );
+            }
+            if !file_type.is_file() {
+                bail!(
+                    "Refusing to write deploy file over non-file path: {}",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed inspecting deploy file destination before copy: {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn remove_repo_deploy_entry(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "Failed inspecting existing GitHub deploy repository entry {}",
+            path.display()
+        )
+    })?;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() && !file_type.is_symlink() {
+        std::fs::remove_dir_all(path).with_context(|| {
+            format!(
+                "Failed removing existing GitHub deploy directory {}",
+                path.display()
+            )
+        })
+    } else {
+        std::fs::remove_file(path).with_context(|| {
+            format!(
+                "Failed removing existing GitHub deploy file {}",
+                path.display()
+            )
+        })
+    }
 }
 
 /// Configure a local git identity for commits in the temporary deployment clone.
