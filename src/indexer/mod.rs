@@ -24039,7 +24039,7 @@ mod tests {
     fn lexical_rebuild_staged_merge_controller_restores_parallelism_after_producer_finishes() {
         let controller = LexicalRebuildStagedMergeController::new(3, Some(7_000));
         let fan_in = LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN;
-        let ready_groups = 2;
+        let ready_groups = (LEXICAL_REBUILD_FINAL_FRONTIER_FEDERATED_SHARD_LIMIT / fan_in) + 1;
         let merge_coordinator = LexicalRebuildShardMergeCoordinator {
             stage_root: PathBuf::from("/tmp/eager-merge"),
             ready_levels: vec![
@@ -29755,6 +29755,7 @@ mod tests {
     #[serial]
     fn rebuild_tantivy_from_db_promotes_pipeline_budgets_after_first_commit() {
         let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        let _controller_mode = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_MODE", "auto");
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -30224,7 +30225,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn rebuild_tantivy_from_db_eagerly_reduced_single_final_artifact_skips_redundant_final_merge() {
+    fn rebuild_tantivy_from_db_bounded_final_frontier_publishes_federated_without_remerge() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -30322,13 +30323,13 @@ mod tests {
         );
         assert!(
             logs.contains(
-                "reusing already-final staged lexical rebuild artifact without redundant final merge"
+                "publishing staged lexical rebuild as federated lexical shard set without final assembly collapse"
             ),
-            "expected staged final-tail short-circuit log, got:\n{logs}"
+            "expected bounded final-frontier federated publish log, got:\n{logs}"
         );
         assert!(
             !logs.contains("running staged lexical rebuild merge round"),
-            "an eagerly reduced single final artifact should not trigger a redundant final merge round: {logs}"
+            "a bounded final frontier should not trigger a redundant final merge round: {logs}"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 8);
     }

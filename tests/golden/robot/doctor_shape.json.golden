@@ -435,6 +435,77 @@
         }
       }
     },
+    "primary_incident_id": {
+      "type": "string"
+    },
+    "incidents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "schema_version": {
+            "type": "integer"
+          },
+          "incident_id": {
+            "type": "string"
+          },
+          "root_cause_kind": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          },
+          "affected_asset_classes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "archive_risk_level": {
+            "type": "string"
+          },
+          "derived_risk_level": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "string"
+          },
+          "evidence_check_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "blocked_actions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "safe_next_actions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "stale_or_unknown_fields": {
+            "type": "array",
+            "items": {
+              "type": "unknown"
+            }
+          },
+          "redacted_evidence_paths": {
+            "type": "array",
+            "items": {
+              "type": "unknown"
+            }
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "event_log": {
       "type": "object",
       "properties": {

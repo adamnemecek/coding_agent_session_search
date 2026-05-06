@@ -33,12 +33,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --help|-h)
       cat <<'USAGE'
-Usage: scripts/e2e/doctor_v2.sh [--label quick,fault] [--scenario quick-source-pruned] [--include-failure-self-test] [--no-build]
+Usage: scripts/e2e/doctor_v2.sh [--label quick,fault,cleanup,low-disk] [--scenario quick-source-pruned] [--include-failure-self-test] [--no-build]
 
 Artifacts:
   test-results/e2e/doctor-v2/run-*/artifacts/<scenario>/
 
 The runner only invokes robot-safe cass commands. It never launches bare cass.
+The cleanup-low-disk-derived-only scenario runs explicit cleanup preview plus
+fingerprint-approved apply and logs before/after file-tree evidence.
 USAGE
       exit 0
       ;;

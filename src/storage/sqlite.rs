@@ -1537,13 +1537,10 @@ pub(crate) fn discover_historical_database_bundles(
         //     a modern bundle where `MIGRATION_V14` dropped fts_messages on
         //     purpose and cass recreates it lazily via
         //     `ensure_search_fallback_fts_consistency` on the first open.
-        //     Gating on `schema_version == CURRENT_SCHEMA_VERSION` is critical:
-        //     `MIGRATION_FRESH_SCHEMA` (V13) creates fts_messages eagerly,
-        //     so a schema-13 bundle with 0 fts rows is a symptom of a
-        //     crashed / tampered migration — not a legitimate lazy-FTS
-        //     state — and must not be promoted alongside real lazy-V14
-        //     bundles. A `None` schema_version (schema marker unreadable)
-        //     is excluded for the same reason.
+        //     Gating on `schema_version == CURRENT_SCHEMA_VERSION` is critical
+        //     so an incomplete pre-V14 bundle with 0 fts rows is not promoted
+        //     alongside real lazy-V14+ bundles. A `None` schema_version
+        //     (schema marker unreadable) is excluded for the same reason.
         //
         // Everything else — `Some(1)` without queryability, `Some(n)` for
         // n >= 2 (duplicated CREATE VIRTUAL TABLE rows from a broken legacy
@@ -2814,15 +2811,7 @@ const MIGRATION_V14: &str = r"
 DROP TABLE IF EXISTS fts_messages;
 ";
 
-const MIGRATION_V15: &str = r"
--- Cache append-tail state on the conversation row so append-only merges do not
--- have to rescan messages for MAX(idx)/MAX(created_at) on every call.
--- Existing large databases intentionally do not receive an eager full-message
--- backfill here: append paths already repair the cache per touched conversation,
--- while an open-time scan blocks every command behind migration work.
-ALTER TABLE conversations ADD COLUMN last_message_idx INTEGER;
-ALTER TABLE conversations ADD COLUMN last_message_created_at INTEGER;
-
+const MIGRATION_V15_TAIL_STATE_TABLE: &str = r"
 CREATE TABLE IF NOT EXISTS conversation_tail_state (
     -- Deliberately no FOREIGN KEY: this hot row is maintained by insert/append
     -- paths, and FK metadata keeps frankensqlite off the direct rowid update path.
@@ -3970,8 +3959,18 @@ fn apply_conversation_tail_state_cache_migration(conn: &FrankenConnection) -> Re
         }
 
         let started = Instant::now();
-        conn.execute_batch(MIGRATION_V15)
-            .with_context(|| "applying v15 conversation tail-state schema")?;
+        let conversation_columns = franken_table_column_names(conn, "conversations")
+            .with_context(|| "inspecting conversations columns before v15 migration")?;
+        if !conversation_columns.contains("last_message_idx") {
+            conn.execute("ALTER TABLE conversations ADD COLUMN last_message_idx INTEGER;")
+                .with_context(|| "adding v15 conversations.last_message_idx column")?;
+        }
+        if !conversation_columns.contains("last_message_created_at") {
+            conn.execute("ALTER TABLE conversations ADD COLUMN last_message_created_at INTEGER;")
+                .with_context(|| "adding v15 conversations.last_message_created_at column")?;
+        }
+        conn.execute_batch(MIGRATION_V15_TAIL_STATE_TABLE)
+            .with_context(|| "applying v15 conversation tail-state table schema")?;
         conn.execute_compat(
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
             fparams![15_i64, "conversation_tail_state_cache"],
@@ -3991,6 +3990,28 @@ fn apply_conversation_tail_state_cache_migration(conn: &FrankenConnection) -> Re
     }
 
     result
+}
+
+fn franken_table_column_names(
+    conn: &FrankenConnection,
+    table_name: &str,
+) -> Result<HashSet<String>> {
+    if !table_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(anyhow!(
+            "unsafe table name for PRAGMA table_info: {table_name}"
+        ));
+    }
+
+    conn.query_map_collect(
+        &format!("PRAGMA table_info({table_name})"),
+        fparams![],
+        |row: &FrankenRow| row.get_typed::<String>(1),
+    )
+    .with_context(|| format!("reading PRAGMA table_info({table_name})"))
+    .map(|columns| columns.into_iter().collect())
 }
 
 /// Combined V13 schema for fresh databases.
@@ -4065,7 +4086,13 @@ CREATE TABLE IF NOT EXISTS conversations (
     api_call_count INTEGER,
     tool_call_count INTEGER,
     user_message_count INTEGER,
-    assistant_message_count INTEGER
+    assistant_message_count INTEGER,
+    -- V15 columns are included in the fresh schema so fresh DB creation does
+    -- not need ALTER TABLE on conversations. That ALTER path can duplicate
+    -- provenance autoindex state in frankensqlite when the named unique
+    -- provenance index already exists.
+    last_message_idx INTEGER,
+    last_message_created_at INTEGER
 );
 
 -- Named unique index avoids autoindex issues if table is ever recreated
@@ -4322,18 +4349,6 @@ CREATE TABLE IF NOT EXISTS usage_models_daily (
     api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
     last_updated INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day_id, agent_slug, workspace_id, source_id, model_family, model_tier)
-);
-
--- Lexical FTS index (current contentless form)
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
-    content,
-    title,
-    agent,
-    workspace,
-    source_path,
-    created_at UNINDEXED,
-    content='',
-    tokenize='porter'
 );
 
 -- All indexes
@@ -14851,6 +14866,34 @@ mod tests {
             umd_idxs.iter().any(|n| n.contains("idx_umd_model_day")),
             "usage_models_daily must have model+day index"
         );
+
+        let conversation_cols = col_names(conn, "conversations");
+        assert!(
+            conversation_cols.contains(&"last_message_idx".to_string())
+                && conversation_cols.contains(&"last_message_created_at".to_string()),
+            "fresh schema must include V15 tail columns without ALTER TABLE on conversations"
+        );
+        let fts_schema_rows: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                fparams![],
+                |row: &FrankenRow| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fts_schema_rows, 0,
+            "fresh schema should not create and immediately drop derived fts_messages"
+        );
+        let integrity: Vec<String> = conn
+            .query_map_collect("PRAGMA integrity_check;", fparams![], |row: &FrankenRow| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(
+            integrity,
+            vec!["ok".to_string()],
+            "fresh schema must pass SQLite integrity_check"
+        );
     }
 
     #[test]
@@ -22850,12 +22893,25 @@ mod tests {
                  id INTEGER PRIMARY KEY,
                  path TEXT NOT NULL
              );
+             CREATE TABLE sources (
+                 id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 host_label TEXT,
+                 machine_id TEXT,
+                 platform TEXT,
+                 config_json TEXT,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
              CREATE TABLE conversations (
                  id INTEGER PRIMARY KEY,
                  agent_id INTEGER NOT NULL,
                  workspace_id INTEGER,
+                 source_id TEXT NOT NULL DEFAULT 'local',
+                 external_id TEXT,
                  title TEXT,
                  source_path TEXT NOT NULL,
+                 started_at INTEGER,
                  ended_at INTEGER
              );
              CREATE TABLE messages (
@@ -22871,8 +22927,28 @@ mod tests {
              );
              INSERT INTO agents(id, slug) VALUES (1, 'codex');
              INSERT INTO workspaces(id, path) VALUES (1, '/data/projects/coding_agent_session_search');
-             INSERT INTO conversations(id, agent_id, workspace_id, title, source_path)
-             VALUES (1, 1, 1, 'legacy session', '/tmp/legacy.jsonl');
+             INSERT INTO sources(id, kind, host_label, created_at, updated_at)
+             VALUES ('local', 'local', NULL, 1710000000000, 1710000000000);
+             INSERT INTO conversations(
+                 id,
+                 agent_id,
+                 workspace_id,
+                 source_id,
+                 external_id,
+                 title,
+                 source_path,
+                 started_at
+             )
+             VALUES (
+                 1,
+                 1,
+                 1,
+                 'local',
+                 'legacy-session',
+                 'legacy session',
+                 '/tmp/legacy.jsonl',
+                 1710000000000
+             );
              INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content)
              VALUES (1, 1, 0, 'user', 'tester', 1710000000000, 'legacy content');
              CREATE VIRTUAL TABLE fts_messages USING fts5(

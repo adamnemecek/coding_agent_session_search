@@ -192,10 +192,9 @@ impl DoctorCommandRequest {
     pub(crate) fn validate(&self) -> CliResult<()> {
         debug_assert!(DOCTOR_COMMAND_SURFACES.contains(&self.surface));
         debug_assert!(!self.mode.stable_name().is_empty());
-        let explicit_surface_count =
-            usize::from(self.surface == DoctorCommandSurface::Check)
-                + usize::from(self.repair)
-                + usize::from(self.cleanup);
+        let explicit_surface_count = usize::from(self.surface == DoctorCommandSurface::Check)
+            + usize::from(self.repair)
+            + usize::from(self.cleanup);
         if explicit_surface_count > 1 {
             return Err(CliError {
                 code: 2,
@@ -320,9 +319,8 @@ impl DoctorCommandRequest {
             return Err(CliError {
                 code: 2,
                 kind: "usage",
-                message:
-                    "`cass doctor cleanup --yes` requires `--plan-fingerprint <fingerprint>`"
-                        .to_string(),
+                message: "`cass doctor cleanup --yes` requires `--plan-fingerprint <fingerprint>`"
+                    .to_string(),
                 hint: Some(
                     "Copy the cleanup approval fingerprint from `cass doctor cleanup --json`."
                         .to_string(),

@@ -202,6 +202,86 @@
       "Interrupted artifacts are never deleted by this state model; they block mutation until inspected."
     ]
   },
+  "primary_incident_id": "doctor-incident-v1-e74b084c6b952c5cc399b1c717aca0d3c3fe5514b5e7e8bbbe0174cd6194533b",
+  "incidents": [
+    {
+      "schema_version": 1,
+      "incident_id": "doctor-incident-v1-e74b084c6b952c5cc399b1c717aca0d3c3fe5514b5e7e8bbbe0174cd6194533b",
+      "root_cause_kind": "archive-db-unreadable",
+      "severity": "error",
+      "affected_asset_classes": [
+        "canonical_archive_db"
+      ],
+      "archive_risk_level": "high",
+      "derived_risk_level": "none",
+      "confidence": "medium",
+      "evidence_check_ids": [
+        "database"
+      ],
+      "blocked_actions": [
+        "auto-repair",
+        "coverage-reducing-repair",
+        "source-only-rebuild"
+      ],
+      "safe_next_actions": [
+        "inspect-archive-db-and-preserve-sidecars"
+      ],
+      "stale_or_unknown_fields": [],
+      "redacted_evidence_paths": [],
+      "summary": "The archive DB is unreadable or corrupt; preserve sidecars and plan recovery before mutation."
+    },
+    {
+      "schema_version": 1,
+      "incident_id": "doctor-incident-v1-690232e2972db9439a63f3e2e78d4492ac5495b7254415b51c6617b3ead8ee59",
+      "root_cause_kind": "unknown",
+      "severity": "warn",
+      "affected_asset_classes": [
+        "external_upstream_source"
+      ],
+      "archive_risk_level": "medium",
+      "derived_risk_level": "none",
+      "confidence": "unknown",
+      "evidence_check_ids": [
+        "sessions"
+      ],
+      "blocked_actions": [
+        "auto-repair",
+        "source-only-rebuild"
+      ],
+      "safe_next_actions": [
+        "verify-source-authority-before-rebuild"
+      ],
+      "stale_or_unknown_fields": [
+        "root_cause_kind"
+      ],
+      "redacted_evidence_paths": [],
+      "summary": "Doctor found related symptoms but cannot prove one root cause yet."
+    },
+    {
+      "schema_version": 1,
+      "incident_id": "doctor-incident-v1-0a2aedba122593d0ca6f3db3b32b9a01578d8307123dacb83c11b381c08991cc",
+      "root_cause_kind": "derived-index-stale",
+      "severity": "warn",
+      "affected_asset_classes": [
+        "derived_lexical_index"
+      ],
+      "archive_risk_level": "none",
+      "derived_risk_level": "low",
+      "confidence": "medium",
+      "evidence_check_ids": [
+        "index"
+      ],
+      "blocked_actions": [
+        "auto-repair"
+      ],
+      "safe_next_actions": [
+        "rebuild-derived-lexical-index"
+      ],
+      "stale_or_unknown_fields": [],
+      "redacted_evidence_paths": [],
+      "summary": "Derived search assets need rebuild or cleanup; archive evidence is not the failing asset."
+    }
+  ],
   "event_log": {
     "path": null,
     "checksum_blake3": "doctor-event-log-v1-528abfd52d862c2cb9981dce3239050472be500ba4e29a1b68b30370ed733d13",

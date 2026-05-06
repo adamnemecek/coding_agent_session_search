@@ -192,20 +192,6 @@ fn seed_healthy_empty_index(test_home: &Path, data_dir: &Path) {
     );
 }
 
-fn run_doctor_json(test_home: &Path, args: &[&str]) -> Value {
-    let out = cass_cmd(test_home)
-        .args(args)
-        .output()
-        .expect("run cass doctor command");
-    assert!(
-        out.status.success(),
-        "cass doctor command failed: args={args:?} stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).expect("doctor JSON")
-}
-
 fn cleanup_fingerprint_from_preview(payload: &Value) -> String {
     payload
         .pointer("/quarantine/lexical_cleanup_dry_run/approval_fingerprint")
@@ -220,22 +206,27 @@ fn cleanup_fingerprint_from_preview(payload: &Value) -> String {
 }
 
 fn run_doctor_cleanup_preview(test_home: &Path, data_dir: &Path) -> Value {
-    run_doctor_json(
-        test_home,
-        &[
+    let out = cass_cmd(test_home)
+        .args([
             "doctor",
             "cleanup",
             "--json",
             "--data-dir",
             data_dir.to_str().expect("utf8"),
-        ],
-    )
+        ])
+        .output()
+        .expect("run cass doctor cleanup preview");
+    assert!(
+        !out.stdout.is_empty(),
+        "cass doctor cleanup preview should emit JSON even when health is degraded: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("doctor cleanup preview JSON")
 }
 
 fn run_doctor_cleanup_apply(test_home: &Path, data_dir: &Path, fingerprint: &str) -> Value {
-    run_doctor_json(
-        test_home,
-        &[
+    let out = cass_cmd(test_home)
+        .args([
             "doctor",
             "cleanup",
             "--yes",
@@ -244,8 +235,15 @@ fn run_doctor_cleanup_apply(test_home: &Path, data_dir: &Path, fingerprint: &str
             "--json",
             "--data-dir",
             data_dir.to_str().expect("utf8"),
-        ],
-    )
+        ])
+        .output()
+        .expect("run cass doctor cleanup apply");
+    assert!(
+        !out.stdout.is_empty(),
+        "cass doctor cleanup apply should emit JSON even when health remains degraded: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("doctor cleanup apply JSON")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,7 +372,8 @@ fn corrupt_unused_secondary_index_entry(db_path: &Path) {
             row.get_typed(0)
         })
         .unwrap_or(4096);
-    let _ = conn.query("PRAGMA wal_checkpoint(TRUNCATE);");
+    conn.query("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint fixture db before raw page mutation");
     drop(conn);
 
     assert!(
@@ -403,6 +402,7 @@ fn corrupt_unused_secondary_index_entry(db_path: &Path) {
     file.write_all(b"9")
         .expect("mutate index payload without touching table row");
     file.flush().expect("flush corrupt index fixture");
+    drop(file);
 
     let verify_conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())
         .expect("reopen corrupted fixture");
@@ -684,6 +684,59 @@ fn write_superseded_reclaimable_manifest(generation_dir: &Path, generation_id: &
         .expect("serialize superseded manifest"),
     )
     .expect("write superseded manifest");
+}
+
+fn write_failed_reclaimable_manifest(generation_dir: &Path, generation_id: &str) {
+    fs::create_dir_all(generation_dir).expect("create failed generation dir");
+    fs::write(
+        generation_dir.join("lexical-generation-manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "manifest_version": 3,
+            "generation_id": generation_id,
+            "attempt_id": "attempt-1",
+            "created_at_ms": 1_733_000_000_000_i64,
+            "updated_at_ms": 1_733_000_000_321_i64,
+            "source_db_fingerprint": "fp-test",
+            "conversation_count": 3,
+            "message_count": 9,
+            "indexed_doc_count": 0,
+            "equivalence_manifest_fingerprint": null,
+            "shard_plan": null,
+            "build_budget": null,
+            "shards": [{
+                "shard_id": "shard-failed",
+                "shard_ordinal": 0,
+                "state": "abandoned",
+                "updated_at_ms": 1_733_000_000_222_i64,
+                "indexed_doc_count": 0,
+                "message_count": 0,
+                "artifact_bytes": 192,
+                "stable_hash": null,
+                "reclaimable": true,
+                "pinned": false,
+                "recovery_reason": "failed generation can be rebuilt from canonical SQLite",
+                "quarantine_reason": null
+            }],
+            "merge_debt": {
+                "state": "none",
+                "updated_at_ms": null,
+                "pending_shard_count": 0,
+                "pending_artifact_bytes": 0,
+                "reason": null,
+                "controller_reason": null
+            },
+            "build_state": "failed",
+            "publish_state": "staged",
+            "failure_history": [{
+                "attempt_id": "attempt-1",
+                "at_ms": 1_733_000_000_300_i64,
+                "phase": "validate",
+                "message": "open probe failed before publish"
+            }]
+        }))
+        .expect("serialize failed manifest"),
+    )
+    .expect("write failed manifest");
 }
 
 fn write_superseded_partly_pinned_manifest(generation_dir: &Path, generation_id: &str) {
@@ -1693,7 +1746,7 @@ fn doctor_fix_reports_repair_blocked_when_doctor_lock_is_active() {
     .expect("write lock metadata");
     lock_file.flush().expect("flush lock");
 
-    let legacy_fix_out = cass_cmd(test_home.path())
+    let out = cass_cmd(test_home.path())
         .args([
             "doctor",
             "--json",
@@ -1746,6 +1799,50 @@ fn doctor_fix_reports_repair_blocked_when_doctor_lock_is_active() {
     assert_eq!(
         operation_check["anomaly_class"].as_str(),
         Some("lock-contention")
+    );
+    let locks = payload["locks"].as_array().expect("locks array");
+    assert_eq!(
+        locks.len(),
+        1,
+        "blocked repair should report one lock: {payload:#}"
+    );
+    let lock = &locks[0];
+    assert_eq!(lock["lock_kind"].as_str(), Some("doctor_repair"));
+    assert_eq!(lock["active"].as_bool(), Some(true));
+    assert_eq!(lock["retry_policy"].as_str(), Some("wait-and-retry"));
+    assert_eq!(lock["wait_duration_ms"].as_u64(), Some(30_000));
+    assert_eq!(lock["manual_delete_allowed"].as_bool(), Some(false));
+    assert_eq!(lock["owner_command"].as_str(), Some("cass doctor --fix"));
+    assert!(
+        lock["recommended_action"]
+            .as_str()
+            .is_some_and(|action| action.contains("wait for the active cass doctor")),
+        "lock recommendation should be specific and safe: {lock:#}"
+    );
+    assert!(
+        payload["slow_operations"].as_array().is_some(),
+        "doctor JSON should always include slow_operations for robot consumers"
+    );
+    assert!(
+        payload["timing_summary"]["measured_operation_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 8),
+        "timing summary should cover core doctor phases: {payload:#}"
+    );
+    assert_eq!(
+        payload["retry_recommendation"]["policy"].as_str(),
+        Some("wait-and-retry")
+    );
+    assert!(
+        payload["retry_recommendation"]["notes"]
+            .as_array()
+            .expect("retry notes")
+            .iter()
+            .any(|note| note
+                .as_str()
+                .unwrap_or_default()
+                .contains("Do not delete lock files manually")),
+        "retry recommendation must explicitly warn against manual lock deletion: {payload:#}"
     );
 }
 
@@ -2253,6 +2350,34 @@ fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() 
             .as_str()
             .is_some_and(|message| message.contains("sole-copy")),
         "source coverage check should explicitly name sole-copy risk: {source_coverage_check:#}"
+    );
+    let incidents = payload["incidents"].as_array().expect("incidents array");
+    assert!(
+        !incidents.is_empty(),
+        "doctor should group coverage symptoms into root-cause incidents: {payload:#}"
+    );
+    assert_eq!(
+        payload["primary_incident_id"].as_str(),
+        incidents[0]["incident_id"].as_str()
+    );
+    assert_eq!(
+        incidents[0]["root_cause_kind"].as_str(),
+        Some("mirror-missing-with-db-sole-copy"),
+        "missing upstream source without raw mirror should become one archive-preserving incident: {incidents:#?}"
+    );
+    assert!(
+        incidents[0]["evidence_check_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some("source_coverage"))),
+        "incident should point back to the source_coverage check: {incidents:#?}"
+    );
+    assert!(
+        incidents[0]["blocked_actions"]
+            .as_array()
+            .is_some_and(|actions| actions
+                .iter()
+                .any(|action| action.as_str() == Some("source-only-rebuild"))),
+        "incident should block source-only rebuilds that would shrink coverage: {incidents:#?}"
     );
 
     let status_out = cass_cmd(test_home)
@@ -2955,6 +3080,27 @@ fn doctor_json_verifies_raw_mirror_after_upstream_source_is_pruned() {
         payload["coverage_risk"]["status"].as_str(),
         Some("sole_copy_risk")
     );
+    let incidents = payload["incidents"].as_array().expect("incidents array");
+    assert!(
+        !incidents.is_empty(),
+        "doctor should report root-cause incidents for pruned-source mirror cases: {payload:#}"
+    );
+    assert_eq!(
+        payload["primary_incident_id"].as_str(),
+        incidents[0]["incident_id"].as_str()
+    );
+    assert_eq!(
+        incidents[0]["root_cause_kind"].as_str(),
+        Some("source-pruned-with-mirror-intact"),
+        "verified mirror evidence should distinguish source pruning from archive loss: {incidents:#?}"
+    );
+    assert_eq!(incidents[0]["confidence"].as_str(), Some("high"));
+    assert!(
+        incidents[0]["evidence_check_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some("source_coverage"))),
+        "incident should identify the source coverage evidence check: {incidents:#?}"
+    );
     let sole_copy_warning = payload["sole_copy_warnings"]
         .as_array()
         .expect("sole copy warnings")
@@ -3218,7 +3364,7 @@ fn doctor_cleanup_apply_prunes_safe_derivative_cleanup_candidates() {
     )
     .expect("write quarantined generation artifact");
 
-    let out = cass_cmd(test_home.path())
+    let legacy_fix_out = cass_cmd(test_home.path())
         .args([
             "doctor",
             "--json",
@@ -3230,9 +3376,8 @@ fn doctor_cleanup_apply_prunes_safe_derivative_cleanup_candidates() {
         .output()
         .expect("run cass doctor --json --fix");
     assert!(
-        legacy_fix_out.status.success(),
-        "cass doctor --json --fix failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&legacy_fix_out.stdout),
+        !legacy_fix_out.stdout.is_empty(),
+        "legacy --fix should still emit JSON while proving it does not enter cleanup: stderr={}",
         String::from_utf8_lossy(&legacy_fix_out.stderr)
     );
     let legacy_payload: Value =
@@ -3533,6 +3678,189 @@ fn doctor_cleanup_apply_prunes_safe_derivative_cleanup_candidates() {
                 && action["applied"].as_bool() == Some(true)
         }),
         "apply result should include superseded generation prune action"
+    );
+}
+
+#[test]
+fn doctor_cleanup_apply_prunes_failed_derived_generation_but_preserves_archive_evidence() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+
+    let failed_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-failed-reclaimable");
+    write_failed_reclaimable_manifest(&failed_dir, "gen-failed-reclaimable");
+    fs::write(
+        failed_dir.join("segment-failed"),
+        b"failed derived generation bytes",
+    )
+    .expect("write failed derived generation artifact");
+
+    let candidate_dir = data_dir
+        .join("doctor")
+        .join("candidates")
+        .join("candidate-completed");
+    fs::create_dir_all(&candidate_dir).expect("create completed candidate dir");
+    let candidate_db = candidate_dir.join("candidate.db");
+    fs::write(&candidate_db, b"candidate archive bytes").expect("write candidate DB evidence");
+    let candidate_manifest = candidate_dir.join("manifest.json");
+    fs::write(
+        &candidate_manifest,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "manifest_kind": "cass_doctor_reconstruct_candidate_v1",
+            "candidate_id": "candidate-completed",
+            "lifecycle_status": "completed",
+            "artifact_count": 1,
+            "checksum_set": {
+                "candidate.db": "fixture-candidate-db-checksum"
+            },
+            "selected_authority": "verified_raw_mirror",
+            "created_at_ms": 1_733_000_001_000_i64,
+            "updated_at_ms": 1_733_000_001_111_i64
+        }))
+        .expect("candidate manifest JSON"),
+    )
+    .expect("write completed candidate manifest");
+
+    let raw_mirror_blob = data_dir
+        .join("raw-mirror")
+        .join("v1")
+        .join("blobs")
+        .join("aa")
+        .join("blob.raw");
+    fs::create_dir_all(raw_mirror_blob.parent().expect("raw mirror blob parent"))
+        .expect("create raw mirror blob parent");
+    fs::write(&raw_mirror_blob, b"raw mirror session bytes").expect("write raw mirror blob");
+    let backup_file = data_dir
+        .join("backups")
+        .join("doctor-backup")
+        .join("agent_search.db.bak");
+    fs::create_dir_all(backup_file.parent().expect("backup parent")).expect("create backup parent");
+    fs::write(&backup_file, b"archive backup bytes").expect("write archive backup");
+    let receipt_file = data_dir
+        .join("doctor")
+        .join("receipts")
+        .join("receipt.json");
+    fs::create_dir_all(receipt_file.parent().expect("receipt parent"))
+        .expect("create receipt parent");
+    fs::write(&receipt_file, b"prior repair receipt").expect("write prior repair receipt");
+    let support_bundle = data_dir
+        .join("doctor")
+        .join("support-bundles")
+        .join("bundle.json");
+    fs::create_dir_all(support_bundle.parent().expect("support bundle parent"))
+        .expect("create support bundle parent");
+    fs::write(&support_bundle, b"support bundle evidence").expect("write support bundle");
+    let sources_config = data_dir.join("sources.toml");
+    fs::write(&sources_config, b"# source config").expect("write sources config");
+    let bookmarks = data_dir.join("bookmarks.json");
+    fs::write(&bookmarks, b"[]").expect("write bookmarks");
+
+    let protected_files = [
+        (&candidate_db, b"candidate archive bytes".as_slice()),
+        (&raw_mirror_blob, b"raw mirror session bytes".as_slice()),
+        (&backup_file, b"archive backup bytes".as_slice()),
+        (&receipt_file, b"prior repair receipt".as_slice()),
+        (&support_bundle, b"support bundle evidence".as_slice()),
+        (&sources_config, b"# source config".as_slice()),
+        (&bookmarks, b"[]".as_slice()),
+    ];
+
+    let preview = run_doctor_cleanup_preview(test_home.path(), &data_dir);
+    assert_eq!(
+        preview["quarantine"]["summary"]["cleanup_dry_run_reclaim_candidate_count"].as_u64(),
+        Some(1),
+        "preview should identify exactly the failed derived generation as reclaimable: {preview:#}"
+    );
+    assert!(
+        preview["quarantine"]["lexical_cleanup_dry_run"]["inventories"]
+            .as_array()
+            .expect("preview lexical inventories")
+            .iter()
+            .any(|entry| {
+                entry["generation_id"].as_str() == Some("gen-failed-reclaimable")
+                    && entry["disposition"].as_str() == Some("failed_reclaimable")
+            }),
+        "preview must classify the failed generation as failed_reclaimable: {preview:#}"
+    );
+
+    let fingerprint = cleanup_fingerprint_from_preview(&preview);
+    let payload = run_doctor_cleanup_apply(test_home.path(), &data_dir, &fingerprint);
+
+    assert!(
+        !failed_dir.exists(),
+        "fingerprint-approved cleanup should prune the failed derived generation"
+    );
+    for (path, expected_bytes) in protected_files {
+        assert!(
+            path.exists(),
+            "cleanup must preserve precious evidence/config path {}",
+            path.display()
+        );
+        assert_eq!(
+            fs::read(path).expect("read protected file"),
+            expected_bytes,
+            "cleanup must not rewrite precious evidence/config path {}",
+            path.display()
+        );
+    }
+
+    let cleanup = &payload["cleanup_apply"];
+    assert_eq!(cleanup["requested"].as_bool(), Some(true));
+    assert_eq!(cleanup["applied"].as_bool(), Some(true));
+    assert_eq!(cleanup["before_reclaim_candidate_count"].as_u64(), Some(1));
+    assert_eq!(cleanup["after_reclaim_candidate_count"].as_u64(), Some(0));
+    assert_eq!(cleanup["pruned_asset_count"].as_u64(), Some(1));
+    let actions = cleanup["actions"].as_array().expect("cleanup actions");
+    assert_eq!(
+        actions.len(),
+        1,
+        "only the failed derived generation should be acted on: {cleanup:#}"
+    );
+    let action = &actions[0];
+    assert_eq!(action["artifact_kind"].as_str(), Some("lexical_generation"));
+    assert_eq!(
+        action["generation_id"].as_str(),
+        Some("gen-failed-reclaimable")
+    );
+    assert_eq!(
+        action["asset_class"].as_str(),
+        Some("reclaimable_derived_cache")
+    );
+    assert_eq!(
+        action["safety_classification"].as_str(),
+        Some("derived_reclaimable")
+    );
+    assert_eq!(action["disposition"].as_str(), Some("failed_reclaimable"));
+    assert_eq!(action["safe_to_gc_allowed"].as_bool(), Some(true));
+    assert_eq!(action["applied"].as_bool(), Some(true));
+
+    let candidate_staging = &payload["candidate_staging"];
+    assert_eq!(
+        candidate_staging["total_candidate_count"].as_u64(),
+        Some(1),
+        "cleanup apply should continue reporting completed candidate evidence: {candidate_staging:#}"
+    );
+    assert_eq!(
+        candidate_staging["completed_candidate_count"].as_u64(),
+        Some(1),
+        "completed reconstruct candidates are preserved evidence, not cleanup candidates"
+    );
+    assert!(
+        candidate_staging["candidates"]
+            .as_array()
+            .expect("candidate staging candidates")
+            .iter()
+            .all(|candidate| {
+                candidate["candidate_id"].as_str() == Some("candidate-completed")
+                    && candidate["safe_to_delete_automatically"].as_bool() == Some(false)
+            }),
+        "candidate staging must remain explicitly non-auto-deletable: {candidate_staging:#}"
     );
 }
 
@@ -4354,9 +4682,16 @@ fn long_running_maintenance_story_end_to_end_across_diag_doctor_cleanup_diag() {
         .expect("run doctor cleanup apply");
     assert!(
         doctor_apply_out.status.success(),
-        "step 3 cass doctor cleanup apply failed: stdout={} stderr={}",
+        "step 3 cass doctor cleanup apply failed despite successful cleanup outcome: stdout={} stderr={}",
         String::from_utf8_lossy(&doctor_apply_out.stdout),
         String::from_utf8_lossy(&doctor_apply_out.stderr)
+    );
+    let doctor_apply_payload: Value =
+        serde_json::from_slice(&doctor_apply_out.stdout).expect("step 3 doctor JSON parses");
+    assert_eq!(
+        doctor_apply_payload["operation_outcome"]["exit_code_kind"].as_str(),
+        Some("success"),
+        "step 3 cleanup apply should report a successful cleanup operation even when unrelated health checks remain degraded"
     );
 
     // CONTRACT: filesystem post-state matches the safety policy:

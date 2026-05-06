@@ -3020,6 +3020,98 @@
             "notes"
           ]
         },
+        "primary_incident_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "incident_id for the highest-priority root-cause incident, or null when no incident was found."
+        },
+        "incidents": {
+          "type": "array",
+          "description": "Root-cause incident groups derived from checks, coverage, lock, and candidate state. Robots should use root_cause_kind and evidence_check_ids instead of scraping check prose.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "schema_version": {
+                "type": "integer"
+              },
+              "incident_id": {
+                "type": "string"
+              },
+              "root_cause_kind": {
+                "type": "string"
+              },
+              "severity": {
+                "type": "string"
+              },
+              "affected_asset_classes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "archive_risk_level": {
+                "type": "string"
+              },
+              "derived_risk_level": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "string"
+              },
+              "evidence_check_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "blocked_actions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "safe_next_actions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "stale_or_unknown_fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "redacted_evidence_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "summary": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "schema_version",
+              "incident_id",
+              "root_cause_kind",
+              "severity",
+              "affected_asset_classes",
+              "archive_risk_level",
+              "derived_risk_level",
+              "confidence",
+              "evidence_check_ids",
+              "blocked_actions",
+              "safe_next_actions",
+              "stale_or_unknown_fields",
+              "redacted_evidence_paths",
+              "summary"
+            ]
+          }
+        },
         "event_log": {
           "type": "object",
           "properties": {
@@ -7192,6 +7284,8 @@
         "repair_failure_marker",
         "operation_outcome",
         "operation_state",
+        "primary_incident_id",
+        "incidents",
         "event_log",
         "lexical",
         "semantic",

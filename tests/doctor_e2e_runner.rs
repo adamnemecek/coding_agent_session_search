@@ -651,6 +651,160 @@ fn doctor_e2e_runner_builds_candidate_with_fix_and_logs_lifecycle() {
 }
 
 #[test]
+fn doctor_e2e_runner_cleanup_low_disk_prunes_only_derived_and_logs() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
+    let spec = DoctorE2eScenarioSpec::new(
+        "artifact-cleanup-low-disk",
+        DoctorFixtureScenario::LowDisk,
+        ["quick", "cleanup", "low-disk"],
+    )
+    .cleanup_apply()
+    .env("CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES", "1024")
+    .require_json_pointer("/storage_pressure")
+    .require_json_pointer("/quarantine/lexical_cleanup_dry_run")
+    .require_json_pointer("/cleanup_apply")
+    .require_json_pointer("/cleanup_apply/actions")
+    .require_json_pointer("/candidate_staging");
+
+    let result = runner
+        .run_scenario(&spec)
+        .expect("run low-disk cleanup doctor e2e scenario");
+    assert_eq!(result.status, "pass");
+    validate_artifact_manifest(&result.manifest_path).expect("artifact manifest valid");
+
+    let payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("parsed-json/doctor-json.json")).unwrap(),
+    )
+    .expect("doctor cleanup apply json");
+    assert_eq!(payload["storage_pressure"]["status"].as_str(), Some("warn"));
+    assert_eq!(
+        payload["storage_pressure"]["available_bytes"].as_u64(),
+        Some(1024),
+        "low-disk E2E must use the deterministic storage-pressure override"
+    );
+    let cleanup = &payload["cleanup_apply"];
+    assert_eq!(cleanup["requested"].as_bool(), Some(true));
+    assert_eq!(cleanup["applied"].as_bool(), Some(true));
+    assert_eq!(cleanup["pruned_asset_count"].as_u64(), Some(1));
+    assert!(
+        cleanup["actions"]
+            .as_array()
+            .expect("cleanup actions")
+            .iter()
+            .all(|action| {
+                action["artifact_kind"].as_str() == Some("lexical_generation")
+                    && action["asset_class"].as_str() == Some("reclaimable_derived_cache")
+                    && action["safety_classification"].as_str() == Some("derived_reclaimable")
+                    && action["disposition"].as_str() == Some("failed_reclaimable")
+                    && action["applied"].as_bool() == Some(true)
+            }),
+        "low-disk cleanup may only apply derived generation cleanup actions: {cleanup:#}"
+    );
+
+    let before_tree: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("file-tree-before.json")).unwrap(),
+    )
+    .expect("before file tree json");
+    let after_tree: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.artifact_dir.join("file-tree-after.json")).unwrap(),
+    )
+    .expect("after file tree json");
+    let before_data = data_file_hashes(&before_tree);
+    let after_data = data_file_hashes(&after_tree);
+
+    assert!(
+        before_data
+            .keys()
+            .any(|path| path.starts_with("index/generation-failed-reclaimable/")),
+        "fixture should seed a failed derived generation before cleanup: {before_tree:#}"
+    );
+    assert!(
+        !after_data
+            .keys()
+            .any(|path| path.starts_with("index/generation-failed-reclaimable/")),
+        "cleanup apply should remove the failed derived generation only: {after_tree:#}"
+    );
+
+    for protected_path in [
+        "agent_search.db",
+        "backups/low-disk-agent_search.db.bak",
+        "doctor/receipts/prior-cleanup-receipt.json",
+        "doctor/support-bundles/prior-support-bundle.json",
+        "sources.toml",
+        "bookmarks.json",
+    ] {
+        assert_eq!(
+            before_data.get(protected_path),
+            after_data.get(protected_path),
+            "cleanup must preserve protected file {protected_path}"
+        );
+    }
+
+    let raw_mirror_before = filtered_hashes(&before_data, "raw-mirror/v1/");
+    let raw_mirror_after = filtered_hashes(&after_data, "raw-mirror/v1/");
+    assert!(
+        !raw_mirror_before.is_empty(),
+        "low-disk fixture should include raw mirror evidence"
+    );
+    assert_eq!(
+        raw_mirror_before, raw_mirror_after,
+        "cleanup must not rewrite or prune raw mirror evidence"
+    );
+
+    let commands = std::fs::read_to_string(result.artifact_dir.join("commands.jsonl")).unwrap();
+    assert!(
+        commands.contains("\"command_id\":\"doctor-cleanup-preview\"")
+            && commands.contains("\"command_id\":\"doctor-json\"")
+            && commands.contains("CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES"),
+        "commands log should include preview, apply, and low-disk override evidence: {commands}"
+    );
+    let execution_flow =
+        std::fs::read_to_string(result.artifact_dir.join("execution-flow.jsonl")).unwrap();
+    for phase in [
+        "storage_pressure",
+        "cleanup_apply",
+        "mutation_audit",
+        "source_inventory_before",
+        "source_inventory_after",
+    ] {
+        assert!(
+            execution_flow.contains(&format!("\"phase\":\"{phase}\"")),
+            "low-disk cleanup execution log should include phase {phase}: {execution_flow}"
+        );
+    }
+}
+
+fn data_file_hashes(tree: &serde_json::Value) -> BTreeMap<String, String> {
+    tree["roots"]
+        .as_array()
+        .and_then(|roots| {
+            roots
+                .iter()
+                .find(|root| root["root_id"].as_str() == Some("data"))
+        })
+        .and_then(|root| root["entries"].as_array())
+        .expect("data tree entries")
+        .iter()
+        .filter(|entry| entry["entry_kind"].as_str() == Some("file"))
+        .filter_map(|entry| {
+            Some((
+                entry["relative_path"].as_str()?.to_string(),
+                entry["blake3"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn filtered_hashes(entries: &BTreeMap<String, String>, prefix: &str) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .filter(|(path, _)| path.starts_with(prefix))
+        .map(|(path, hash)| (path.clone(), hash.clone()))
+        .collect()
+}
+
+#[test]
 fn doctor_e2e_runner_reconstructs_candidate_from_mirror_when_db_is_corrupt() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");

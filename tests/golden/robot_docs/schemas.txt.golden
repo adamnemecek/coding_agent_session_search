@@ -222,6 +222,7 @@ schemas: (auto-generated from contract)
     - fallback_mode: string
     - health_class: string
     - healthy: boolean
+    - incidents: array
     - initialized: boolean
     - issues_fixed: integer
     - issues_found: integer
@@ -280,6 +281,7 @@ schemas: (auto-generated from contract)
     - override_available: boolean
     - override_used: boolean
     - post_repair_probes: object
+    - primary_incident_id: ?
     - quarantine: object
     - raw_mirror: object
       - exists: boolean

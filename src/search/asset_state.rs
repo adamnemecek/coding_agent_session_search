@@ -453,6 +453,7 @@ pub(crate) fn inspect_search_assets(
     let semantic = if inspect_semantic {
         inspect_semantic_assets(
             data_dir,
+            db_path,
             semantic_preference,
             current_db_fingerprint,
             db_available,
@@ -500,12 +501,22 @@ fn semantic_state_not_inspected(
 
 pub(crate) fn inspect_semantic_assets(
     data_dir: &Path,
+    db_path: &Path,
     preference: SemanticPreference,
     current_db_fingerprint: Option<&str>,
     db_available: bool,
 ) -> SemanticAssetState {
     if !db_available {
-        return semantic_state_not_inspected(data_dir, preference, current_db_fingerprint);
+        let availability = SemanticAvailability::DatabaseUnavailable {
+            db_path: db_path.to_path_buf(),
+            error: "database unavailable during asset inspection".to_string(),
+        };
+        return semantic_state_from_availability(
+            data_dir,
+            &availability,
+            preference,
+            current_db_fingerprint,
+        );
     }
 
     let availability = match preference {

@@ -583,8 +583,62 @@ impl DoctorFixtureFactory {
                     });
             }
             DoctorFixtureScenario::LowDisk => {
-                self.set_contract("storage-pressure", "read-only", "cleanup-dry-run-only");
+                self.set_contract(
+                    "storage-pressure",
+                    "derived-cleanup-only",
+                    "cleanup-fingerprint-required",
+                );
+                let _ = self.add_provider_source(
+                    DoctorProviderSpec::codex(),
+                    "local",
+                    true,
+                    true,
+                    true,
+                );
+                self.seed_empty_search_index();
                 self.write_marker("diagnostics/low-disk.fixture", b"free_bytes=1024\n");
+                self.write_failed_reclaimable_generation_fixture();
+                self.write_marker("backups/low-disk-agent_search.db.bak", b"backup");
+                self.write_marker("doctor/receipts/prior-cleanup-receipt.json", b"receipt");
+                self.write_marker(
+                    "doctor/support-bundles/prior-support-bundle.json",
+                    b"support",
+                );
+                self.write_marker("sources.toml", b"# low disk source config\n");
+                self.write_marker("bookmarks.json", b"[]");
+                self.manifest.allowed_commands = vec![
+                    "cass doctor cleanup --json".to_string(),
+                    "cass doctor cleanup --yes --plan-fingerprint <fingerprint> --json".to_string(),
+                ];
+                self.manifest
+                    .cleanup_expectations
+                    .push(DoctorFixtureCleanupExpectation {
+                        path_class: "failed_derived_lexical_generation".to_string(),
+                        may_be_reclaimed_by_fix: true,
+                        reason: "failed derived generation can be rebuilt from the canonical archive DB after explicit cleanup fingerprint approval".to_string(),
+                    });
+                for (path_class, reason) in [
+                    (
+                        "raw_mirror",
+                        "raw mirrors may be the only remaining session archive copy",
+                    ),
+                    (
+                        "backup",
+                        "backup evidence requires explicit restore/export policy",
+                    ),
+                    ("receipt", "operation receipts are audit evidence"),
+                    ("support_bundle", "support bundles are diagnostic evidence"),
+                    ("config", "operator configuration is never cleanup material"),
+                    ("bookmark", "bookmarks are user state, not derived cache"),
+                ] {
+                    self.manifest
+                        .cleanup_expectations
+                        .push(DoctorFixtureCleanupExpectation {
+                            path_class: path_class.to_string(),
+                            may_be_reclaimed_by_fix: false,
+                            reason: reason.to_string(),
+                        });
+                }
                 self.manifest
                     .expected_anomalies
                     .push_unique("storage-pressure");
@@ -891,6 +945,67 @@ impl DoctorFixtureFactory {
             .confined_data_path(relative_data_path)
             .expect("marker path must be confined");
         self.write_confined_file(&path, bytes, "scenario_marker");
+    }
+
+    fn write_failed_reclaimable_generation_fixture(&mut self) {
+        let generation_dir = self
+            .confined_data_path("index/generation-failed-reclaimable")
+            .expect("failed generation path must be confined");
+        let manifest_path = generation_dir.join("lexical-generation-manifest.json");
+        self.write_confined_file(
+            &manifest_path,
+            &serde_json::to_vec_pretty(&json!({
+                "manifest_version": 3,
+                "generation_id": "gen-failed-reclaimable",
+                "attempt_id": "attempt-1",
+                "created_at_ms": FIXTURE_BASE_TS_MS,
+                "updated_at_ms": FIXTURE_BASE_TS_MS + 321,
+                "source_db_fingerprint": "fixture-db-fingerprint",
+                "conversation_count": 1,
+                "message_count": 2,
+                "indexed_doc_count": 0,
+                "equivalence_manifest_fingerprint": null,
+                "shard_plan": null,
+                "build_budget": null,
+                "shards": [{
+                    "shard_id": "shard-failed",
+                    "shard_ordinal": 0,
+                    "state": "abandoned",
+                    "updated_at_ms": FIXTURE_BASE_TS_MS + 222,
+                    "indexed_doc_count": 0,
+                    "message_count": 0,
+                    "artifact_bytes": 192,
+                    "stable_hash": null,
+                    "reclaimable": true,
+                    "pinned": false,
+                    "recovery_reason": "failed generation can be rebuilt from canonical SQLite",
+                    "quarantine_reason": null
+                }],
+                "merge_debt": {
+                    "state": "none",
+                    "updated_at_ms": null,
+                    "pending_shard_count": 0,
+                    "pending_artifact_bytes": 0,
+                    "reason": null,
+                    "controller_reason": null
+                },
+                "build_state": "failed",
+                "publish_state": "staged",
+                "failure_history": [{
+                    "attempt_id": "attempt-1",
+                    "at_ms": FIXTURE_BASE_TS_MS + 300,
+                    "phase": "validate",
+                    "message": "fixture open probe failed before publish"
+                }]
+            }))
+            .expect("failed generation manifest JSON"),
+            "failed_derived_generation_manifest",
+        );
+        self.write_confined_file(
+            &generation_dir.join("segment-failed"),
+            b"failed derived generation bytes",
+            "failed_derived_generation_segment",
+        );
     }
 
     fn write_confined_file(&mut self, path: &Path, bytes: &[u8], kind: &str) {

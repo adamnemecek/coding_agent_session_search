@@ -12486,6 +12486,43 @@ struct DoctorCheckReport {
     fix_applied: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DoctorIncidentRootCauseKind {
+    DerivedIndexStale,
+    DerivedIndexStaleAfterDbPromotion,
+    SemanticModelMissingLexicalFallback,
+    SourcePrunedWithMirrorIntact,
+    MirrorMissingWithDbSoleCopy,
+    ArchiveDbUnreadableWithValidCandidate,
+    ArchiveDbUnreadable,
+    ActiveLockBlockingRepair,
+    InterruptedRepairState,
+    StoragePressureDerivedCleanupAvailable,
+    BackupExclusionRisk,
+    BackupUnverified,
+    PreviousRepairFailed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorRootCauseIncident {
+    schema_version: u32,
+    incident_id: String,
+    root_cause_kind: DoctorIncidentRootCauseKind,
+    severity: DoctorSeverity,
+    affected_asset_classes: Vec<DoctorAssetClass>,
+    archive_risk_level: DoctorDataLossRisk,
+    derived_risk_level: DoctorDataLossRisk,
+    confidence: String,
+    evidence_check_ids: Vec<String>,
+    blocked_actions: Vec<String>,
+    safe_next_actions: Vec<String>,
+    stale_or_unknown_fields: Vec<String>,
+    redacted_evidence_paths: Vec<String>,
+    summary: String,
+}
+
 #[derive(Debug, Clone)]
 struct DoctorDatabaseIntegrityProbe {
     quick_check_status: String,
@@ -12733,8 +12770,10 @@ fn doctor_database_integrity_probe(
 
     let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
     let integrity_check_diagnostics = if quick_check_ok {
+        let integrity_sql =
+            format!("PRAGMA integrity_check({DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT});");
         let rows = conn
-            .query("PRAGMA integrity_check;")
+            .query(&integrity_sql)
             .map_err(|err| format!("running PRAGMA integrity_check: {err}"))?;
         let mut diagnostics = Vec::new();
         for row in rows {
@@ -12901,6 +12940,411 @@ fn doctor_check_report(
         fix_available,
         fix_applied,
     }
+}
+
+fn doctor_severity_rank(severity: DoctorSeverity) -> u8 {
+    match severity {
+        DoctorSeverity::Info => 0,
+        DoctorSeverity::Warn => 1,
+        DoctorSeverity::Error => 2,
+    }
+}
+
+fn doctor_max_severity(left: DoctorSeverity, right: DoctorSeverity) -> DoctorSeverity {
+    if doctor_severity_rank(right) > doctor_severity_rank(left) {
+        right
+    } else {
+        left
+    }
+}
+
+fn doctor_max_data_loss_risk(
+    left: DoctorDataLossRisk,
+    right: DoctorDataLossRisk,
+) -> DoctorDataLossRisk {
+    if doctor_data_loss_risk_rank(right) > doctor_data_loss_risk_rank(left) {
+        right
+    } else {
+        left
+    }
+}
+
+fn doctor_add_unique_string(values: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    if !value.is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn doctor_add_unique_asset_class(values: &mut Vec<DoctorAssetClass>, value: DoctorAssetClass) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn doctor_incident_kind_for_check(
+    check: &DoctorCheckReport,
+    coverage_risk: &DoctorCoverageRiskSummary,
+    candidate_staging: &DoctorCandidateStagingReport,
+    fallback_mode: &str,
+    candidate_promotion_report: Option<&DoctorCandidatePromotionReport>,
+) -> DoctorIncidentRootCauseKind {
+    match check.anomaly_class {
+        DoctorAnomaly::Healthy => DoctorIncidentRootCauseKind::Unknown,
+        DoctorAnomaly::DerivedLexicalStale | DoctorAnomaly::DegradedDerivedAssets => {
+            if candidate_promotion_report.is_some_and(|report| {
+                report.status == "applied"
+                    && (report.derived_lexical_rebuild_required
+                        || report.derived_semantic_rebuild_required)
+            }) {
+                DoctorIncidentRootCauseKind::DerivedIndexStaleAfterDbPromotion
+            } else {
+                DoctorIncidentRootCauseKind::DerivedIndexStale
+            }
+        }
+        DoctorAnomaly::DerivedSemanticStale => {
+            if fallback_mode == "lexical" {
+                DoctorIncidentRootCauseKind::SemanticModelMissingLexicalFallback
+            } else {
+                DoctorIncidentRootCauseKind::DerivedIndexStale
+            }
+        }
+        DoctorAnomaly::UpstreamSourcePruned => {
+            if coverage_risk.raw_mirror_db_link_count > 0 {
+                DoctorIncidentRootCauseKind::SourcePrunedWithMirrorIntact
+            } else {
+                DoctorIncidentRootCauseKind::MirrorMissingWithDbSoleCopy
+            }
+        }
+        DoctorAnomaly::RawMirrorMissing | DoctorAnomaly::RawMirrorBehindSource => {
+            DoctorIncidentRootCauseKind::MirrorMissingWithDbSoleCopy
+        }
+        DoctorAnomaly::ArchiveDbCorrupt
+        | DoctorAnomaly::ArchiveDbUnreadable
+        | DoctorAnomaly::DegradedArchiveRisk => {
+            if candidate_staging.completed_candidate_count > 0 {
+                DoctorIncidentRootCauseKind::ArchiveDbUnreadableWithValidCandidate
+            } else {
+                DoctorIncidentRootCauseKind::ArchiveDbUnreadable
+            }
+        }
+        DoctorAnomaly::LockContention => DoctorIncidentRootCauseKind::ActiveLockBlockingRepair,
+        DoctorAnomaly::InterruptedRepair => DoctorIncidentRootCauseKind::InterruptedRepairState,
+        DoctorAnomaly::StoragePressure => {
+            DoctorIncidentRootCauseKind::StoragePressureDerivedCleanupAvailable
+        }
+        DoctorAnomaly::ConfigExclusionRisk => DoctorIncidentRootCauseKind::BackupExclusionRisk,
+        DoctorAnomaly::BackupUnverified | DoctorAnomaly::BackupStale => {
+            DoctorIncidentRootCauseKind::BackupUnverified
+        }
+        DoctorAnomaly::RepairPreviouslyFailed => DoctorIncidentRootCauseKind::PreviousRepairFailed,
+        DoctorAnomaly::SourceAuthorityUnsafe | DoctorAnomaly::RepairBlocked => {
+            DoctorIncidentRootCauseKind::Unknown
+        }
+        DoctorAnomaly::PrivacyRedactionRequired => DoctorIncidentRootCauseKind::Unknown,
+    }
+}
+
+fn doctor_incident_summary(kind: DoctorIncidentRootCauseKind) -> &'static str {
+    match kind {
+        DoctorIncidentRootCauseKind::DerivedIndexStale => {
+            "Derived search assets need rebuild or cleanup; archive evidence is not the failing asset."
+        }
+        DoctorIncidentRootCauseKind::DerivedIndexStaleAfterDbPromotion => {
+            "A promoted archive generation needs derived search assets rebuilt or marked as lexical fallback."
+        }
+        DoctorIncidentRootCauseKind::SemanticModelMissingLexicalFallback => {
+            "Semantic assets are unavailable, but lexical fallback remains the safe search mode."
+        }
+        DoctorIncidentRootCauseKind::SourcePrunedWithMirrorIntact => {
+            "Upstream source logs are missing, but cass has verified raw mirror evidence."
+        }
+        DoctorIncidentRootCauseKind::MirrorMissingWithDbSoleCopy => {
+            "Some archive rows lack visible upstream or raw-mirror evidence; preserve the cass archive before repair."
+        }
+        DoctorIncidentRootCauseKind::ArchiveDbUnreadableWithValidCandidate => {
+            "The archive DB needs candidate-based recovery; a verified candidate is available or being staged."
+        }
+        DoctorIncidentRootCauseKind::ArchiveDbUnreadable => {
+            "The archive DB is unreadable or corrupt; preserve sidecars and plan recovery before mutation."
+        }
+        DoctorIncidentRootCauseKind::ActiveLockBlockingRepair => {
+            "An active or uncertain lock is blocking mutating doctor work."
+        }
+        DoctorIncidentRootCauseKind::InterruptedRepairState => {
+            "An interrupted doctor operation left artifacts that need inspection before retry."
+        }
+        DoctorIncidentRootCauseKind::StoragePressureDerivedCleanupAvailable => {
+            "Low free space can block safe doctor work; reclaim only approved derived bytes or relocate the archive."
+        }
+        DoctorIncidentRootCauseKind::BackupExclusionRisk => {
+            "Backup or config exclusions may leave archive evidence unprotected."
+        }
+        DoctorIncidentRootCauseKind::BackupUnverified => {
+            "Backups need verification before restore, repair, or cleanup decisions."
+        }
+        DoctorIncidentRootCauseKind::PreviousRepairFailed => {
+            "A previous repair failed verification and must be inspected before repeating repair."
+        }
+        DoctorIncidentRootCauseKind::Unknown => {
+            "Doctor found related symptoms but cannot prove one root cause yet."
+        }
+    }
+}
+
+fn doctor_incident_confidence(
+    kind: DoctorIncidentRootCauseKind,
+    coverage_risk: &DoctorCoverageRiskSummary,
+) -> &'static str {
+    if kind == DoctorIncidentRootCauseKind::Unknown
+        || coverage_risk.confidence_tier == "unchecked"
+        || coverage_risk.status == "not_initialized"
+    {
+        "unknown"
+    } else if coverage_risk.confidence_tier.contains("verified")
+        || matches!(
+            kind,
+            DoctorIncidentRootCauseKind::SourcePrunedWithMirrorIntact
+                | DoctorIncidentRootCauseKind::ArchiveDbUnreadableWithValidCandidate
+        )
+    {
+        "high"
+    } else {
+        "medium"
+    }
+}
+
+fn doctor_incident_blocked_actions(
+    check: &DoctorCheckReport,
+    kind: DoctorIncidentRootCauseKind,
+    blocked_actions: &mut Vec<String>,
+) {
+    if !check.safe_for_auto_repair && check.status != "pass" {
+        doctor_add_unique_string(blocked_actions, "auto-repair");
+    }
+    if matches!(
+        check.data_loss_risk,
+        DoctorDataLossRisk::Medium | DoctorDataLossRisk::High | DoctorDataLossRisk::Unknown
+    ) {
+        doctor_add_unique_string(blocked_actions, "source-only-rebuild");
+    }
+    match kind {
+        DoctorIncidentRootCauseKind::ActiveLockBlockingRepair => {
+            doctor_add_unique_string(blocked_actions, "mutating-doctor-repair");
+        }
+        DoctorIncidentRootCauseKind::StoragePressureDerivedCleanupAvailable => {
+            doctor_add_unique_string(blocked_actions, "archive-evidence-cleanup");
+        }
+        DoctorIncidentRootCauseKind::PreviousRepairFailed => {
+            doctor_add_unique_string(blocked_actions, "repeat-repair-without-marker-inspection");
+        }
+        DoctorIncidentRootCauseKind::ArchiveDbUnreadable
+        | DoctorIncidentRootCauseKind::ArchiveDbUnreadableWithValidCandidate
+        | DoctorIncidentRootCauseKind::MirrorMissingWithDbSoleCopy => {
+            doctor_add_unique_string(blocked_actions, "coverage-reducing-repair");
+        }
+        _ => {}
+    }
+}
+
+fn doctor_incident_redacted_paths(
+    kind: DoctorIncidentRootCauseKind,
+    operation_state: &DoctorOperationStateReport,
+    candidate_staging: &DoctorCandidateStagingReport,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    if matches!(
+        kind,
+        DoctorIncidentRootCauseKind::ActiveLockBlockingRepair
+            | DoctorIncidentRootCauseKind::InterruptedRepairState
+    ) {
+        for owner in &operation_state.owners {
+            doctor_add_unique_string(&mut paths, owner.redacted_lock_path.clone());
+        }
+        for interrupted in &operation_state.interrupted_states {
+            doctor_add_unique_string(&mut paths, interrupted.redacted_path.clone());
+        }
+    }
+    if matches!(
+        kind,
+        DoctorIncidentRootCauseKind::ArchiveDbUnreadableWithValidCandidate
+            | DoctorIncidentRootCauseKind::InterruptedRepairState
+    ) {
+        doctor_add_unique_string(&mut paths, candidate_staging.redacted_root_path.clone());
+        if let Some(build) = candidate_staging.latest_build.as_ref() {
+            if let Some(path) = build.redacted_path.as_ref() {
+                doctor_add_unique_string(&mut paths, path.clone());
+            }
+            if let Some(path) = build.redacted_manifest_path.as_ref() {
+                doctor_add_unique_string(&mut paths, path.clone());
+            }
+        }
+        for candidate in &candidate_staging.candidates {
+            doctor_add_unique_string(&mut paths, candidate.redacted_path.clone());
+            if let Some(path) = candidate.redacted_manifest_path.as_ref() {
+                doctor_add_unique_string(&mut paths, path.clone());
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn build_doctor_root_cause_incidents(
+    checks: &[DoctorCheckReport],
+    coverage_risk: &DoctorCoverageRiskSummary,
+    operation_state: &DoctorOperationStateReport,
+    candidate_staging: &DoctorCandidateStagingReport,
+    fallback_mode: &str,
+    candidate_promotion_report: Option<&DoctorCandidatePromotionReport>,
+) -> Vec<DoctorRootCauseIncident> {
+    struct IncidentAccumulator {
+        kind: DoctorIncidentRootCauseKind,
+        severity: DoctorSeverity,
+        affected_asset_classes: Vec<DoctorAssetClass>,
+        archive_risk_level: DoctorDataLossRisk,
+        derived_risk_level: DoctorDataLossRisk,
+        evidence_check_ids: Vec<String>,
+        blocked_actions: Vec<String>,
+        safe_next_actions: Vec<String>,
+        stale_or_unknown_fields: Vec<String>,
+    }
+
+    let mut groups: BTreeMap<String, IncidentAccumulator> = BTreeMap::new();
+    for check in checks.iter().filter(|check| check.status != "pass") {
+        let kind = doctor_incident_kind_for_check(
+            check,
+            coverage_risk,
+            candidate_staging,
+            fallback_mode,
+            candidate_promotion_report,
+        );
+        let key = doctor_serde_label(kind);
+        let entry = groups.entry(key).or_insert_with(|| IncidentAccumulator {
+            kind,
+            severity: DoctorSeverity::Info,
+            affected_asset_classes: Vec::new(),
+            archive_risk_level: DoctorDataLossRisk::None,
+            derived_risk_level: DoctorDataLossRisk::None,
+            evidence_check_ids: Vec::new(),
+            blocked_actions: Vec::new(),
+            safe_next_actions: Vec::new(),
+            stale_or_unknown_fields: Vec::new(),
+        });
+
+        entry.severity = doctor_max_severity(entry.severity, check.severity);
+        doctor_add_unique_asset_class(
+            &mut entry.affected_asset_classes,
+            check.affected_asset_class,
+        );
+        doctor_add_unique_string(&mut entry.evidence_check_ids, check.name.clone());
+        if check.recommended_action != "none" {
+            doctor_add_unique_string(&mut entry.safe_next_actions, check.recommended_action);
+        }
+        doctor_incident_blocked_actions(check, kind, &mut entry.blocked_actions);
+
+        let asset_policy = doctor_asset_policy(check.affected_asset_class);
+        let derived_risk = if asset_policy.derived
+            && check.data_loss_risk == DoctorDataLossRisk::None
+            && check.status != "pass"
+        {
+            DoctorDataLossRisk::Low
+        } else {
+            check.data_loss_risk
+        };
+        if asset_policy.derived {
+            entry.derived_risk_level =
+                doctor_max_data_loss_risk(entry.derived_risk_level, derived_risk);
+        } else {
+            entry.archive_risk_level =
+                doctor_max_data_loss_risk(entry.archive_risk_level, check.data_loss_risk);
+        }
+        if check.data_loss_risk == DoctorDataLossRisk::Unknown
+            || kind == DoctorIncidentRootCauseKind::Unknown
+        {
+            doctor_add_unique_string(&mut entry.stale_or_unknown_fields, "root_cause_kind");
+        }
+    }
+
+    if coverage_risk.confidence_tier == "unchecked" {
+        for entry in groups.values_mut() {
+            doctor_add_unique_string(&mut entry.stale_or_unknown_fields, "coverage_risk");
+        }
+    }
+    if operation_state.mutation_blocked_reason.is_some() {
+        for entry in groups.values_mut().filter(|entry| {
+            entry.kind == DoctorIncidentRootCauseKind::ActiveLockBlockingRepair
+                || entry.kind == DoctorIncidentRootCauseKind::InterruptedRepairState
+        }) {
+            doctor_add_unique_string(
+                &mut entry.safe_next_actions,
+                operation_state.next_action.clone(),
+            );
+        }
+    }
+
+    let mut incidents = groups
+        .into_values()
+        .map(|mut entry| {
+            entry
+                .affected_asset_classes
+                .sort_by_key(|class| doctor_serde_label(*class));
+            entry.evidence_check_ids.sort();
+            entry.blocked_actions.sort();
+            entry.safe_next_actions.sort();
+            entry.stale_or_unknown_fields.sort();
+            let redacted_evidence_paths =
+                doctor_incident_redacted_paths(entry.kind, operation_state, candidate_staging);
+            let root_cause_label = doctor_serde_label(entry.kind);
+            let incident_id = doctor_canonical_blake3(
+                "doctor-incident-v1",
+                serde_json::json!({
+                    "kind": root_cause_label,
+                    "evidence": entry.evidence_check_ids.clone(),
+                    "assets": entry
+                        .affected_asset_classes
+                        .iter()
+                        .map(|class| doctor_serde_label(*class))
+                        .collect::<Vec<_>>(),
+                }),
+            );
+            DoctorRootCauseIncident {
+                schema_version: 1,
+                incident_id,
+                root_cause_kind: entry.kind,
+                severity: entry.severity,
+                affected_asset_classes: entry.affected_asset_classes,
+                archive_risk_level: entry.archive_risk_level,
+                derived_risk_level: entry.derived_risk_level,
+                confidence: doctor_incident_confidence(entry.kind, coverage_risk).to_string(),
+                evidence_check_ids: entry.evidence_check_ids,
+                blocked_actions: entry.blocked_actions,
+                safe_next_actions: entry.safe_next_actions,
+                stale_or_unknown_fields: entry.stale_or_unknown_fields,
+                redacted_evidence_paths,
+                summary: doctor_incident_summary(entry.kind).to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    incidents.sort_by(|left, right| {
+        doctor_severity_rank(right.severity)
+            .cmp(&doctor_severity_rank(left.severity))
+            .then_with(|| {
+                doctor_data_loss_risk_rank(right.archive_risk_level)
+                    .cmp(&doctor_data_loss_risk_rank(left.archive_risk_level))
+            })
+            .then_with(|| {
+                doctor_data_loss_risk_rank(right.derived_risk_level)
+                    .cmp(&doctor_data_loss_risk_rank(left.derived_risk_level))
+            })
+            .then_with(|| {
+                doctor_serde_label(left.root_cause_kind)
+                    .cmp(&doctor_serde_label(right.root_cause_kind))
+            })
+            .then_with(|| left.incident_id.cmp(&right.incident_id))
+    });
+    incidents
 }
 
 fn doctor_health_class_for_checks(checks: &[DoctorCheckReport]) -> DoctorHealth {
@@ -16624,6 +17068,7 @@ struct DoctorOperationOwnerReport {
     owned_by_current_process: bool,
     owner_confidence: DoctorOperationOwnerConfidence,
     pid: Option<u32>,
+    owner_command: Option<String>,
     started_at_ms: Option<i64>,
     started_at: Option<String>,
     updated_at_ms: Option<i64>,
@@ -16636,6 +17081,78 @@ struct DoctorOperationOwnerReport {
     db_path_matches_requested: Option<bool>,
     evidence: Vec<String>,
     next_action: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorLockDiagnosticReport {
+    schema_version: u32,
+    lock_kind: DoctorOperationLockKind,
+    lock_path: String,
+    redacted_lock_path: String,
+    active: bool,
+    owned_by_current_process: bool,
+    owner_confidence: DoctorOperationOwnerConfidence,
+    pid: Option<u32>,
+    owner_command: Option<String>,
+    pid_metadata_status: String,
+    pid_reuse_ambiguous: bool,
+    age_ms: Option<u64>,
+    last_heartbeat_age_ms: Option<u64>,
+    stale_suspected: Option<bool>,
+    wait_duration_ms: Option<u64>,
+    retry_policy: String,
+    safe_to_wait: bool,
+    manual_delete_allowed: bool,
+    recommended_action: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorTimingSpanReport {
+    schema_version: u32,
+    name: String,
+    phase: String,
+    source: String,
+    elapsed_ms: u64,
+    threshold_ms: u64,
+    slow: bool,
+    event_log_correlation_id: String,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorSlowOperationReport {
+    schema_version: u32,
+    name: String,
+    phase: String,
+    elapsed_ms: u64,
+    threshold_ms: u64,
+    severity: String,
+    event_log_correlation_id: String,
+    recommended_action: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorTimingSummaryReport {
+    schema_version: u32,
+    elapsed_ms: u64,
+    measured_operation_count: usize,
+    slow_operation_count: usize,
+    default_threshold_ms: u64,
+    slowest_operation: Option<String>,
+    slowest_elapsed_ms: Option<u64>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorRetryRecommendationReport {
+    schema_version: u32,
+    policy: String,
+    safe_to_retry: bool,
+    retry_after_ms: Option<u64>,
+    command: Option<String>,
+    reason: String,
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -16720,6 +17237,9 @@ impl DoctorMutationLockObservation {
 }
 
 const DOCTOR_STORAGE_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+const CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES: &str = "CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES";
+const DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS: u64 = 500;
+const DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS: u64 = 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize)]
 struct DoctorStoragePressureReport {
@@ -16741,23 +17261,40 @@ fn doctor_storage_probe_path(data_dir: &Path) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn doctor_available_space(probe_path: &Path) -> io::Result<u64> {
+    if let Ok(raw) = dotenvy::var(CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES) {
+        return raw.parse::<u64>().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid {CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES}={raw:?}: {err}"),
+            )
+        });
+    }
+    fs2::available_space(probe_path)
+}
+
 fn collect_doctor_storage_pressure(data_dir: &Path) -> DoctorStoragePressureReport {
     let probe_path = doctor_storage_probe_path(data_dir);
-    match fs2::available_space(&probe_path) {
+    match doctor_available_space(&probe_path) {
         Ok(available_bytes) => {
             let status = if available_bytes < DOCTOR_STORAGE_MIN_FREE_BYTES {
                 "warn"
             } else {
                 "ok"
             };
-            let note = if status == "warn" {
+            let mut notes = vec![if status == "warn" {
                 format!(
                     "Available space is below the doctor safety floor of {} bytes; free space without deleting cass archive evidence.",
                     DOCTOR_STORAGE_MIN_FREE_BYTES
                 )
             } else {
                 "Available space is above the doctor safety floor.".to_string()
-            };
+            }];
+            if dotenvy::var(CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES).is_ok() {
+                notes.push(
+                    "Storage pressure used the deterministic doctor E2E test override.".to_string(),
+                );
+            }
             DoctorStoragePressureReport {
                 schema_version: 1,
                 status: status.to_string(),
@@ -16765,7 +17302,7 @@ fn collect_doctor_storage_pressure(data_dir: &Path) -> DoctorStoragePressureRepo
                 probe_path: probe_path.display().to_string(),
                 available_bytes: Some(available_bytes),
                 min_recommended_free_bytes: DOCTOR_STORAGE_MIN_FREE_BYTES,
-                notes: vec![note],
+                notes,
             }
         }
         Err(err) => DoctorStoragePressureReport {
@@ -23184,6 +23721,15 @@ fn doctor_lock_metadata_i64(metadata: &BTreeMap<String, String>, key: &str) -> O
     metadata.get(key).and_then(|value| value.parse().ok())
 }
 
+fn doctor_redact_lock_command(command: Option<&String>, data_dir: &Path) -> Option<String> {
+    let command = command?;
+    let data_dir_text = data_dir.display().to_string();
+    if data_dir_text.is_empty() {
+        return Some(command.clone());
+    }
+    Some(command.replace(&data_dir_text, "[cass-data]"))
+}
+
 fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation {
     let path = doctor_mutation_lock_path(data_dir);
     if !path.exists() {
@@ -23357,6 +23903,7 @@ fn doctor_operation_owner_from_maintenance(
         owned_by_current_process,
         owner_confidence,
         pid,
+        owner_command: None,
         started_at_ms,
         started_at: started_at_ms.and_then(format_timestamp_millis_rfc3339),
         updated_at_ms,
@@ -23450,6 +23997,7 @@ fn doctor_operation_owner_from_doctor_lock(
         owned_by_current_process,
         owner_confidence,
         pid,
+        owner_command: doctor_redact_lock_command(metadata.get("command"), data_dir),
         started_at_ms,
         started_at: started_at_ms.and_then(format_timestamp_millis_rfc3339),
         updated_at_ms,
@@ -23720,6 +24268,261 @@ fn build_doctor_operation_state_report(
             "PID and timestamp metadata are advisory; advisory lock ownership and receipts are the authority.".to_string(),
             "Interrupted artifacts are never deleted by this state model; they block mutation until inspected.".to_string(),
         ],
+    }
+}
+
+fn doctor_elapsed_since_ms(now_ms: i64, timestamp_ms: Option<i64>) -> Option<u64> {
+    let timestamp_ms = timestamp_ms?;
+    Some(now_ms.saturating_sub(timestamp_ms).max(0) as u64)
+}
+
+fn doctor_lock_pid_metadata_status(owner: &DoctorOperationOwnerReport) -> String {
+    if owner
+        .evidence
+        .iter()
+        .any(|entry| entry.to_ascii_lowercase().contains("permission denied"))
+    {
+        return "permission-denied".to_string();
+    }
+    if owner.pid.is_none() {
+        return "pid-missing".to_string();
+    }
+    if owner.owned_by_current_process {
+        return "current-process".to_string();
+    }
+    match owner.owner_confidence {
+        DoctorOperationOwnerConfidence::ActiveAdvisoryLock => {
+            "not-queried-pid-reuse-ambiguous".to_string()
+        }
+        DoctorOperationOwnerConfidence::ActiveMissingMetadata => "metadata-missing".to_string(),
+        DoctorOperationOwnerConfidence::CurrentProcess => "current-process".to_string(),
+        DoctorOperationOwnerConfidence::StaleMetadataOnly => "metadata-only".to_string(),
+        DoctorOperationOwnerConfidence::Unavailable => "unavailable".to_string(),
+    }
+}
+
+fn doctor_lock_pid_reuse_ambiguous(owner: &DoctorOperationOwnerReport) -> bool {
+    owner.pid.is_some()
+        && !owner.owned_by_current_process
+        && matches!(
+            owner.owner_confidence,
+            DoctorOperationOwnerConfidence::ActiveAdvisoryLock
+                | DoctorOperationOwnerConfidence::StaleMetadataOnly
+        )
+}
+
+fn doctor_lock_stale_suspected(
+    owner: &DoctorOperationOwnerReport,
+    last_heartbeat_age_ms: Option<u64>,
+) -> Option<bool> {
+    match owner.owner_confidence {
+        DoctorOperationOwnerConfidence::StaleMetadataOnly => Some(true),
+        DoctorOperationOwnerConfidence::Unavailable
+        | DoctorOperationOwnerConfidence::ActiveMissingMetadata => None,
+        DoctorOperationOwnerConfidence::CurrentProcess
+        | DoctorOperationOwnerConfidence::ActiveAdvisoryLock => Some(
+            last_heartbeat_age_ms.is_some_and(|age| age > DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS),
+        ),
+    }
+}
+
+fn doctor_lock_retry_policy(owner: &DoctorOperationOwnerReport) -> (&'static str, Option<u64>) {
+    match owner.owner_confidence {
+        DoctorOperationOwnerConfidence::CurrentProcess => ("current-process-owned", None),
+        DoctorOperationOwnerConfidence::ActiveAdvisoryLock
+        | DoctorOperationOwnerConfidence::ActiveMissingMetadata => ("wait-and-retry", Some(30_000)),
+        DoctorOperationOwnerConfidence::StaleMetadataOnly => ("inspect-receipts", None),
+        DoctorOperationOwnerConfidence::Unavailable => ("inspect-permissions", None),
+    }
+}
+
+fn build_doctor_lock_diagnostics(
+    operation_state: &DoctorOperationStateReport,
+    now_ms: i64,
+) -> Vec<DoctorLockDiagnosticReport> {
+    operation_state
+        .owners
+        .iter()
+        .map(|owner| {
+            let age_ms = doctor_elapsed_since_ms(now_ms, owner.started_at_ms);
+            let last_heartbeat_age_ms = doctor_elapsed_since_ms(now_ms, owner.updated_at_ms);
+            let stale_suspected = doctor_lock_stale_suspected(owner, last_heartbeat_age_ms);
+            let (retry_policy, retry_after_ms) = doctor_lock_retry_policy(owner);
+            let mut evidence = owner.evidence.clone();
+            if owner.owner_command.is_some() {
+                doctor_add_unique_string(&mut evidence, "owner-command-from-lock-metadata");
+            }
+            if owner.pid.is_none() {
+                doctor_add_unique_string(&mut evidence, "pid-missing");
+            }
+            if doctor_lock_pid_reuse_ambiguous(owner) {
+                doctor_add_unique_string(&mut evidence, "pid-reuse-ambiguous");
+            }
+            if last_heartbeat_age_ms.is_some_and(|age| age > DOCTOR_LOCK_HEARTBEAT_STALE_AFTER_MS) {
+                doctor_add_unique_string(&mut evidence, "heartbeat-older-than-stale-threshold");
+            }
+
+            DoctorLockDiagnosticReport {
+                schema_version: 1,
+                lock_kind: owner.lock_kind,
+                lock_path: owner.lock_path.clone(),
+                redacted_lock_path: owner.redacted_lock_path.clone(),
+                active: owner.active,
+                owned_by_current_process: owner.owned_by_current_process,
+                owner_confidence: owner.owner_confidence,
+                pid: owner.pid,
+                owner_command: owner.owner_command.clone(),
+                pid_metadata_status: doctor_lock_pid_metadata_status(owner),
+                pid_reuse_ambiguous: doctor_lock_pid_reuse_ambiguous(owner),
+                age_ms,
+                last_heartbeat_age_ms,
+                stale_suspected,
+                wait_duration_ms: retry_after_ms,
+                retry_policy: retry_policy.to_string(),
+                safe_to_wait: matches!(retry_policy, "wait-and-retry" | "current-process-owned"),
+                manual_delete_allowed: false,
+                recommended_action: owner.next_action.clone(),
+                evidence,
+            }
+        })
+        .collect()
+}
+
+fn doctor_push_timing_span(
+    spans: &mut Vec<DoctorTimingSpanReport>,
+    name: &str,
+    phase: &str,
+    source: &str,
+    started: std::time::Instant,
+    threshold_ms: u64,
+    notes: Vec<String>,
+) {
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    spans.push(DoctorTimingSpanReport {
+        schema_version: 1,
+        name: name.to_string(),
+        phase: phase.to_string(),
+        source: source.to_string(),
+        elapsed_ms,
+        threshold_ms,
+        slow: elapsed_ms > threshold_ms,
+        event_log_correlation_id: format!("doctor_timing:{name}"),
+        notes,
+    });
+}
+
+fn build_doctor_slow_operations(
+    spans: &[DoctorTimingSpanReport],
+) -> Vec<DoctorSlowOperationReport> {
+    let mut slow = spans
+        .iter()
+        .filter(|span| span.slow)
+        .map(|span| DoctorSlowOperationReport {
+            schema_version: 1,
+            name: span.name.clone(),
+            phase: span.phase.clone(),
+            elapsed_ms: span.elapsed_ms,
+            threshold_ms: span.threshold_ms,
+            severity: if span.elapsed_ms > span.threshold_ms.saturating_mul(5) {
+                "warn".to_string()
+            } else {
+                "info".to_string()
+            },
+            event_log_correlation_id: span.event_log_correlation_id.clone(),
+            recommended_action: format!(
+                "Inspect doctor timing span `{}` and rerun with CASS_TRACE_FILE=<path> if it remains slow.",
+                span.name
+            ),
+        })
+        .collect::<Vec<_>>();
+    slow.sort_by(|left, right| {
+        right
+            .elapsed_ms
+            .cmp(&left.elapsed_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    slow
+}
+
+fn build_doctor_timing_summary(
+    spans: &[DoctorTimingSpanReport],
+    elapsed_ms: u64,
+) -> DoctorTimingSummaryReport {
+    let slow_operation_count = spans.iter().filter(|span| span.slow).count();
+    let slowest = spans
+        .iter()
+        .max_by(|left, right| left.elapsed_ms.cmp(&right.elapsed_ms));
+    DoctorTimingSummaryReport {
+        schema_version: 1,
+        elapsed_ms,
+        measured_operation_count: spans.len(),
+        slow_operation_count,
+        default_threshold_ms: DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        slowest_operation: slowest.map(|span| span.name.clone()),
+        slowest_elapsed_ms: slowest.map(|span| span.elapsed_ms),
+        notes: vec![
+            "Timing spans are advisory wall-clock measurements for the current doctor process."
+                .to_string(),
+            "Health/status should consume cached summaries rather than rerunning expensive doctor collectors."
+                .to_string(),
+        ],
+    }
+}
+
+fn build_doctor_retry_recommendation(
+    operation_state: &DoctorOperationStateReport,
+    operation_outcome: &DoctorOperationOutcomeReport,
+    locks: &[DoctorLockDiagnosticReport],
+    recommended_action: Option<&String>,
+) -> DoctorRetryRecommendationReport {
+    if let Some(lock) = locks.iter().find(|lock| {
+        lock.active || lock.owner_confidence == DoctorOperationOwnerConfidence::Unavailable
+    }) {
+        return DoctorRetryRecommendationReport {
+            schema_version: 1,
+            policy: lock.retry_policy.clone(),
+            safe_to_retry: true,
+            retry_after_ms: lock.wait_duration_ms,
+            command: Some("cass doctor --json".to_string()),
+            reason: lock.recommended_action.clone(),
+            notes: vec![
+                format!("lock_kind={}", doctor_serde_label(lock.lock_kind)),
+                "Do not delete lock files manually; use doctor/status output and receipts as evidence."
+                    .to_string(),
+            ],
+        };
+    }
+
+    if operation_state.interrupted_state_count > 0 {
+        return DoctorRetryRecommendationReport {
+            schema_version: 1,
+            policy: "inspect-interrupted-state".to_string(),
+            safe_to_retry: false,
+            retry_after_ms: None,
+            command: Some("cass doctor --json".to_string()),
+            reason: operation_state.next_action.clone(),
+            notes: vec![
+                "Interrupted artifacts are evidence and are not automatically deleted.".to_string(),
+            ],
+        };
+    }
+
+    DoctorRetryRecommendationReport {
+        schema_version: 1,
+        policy: if operation_outcome.safe_to_retry {
+            "retry-allowed"
+        } else {
+            "no-retry-needed"
+        }
+        .to_string(),
+        safe_to_retry: operation_outcome.safe_to_retry,
+        retry_after_ms: None,
+        command: operation_outcome
+            .next_command
+            .clone()
+            .or_else(|| recommended_action.cloned()),
+        reason: operation_outcome.reason.clone(),
+        notes: vec!["No active doctor/index lock owner was reported in this payload.".to_string()],
     }
 }
 
@@ -30005,6 +30808,217 @@ mod doctor_asset_taxonomy_tests {
     }
 
     #[test]
+    fn doctor_root_cause_incidents_group_source_pruning_with_mirror_evidence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let checks = vec![
+            doctor_check_report(
+                "source_inventory",
+                "warn",
+                "Source coverage risk: 2 indexed local conversation(s) no longer have a visible upstream file; 0 indexed conversation(s) have incomplete source mapping",
+                false,
+                false,
+            ),
+            doctor_check_report(
+                "raw_mirror_backfill",
+                "warn",
+                "2 DB-only archive rows appear to be the sole remaining copy but verified raw mirror evidence exists",
+                false,
+                false,
+            ),
+        ];
+        let coverage_risk = DoctorCoverageRiskSummary {
+            schema_version: 1,
+            status: "sole_copy_risk".to_string(),
+            confidence_tier: "sole_copy_verified_raw_mirror".to_string(),
+            archive_conversation_count: 2,
+            missing_current_source_count: 2,
+            raw_mirror_db_link_count: 2,
+            sole_copy_warning_count: 2,
+            recommended_action: "Back up the cass data directory.".to_string(),
+            ..DoctorCoverageRiskSummary::default()
+        };
+        let operation_state = doctor_test_operation_state(data_dir, &db_path, &index_path);
+        let incidents = build_doctor_root_cause_incidents(
+            &checks,
+            &coverage_risk,
+            &operation_state,
+            &DoctorCandidateStagingReport::default(),
+            "lexical",
+            None,
+        );
+
+        assert_eq!(incidents.len(), 1, "{incidents:#?}");
+        let incident = &incidents[0];
+        assert_eq!(
+            incident.root_cause_kind,
+            DoctorIncidentRootCauseKind::SourcePrunedWithMirrorIntact
+        );
+        assert_eq!(incident.confidence, "high");
+        assert_eq!(incident.archive_risk_level, DoctorDataLossRisk::High);
+        assert_eq!(
+            incident.evidence_check_ids,
+            vec![
+                "raw_mirror_backfill".to_string(),
+                "source_inventory".to_string()
+            ]
+        );
+        assert!(
+            incident
+                .blocked_actions
+                .contains(&"source-only-rebuild".to_string()),
+            "{incident:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_root_cause_incidents_collect_lock_paths_and_next_action() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let lock_path = data_dir.join("doctor/locks/doctor-repair.lock");
+        let operation_state = build_doctor_operation_state_report(
+            data_dir,
+            &db_path,
+            &index_path,
+            &crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+            &DoctorMutationLockObservation::Active {
+                path: lock_path,
+                metadata: BTreeMap::new(),
+            },
+        );
+        let checks = vec![
+            doctor_check_report(
+                "operation_state",
+                "fail",
+                "Doctor mutation blocked: another doctor repair is active",
+                false,
+                false,
+            ),
+            doctor_check_report(
+                "lock_file",
+                "warn",
+                "Stale lock file found but owner could not be proven stale",
+                false,
+                false,
+            ),
+        ];
+        let incidents = build_doctor_root_cause_incidents(
+            &checks,
+            &DoctorCoverageRiskSummary {
+                schema_version: 1,
+                status: "ok".to_string(),
+                confidence_tier: "archive_db_coverage".to_string(),
+                recommended_action: "none".to_string(),
+                ..DoctorCoverageRiskSummary::default()
+            },
+            &operation_state,
+            &DoctorCandidateStagingReport::default(),
+            "lexical",
+            None,
+        );
+
+        assert_eq!(incidents.len(), 1, "{incidents:#?}");
+        let incident = &incidents[0];
+        assert_eq!(
+            incident.root_cause_kind,
+            DoctorIncidentRootCauseKind::ActiveLockBlockingRepair
+        );
+        assert_eq!(incident.severity, DoctorSeverity::Warn);
+        assert_eq!(
+            incident.evidence_check_ids,
+            vec!["lock_file".to_string(), "operation_state".to_string()]
+        );
+        assert!(
+            incident
+                .blocked_actions
+                .contains(&"mutating-doctor-repair".to_string()),
+            "{incident:#?}"
+        );
+        assert!(
+            incident
+                .redacted_evidence_paths
+                .iter()
+                .any(|path| path.contains("[cass-data]")),
+            "{incident:#?}"
+        );
+        assert!(
+            incident
+                .safe_next_actions
+                .iter()
+                .any(|action| action.contains("wait") || action.contains("inspect")),
+            "{incident:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_root_cause_incidents_sort_archive_candidate_recovery_before_derived_work() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let checks = vec![
+            doctor_check_report("index", "warn", "Search index missing", true, false),
+            doctor_check_report(
+                "database",
+                "fail",
+                "Cannot open database: simulated archive issue",
+                false,
+                false,
+            ),
+        ];
+        let candidate_staging = DoctorCandidateStagingReport {
+            completed_candidate_count: 1,
+            redacted_root_path: "[cass-data]/doctor/candidates".to_string(),
+            candidates: vec![DoctorCandidateSummary {
+                candidate_id: "candidate-1".to_string(),
+                lifecycle_status: "completed".to_string(),
+                path: data_dir
+                    .join("doctor/candidates/candidate-1")
+                    .display()
+                    .to_string(),
+                redacted_path: "[cass-data]/doctor/candidates/candidate-1".to_string(),
+                redacted_manifest_path: Some(
+                    "[cass-data]/doctor/candidates/candidate-1/manifest.json".to_string(),
+                ),
+                safe_to_delete_automatically: false,
+                ..DoctorCandidateSummary::default()
+            }],
+            ..DoctorCandidateStagingReport::default()
+        };
+        let operation_state = doctor_test_operation_state(data_dir, &db_path, &index_path);
+        let incidents = build_doctor_root_cause_incidents(
+            &checks,
+            &DoctorCoverageRiskSummary {
+                schema_version: 1,
+                status: "ok".to_string(),
+                confidence_tier: "archive_db_coverage".to_string(),
+                recommended_action: "none".to_string(),
+                ..DoctorCoverageRiskSummary::default()
+            },
+            &operation_state,
+            &candidate_staging,
+            "lexical",
+            None,
+        );
+
+        assert_eq!(incidents.len(), 2, "{incidents:#?}");
+        assert_eq!(
+            incidents[0].root_cause_kind,
+            DoctorIncidentRootCauseKind::ArchiveDbUnreadableWithValidCandidate
+        );
+        assert_eq!(
+            incidents[1].root_cause_kind,
+            DoctorIncidentRootCauseKind::DerivedIndexStale
+        );
+        assert_eq!(incidents[0].archive_risk_level, DoctorDataLossRisk::High);
+        assert_eq!(incidents[1].derived_risk_level, DoctorDataLossRisk::Low);
+    }
+
+    #[test]
     fn doctor_health_class_uses_highest_risk_report() {
         let derived = doctor_check_report("index", "fail", "Search index not found", true, false);
         let source_unsafe = doctor_check_report(
@@ -30640,6 +31654,208 @@ mod doctor_asset_taxonomy_tests {
                     && !state.safe_to_delete_automatically
             }),
             "publish sidecar should be classified as recoverable, not deleted: {report:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_lock_diagnostics_report_active_owner_without_delete_advice() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let lock_path = doctor_mutation_lock_path(data_dir);
+        let mut metadata = BTreeMap::new();
+        metadata.insert("schema_version".to_string(), "1".to_string());
+        metadata.insert("pid".to_string(), "999999".to_string());
+        metadata.insert("started_at_ms".to_string(), "1733001111000".to_string());
+        metadata.insert("updated_at_ms".to_string(), "1733001112000".to_string());
+        metadata.insert("db_path".to_string(), db_path.display().to_string());
+        metadata.insert(
+            "command".to_string(),
+            format!("cass doctor --fix --data-dir {}", data_dir.display()),
+        );
+        let report = build_doctor_operation_state_report(
+            data_dir,
+            &db_path,
+            &index_path,
+            &crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+            &DoctorMutationLockObservation::Active {
+                path: lock_path,
+                metadata,
+            },
+        );
+
+        let locks = build_doctor_lock_diagnostics(&report, 1_733_001_113_000);
+
+        assert_eq!(locks.len(), 1);
+        let lock = &locks[0];
+        assert_eq!(lock.lock_kind, DoctorOperationLockKind::DoctorRepair);
+        assert_eq!(
+            lock.owner_confidence,
+            DoctorOperationOwnerConfidence::ActiveAdvisoryLock
+        );
+        assert_eq!(lock.retry_policy, "wait-and-retry");
+        assert_eq!(lock.wait_duration_ms, Some(30_000));
+        assert!(lock.safe_to_wait);
+        assert!(!lock.manual_delete_allowed);
+        assert!(lock.pid_reuse_ambiguous);
+        assert_eq!(
+            lock.owner_command.as_deref(),
+            Some("cass doctor --fix --data-dir [cass-data]")
+        );
+    }
+
+    #[test]
+    fn doctor_lock_diagnostics_keep_stale_metadata_advisory_only() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let mut metadata = BTreeMap::new();
+        metadata.insert("schema_version".to_string(), "1".to_string());
+        metadata.insert("pid".to_string(), "999999".to_string());
+        metadata.insert("started_at_ms".to_string(), "1733000000000".to_string());
+        metadata.insert("updated_at_ms".to_string(), "1733000000000".to_string());
+        let report = build_doctor_operation_state_report(
+            data_dir,
+            &db_path,
+            &index_path,
+            &crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+            &DoctorMutationLockObservation::Available {
+                path: doctor_mutation_lock_path(data_dir),
+                metadata,
+            },
+        );
+
+        let locks = build_doctor_lock_diagnostics(&report, 1_733_004_000_001);
+
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].retry_policy, "inspect-receipts");
+        assert_eq!(locks[0].stale_suspected, Some(true));
+        assert!(!locks[0].manual_delete_allowed);
+        assert!(
+            locks[0]
+                .recommended_action
+                .contains("do not delete it without inspecting receipts"),
+            "stale metadata must not become unsafe delete advice: {locks:#?}"
+        );
+    }
+
+    #[test]
+    fn doctor_lock_diagnostics_handle_missing_pid_and_permission_denied() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+
+        let missing_pid_state = build_doctor_operation_state_report(
+            data_dir,
+            &db_path,
+            &index_path,
+            &crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+            &DoctorMutationLockObservation::Active {
+                path: doctor_mutation_lock_path(data_dir),
+                metadata: BTreeMap::new(),
+            },
+        );
+        let missing_pid_locks =
+            build_doctor_lock_diagnostics(&missing_pid_state, 1_733_004_000_001);
+        assert_eq!(missing_pid_locks[0].pid_metadata_status, "pid-missing");
+        assert_eq!(missing_pid_locks[0].stale_suspected, None);
+
+        let permission_state = build_doctor_operation_state_report(
+            data_dir,
+            &db_path,
+            &index_path,
+            &crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+            &DoctorMutationLockObservation::Unavailable {
+                path: doctor_mutation_lock_path(data_dir),
+                reason: "failed to open doctor mutation lock for inspection: Permission denied"
+                    .to_string(),
+            },
+        );
+        let permission_locks = build_doctor_lock_diagnostics(&permission_state, 1_733_004_000_001);
+        assert_eq!(permission_locks[0].pid_metadata_status, "permission-denied");
+        assert_eq!(permission_locks[0].retry_policy, "inspect-permissions");
+    }
+
+    #[test]
+    fn doctor_lock_diagnostics_no_lock_reports_retry_allowed_summary() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = data_dir.join("index");
+        let state = doctor_test_operation_state(data_dir, &db_path, &index_path);
+        let locks = build_doctor_lock_diagnostics(&state, 1_733_004_000_001);
+        let outcome = doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::OkNoActionNeeded,
+            "doctor found no lock blockers".to_string(),
+            "reported lock state".to_string(),
+            "no mutation was attempted".to_string(),
+            DoctorDataLossRisk::None,
+            Some("cass doctor --json".to_string()),
+            None,
+        );
+
+        let retry = build_doctor_retry_recommendation(&state, &outcome, &locks, None);
+
+        assert!(locks.is_empty());
+        assert_eq!(retry.policy, "retry-allowed");
+        assert_eq!(retry.command.as_deref(), Some("cass doctor --json"));
+    }
+
+    #[test]
+    fn doctor_slow_operation_reports_sort_and_correlate_slow_phases() {
+        let spans = vec![
+            DoctorTimingSpanReport {
+                schema_version: 1,
+                name: "raw_mirror_scan".to_string(),
+                phase: "raw_mirror".to_string(),
+                source: "unit".to_string(),
+                elapsed_ms: 900,
+                threshold_ms: 500,
+                slow: true,
+                event_log_correlation_id: "doctor_timing:raw_mirror_scan".to_string(),
+                notes: vec![],
+            },
+            DoctorTimingSpanReport {
+                schema_version: 1,
+                name: "lexical_probe".to_string(),
+                phase: "index".to_string(),
+                source: "unit".to_string(),
+                elapsed_ms: 30,
+                threshold_ms: 500,
+                slow: false,
+                event_log_correlation_id: "doctor_timing:lexical_probe".to_string(),
+                notes: vec![],
+            },
+            DoctorTimingSpanReport {
+                schema_version: 1,
+                name: "candidate_staging".to_string(),
+                phase: "candidate_staging".to_string(),
+                source: "unit".to_string(),
+                elapsed_ms: 3_000,
+                threshold_ms: 500,
+                slow: true,
+                event_log_correlation_id: "doctor_timing:candidate_staging".to_string(),
+                notes: vec![],
+            },
+        ];
+
+        let slow = build_doctor_slow_operations(&spans);
+        let summary = build_doctor_timing_summary(&spans, 3_200);
+
+        assert_eq!(slow.len(), 2);
+        assert_eq!(slow[0].name, "candidate_staging");
+        assert_eq!(
+            slow[0].event_log_correlation_id,
+            "doctor_timing:candidate_staging"
+        );
+        assert_eq!(summary.measured_operation_count, 3);
+        assert_eq!(summary.slow_operation_count, 2);
+        assert_eq!(
+            summary.slowest_operation.as_deref(),
+            Some("candidate_staging")
         );
     }
 
@@ -40588,6 +41804,8 @@ pub(crate) fn run_doctor_impl(
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let lock_path = data_dir.join(".index.lock");
+    let mut timing_spans: Vec<DoctorTimingSpanReport> = Vec::new();
+    let lock_probe_started = Instant::now();
     let maintenance_snapshot = probe_index_run_lock(&data_dir, &db_path);
     let rebuild_active = maintenance_snapshot.active;
     let cleanup_apply_requested = command_surface == doctor::DoctorCommandSurface::Cleanup
@@ -40600,7 +41818,8 @@ pub(crate) fn run_doctor_impl(
     let override_available = fix && initial_failure_marker.found;
     let override_used = override_available && allow_repeated_repair;
     let mut _doctor_lock_guard: Option<DoctorMutationLockGuard> = None;
-    let fingerprint_apply_requested = execution_mode == doctor::DoctorExecutionMode::FingerprintApply;
+    let fingerprint_apply_requested =
+        execution_mode == doctor::DoctorExecutionMode::FingerprintApply;
     let doctor_lock_observation = if fix && !repeat_repair_refused && !fingerprint_apply_requested {
         match doctor_acquire_mutation_lock(&data_dir, &db_path) {
             Ok((guard, observation)) => {
@@ -40618,6 +41837,15 @@ pub(crate) fn run_doctor_impl(
         &index_path,
         &maintenance_snapshot,
         &doctor_lock_observation,
+    );
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "lock_state_probe",
+        "operation_state",
+        "operation_state",
+        lock_probe_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec!["index-run and doctor repair lock observations captured".to_string()],
     );
     let mutating_lock_acquired = matches!(
         doctor_lock_observation,
@@ -40756,7 +41984,17 @@ pub(crate) fn run_doctor_impl(
         );
     }
 
+    let storage_pressure_started = Instant::now();
     let storage_pressure = collect_doctor_storage_pressure(&data_dir);
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "storage_pressure",
+        "storage_pressure",
+        "storage_pressure",
+        storage_pressure_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec!["free-space probe completed without mutating archive evidence".to_string()],
+    );
     match storage_pressure.status.as_str() {
         "ok" => {
             add_check!(
@@ -40915,6 +42153,7 @@ pub(crate) fn run_doctor_impl(
     // 3. Check database exists and is readable
     // Fix #128: use the CLI read-only opener with a timeout to prevent hanging on degraded
     // databases without dirtying precious archive evidence during a read-only doctor check.
+    let archive_db_probe_started = Instant::now();
     if db_path.exists() {
         let db_open_result = open_franken_cli_read_db_with_hard_timeout(
             db_path.to_path_buf(),
@@ -41036,8 +42275,18 @@ pub(crate) fn run_doctor_impl(
         add_check!("database", "fail", "Database not found", true);
         needs_rebuild = true;
     }
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "archive_db_open_integrity",
+        "database",
+        "archive_db_open_and_integrity",
+        archive_db_probe_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec!["archive DB open, row counts, and integrity-style checks completed or were skipped by state".to_string()],
+    );
 
     // 4. Check Tantivy index exists and is readable
+    let lexical_probe_started = Instant::now();
     if crate::search::tantivy::searchable_index_exists(&index_path) {
         match crate::search::tantivy::searchable_index_summary(&index_path) {
             Ok(Some(summary)) => {
@@ -41099,6 +42348,15 @@ pub(crate) fn run_doctor_impl(
         add_check!("index", "fail", "Search index not found", true);
         needs_rebuild = true;
     }
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "lexical_probe",
+        "index",
+        "lexical_probe",
+        lexical_probe_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec!["derived lexical index presence and metadata probe completed".to_string()],
+    );
 
     // 5. Check config file
     let config_path = data_dir.join("config.toml");
@@ -41200,7 +42458,20 @@ pub(crate) fn run_doctor_impl(
         );
     }
 
+    let source_inventory_started = Instant::now();
     let source_inventory = collect_doctor_source_inventory(&data_dir, &db_path);
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "source_ledger_scan",
+        "source_inventory",
+        "source_ledger_scan",
+        source_inventory_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec![
+            "source ledger and visible provider roots were scanned with bounded reporting"
+                .to_string(),
+        ],
+    );
     if let Some(error) = source_inventory.db_query_error.as_deref() {
         add_check!(
             "source_inventory",
@@ -41241,7 +42512,18 @@ pub(crate) fn run_doctor_impl(
         );
     }
 
+    let raw_mirror_scan_started = Instant::now();
     let mut raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "raw_mirror_scan",
+        "raw_mirror",
+        "raw_mirror_scan",
+        raw_mirror_scan_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec!["raw mirror manifests and blob checksums were summarized".to_string()],
+    );
+    let raw_mirror_backfill_started = Instant::now();
     let raw_mirror_backfill =
         collect_doctor_raw_mirror_backfill_report(&data_dir, &db_path, &raw_mirror, fix_can_mutate);
     let raw_mirror_backfill_applied =
@@ -41257,6 +42539,19 @@ pub(crate) fn run_doctor_impl(
         ));
         raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
     }
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "raw_mirror_backfill",
+        "raw_mirror_backfill",
+        "raw_mirror_backfill",
+        raw_mirror_backfill_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec![if raw_mirror_backfill_applied {
+            "raw mirror backfill applied and raw mirror summary was refreshed".to_string()
+        } else {
+            "raw mirror backfill plan was evaluated without provider source mutation".to_string()
+        }],
+    );
     match raw_mirror.status.as_str() {
         "absent" => {
             add_check!(
@@ -41414,8 +42709,19 @@ pub(crate) fn run_doctor_impl(
             false
         );
     }
+    let source_authority_started = Instant::now();
     let source_authority =
         build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "source_authority",
+        "source_authority",
+        "source_authority",
+        source_authority_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec!["source-authority matrix selected or rejected repair authorities".to_string()],
+    );
+    let candidate_staging_started = Instant::now();
     let mut candidate_staging =
         collect_doctor_candidate_staging_report(&data_dir, &db_path, &index_path);
     if candidate_staging.total_candidate_count == 0
@@ -41448,6 +42754,15 @@ pub(crate) fn run_doctor_impl(
             collect_doctor_candidate_staging_report(&data_dir, &db_path, &index_path);
         candidate_staging.latest_build = Some(latest_build);
     }
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "candidate_staging",
+        "candidate_staging",
+        "candidate_build",
+        candidate_staging_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec!["candidate staging was summarized and any eligible isolated candidate build was recorded".to_string()],
+    );
     let (candidate_check_status, candidate_check_message, candidate_fix_applied) = if let Some(
         build,
     ) =
@@ -41544,6 +42859,7 @@ pub(crate) fn run_doctor_impl(
         });
     }
 
+    let semantic_probe_started = Instant::now();
     let readiness_snapshot = state_meta_json_inner(
         &data_dir,
         &db_path,
@@ -41552,6 +42868,15 @@ pub(crate) fn run_doctor_impl(
         Some(false),
         true,
         true,
+    );
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "semantic_probe",
+        "semantic_model",
+        "semantic_probe",
+        semantic_probe_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec!["semantic readiness was inspected without downloading models".to_string()],
     );
     let fallback_mode = doctor_fallback_mode_from_state(&readiness_snapshot);
     let semantic_status = readiness_snapshot
@@ -41763,6 +43088,7 @@ pub(crate) fn run_doctor_impl(
                 DOCTOR_REPAIR_ACTION_PROMOTE_RECONSTRUCT_CANDIDATE,
             )
     });
+    let candidate_promotion_started = Instant::now();
     if candidate_promotion_apply_requested && fix_can_mutate {
         let candidate_promotion_rebuild_planned = repair_plan.as_ref().is_some_and(|plan| {
             doctor_repair_plan_has_action(
@@ -41962,9 +43288,24 @@ pub(crate) fn run_doctor_impl(
             });
         }
     }
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "candidate_promotion",
+        "candidate_promotion",
+        "atomic_promotion",
+        candidate_promotion_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec![if candidate_promotion_apply_requested {
+            "candidate promotion path was evaluated with fingerprint and lock gates".to_string()
+        } else {
+            "candidate promotion was not requested for this doctor run".to_string()
+        }],
+    );
 
     // Apply fix: rebuild index if needed (only when --fix is passed)
-    if needs_rebuild && fix_can_mutate {
+    let derived_rebuild_started = Instant::now();
+    let derived_rebuild_attempted = needs_rebuild && fix_can_mutate;
+    if derived_rebuild_attempted {
         let stderr_is_tty = std::io::stderr().is_terminal();
         let is_robot = output_format.is_some();
         let show_progress = !is_robot && stderr_is_tty;
@@ -42173,61 +43514,88 @@ pub(crate) fn run_doctor_impl(
             }
         }
     }
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "derived_rebuild",
+        "rebuild",
+        "derived_rebuild",
+        derived_rebuild_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec![if derived_rebuild_attempted {
+            "derived index rebuild path ran under doctor mutation gates".to_string()
+        } else {
+            "derived index rebuild was not attempted for this doctor run".to_string()
+        }],
+    );
 
-    let cleanup_apply_result =
-        if cleanup_apply_requested && fix_can_mutate {
-            let result = apply_diag_quarantine_cleanup(
-                &data_dir,
-                &db_path,
-                &index_path,
-                rebuild_active,
-                requested_plan_fingerprint.as_deref(),
-            );
-            let cleanup_status = if result.applied {
-                "pass"
-            } else if result.before_reclaim_candidate_count > 0
+    let cleanup_apply_started = Instant::now();
+    let cleanup_apply_result = if cleanup_apply_requested && fix_can_mutate {
+        let result = apply_diag_quarantine_cleanup(
+            &data_dir,
+            &db_path,
+            &index_path,
+            rebuild_active,
+            requested_plan_fingerprint.as_deref(),
+        );
+        let cleanup_status = if result.applied {
+            "pass"
+        } else if result.before_reclaim_candidate_count > 0
+            || result
+                .actions
+                .iter()
+                .any(|action| action.artifact_kind == "retained_publish_backup")
+        {
+            "warn"
+        } else {
+            "pass"
+        };
+        let cleanup_message = if result.applied {
+            format!(
+                "Pruned {} derivative cleanup artifact(s), reclaimed {} bytes",
+                result.pruned_asset_count, result.reclaimed_bytes
+            )
+        } else if !result.blocked_reasons.is_empty() {
+            format!(
+                "Derivative cleanup skipped: {}",
+                result.blocked_reasons.join("; ")
+            )
+        } else {
+            "No derivative cleanup artifacts were eligible for pruning".to_string()
+        };
+        checks.push(Check {
+            name: "derivative_cleanup".to_string(),
+            status: cleanup_status.to_string(),
+            message: cleanup_message.clone(),
+            fix_available: result.before_reclaim_candidate_count > 0
                 || result
                     .actions
                     .iter()
-                    .any(|action| action.artifact_kind == "retained_publish_backup")
-            {
-                "warn"
-            } else {
-                "pass"
-            };
-            let cleanup_message = if result.applied {
-                format!(
-                    "Pruned {} derivative cleanup artifact(s), reclaimed {} bytes",
-                    result.pruned_asset_count, result.reclaimed_bytes
-                )
-            } else if !result.blocked_reasons.is_empty() {
-                format!(
-                    "Derivative cleanup skipped: {}",
-                    result.blocked_reasons.join("; ")
-                )
-            } else {
-                "No derivative cleanup artifacts were eligible for pruning".to_string()
-            };
-            checks.push(Check {
-                name: "derivative_cleanup".to_string(),
-                status: cleanup_status.to_string(),
-                message: cleanup_message.clone(),
-                fix_available: result.before_reclaim_candidate_count > 0
-                    || result
-                        .actions
-                        .iter()
-                        .any(|action| action.artifact_kind == "retained_publish_backup"),
-                fix_applied: result.applied,
-            });
-            if result.applied {
-                auto_fix_actions.push(cleanup_message);
-                auto_fix_applied = true;
-            }
-            Some(result)
+                    .any(|action| action.artifact_kind == "retained_publish_backup"),
+            fix_applied: result.applied,
+        });
+        if result.applied {
+            auto_fix_actions.push(cleanup_message);
+            auto_fix_applied = true;
+        }
+        Some(result)
+    } else {
+        None
+    };
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "cleanup_apply",
+        "derivative_cleanup",
+        "cleanup_apply",
+        cleanup_apply_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec![if cleanup_apply_requested {
+            "cleanup apply path evaluated derivative-only reclamation gates".to_string()
         } else {
-            None
-        };
+            "cleanup apply was not requested for this doctor run".to_string()
+        }],
+    );
 
+    let post_repair_probes_started = Instant::now();
     let post_repair_probes = collect_doctor_post_repair_probes(DoctorPostRepairProbeRunContext {
         data_dir: &data_dir,
         db_path: &db_path,
@@ -42238,6 +43606,20 @@ pub(crate) fn run_doctor_impl(
         fs_mutation_receipts: &fs_mutation_receipts,
         cleanup_apply_result: cleanup_apply_result.as_ref(),
     });
+    doctor_push_timing_span(
+        &mut timing_spans,
+        "post_repair_probes",
+        "post_repair_probes",
+        "post_repair_probe",
+        post_repair_probes_started,
+        DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
+        vec![if post_repair_probes.requested {
+            "post-repair verification probes ran with receipt correlation".to_string()
+        } else {
+            "post-repair verification probes were skipped because no repair mutation ran"
+                .to_string()
+        }],
+    );
     if post_repair_probes.requested {
         let (status, message) = if post_repair_probes.blocks_success {
             (
@@ -42310,8 +43692,28 @@ pub(crate) fn run_doctor_impl(
         cleanup_apply_result.as_ref(),
     );
     let operation_exit_code_kind = operation_outcome.exit_code_kind;
+    let incidents = build_doctor_root_cause_incidents(
+        &check_reports,
+        &coverage_risk,
+        &operation_state,
+        &candidate_staging,
+        &fallback_mode,
+        candidate_promotion_report.as_ref(),
+    );
+    let primary_incident_id = incidents
+        .first()
+        .map(|incident| incident.incident_id.clone());
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
+    let locks = build_doctor_lock_diagnostics(&operation_state, doctor_now_ms());
+    let slow_operations = build_doctor_slow_operations(&timing_spans);
+    let timing_summary = build_doctor_timing_summary(&timing_spans, elapsed_ms);
+    let retry_recommendation = build_doctor_retry_recommendation(
+        &operation_state,
+        &operation_outcome,
+        &locks,
+        recommended_action.as_ref(),
+    );
     let operation_id = cleanup_apply_result
         .as_ref()
         .map(|result| result.receipt.plan_fingerprint.clone())
@@ -42443,6 +43845,12 @@ pub(crate) fn run_doctor_impl(
             "failure_marker_write_error": written_failure_marker_error.clone(),
             "operation_outcome": operation_outcome,
             "operation_state": operation_state,
+            "locks": locks,
+            "slow_operations": slow_operations,
+            "timing_summary": timing_summary,
+            "retry_recommendation": retry_recommendation,
+            "primary_incident_id": primary_incident_id,
+            "incidents": incidents,
             "event_log": operation_event_log,
             "lexical": readiness_snapshot.get("index").cloned().unwrap_or(serde_json::Value::Null),
             "semantic": readiness_snapshot.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
@@ -42548,6 +43956,53 @@ pub(crate) fn run_doctor_impl(
                 }
             }
 
+            if let Some(primary_incident) = incidents.first() {
+                println!();
+                println!("{}", "Primary incident:".bold());
+                println!(
+                    "  {} ({}, confidence={})",
+                    doctor_serde_label(primary_incident.root_cause_kind),
+                    primary_incident.summary,
+                    primary_incident.confidence
+                );
+                if let Some(action) = primary_incident.safe_next_actions.first() {
+                    println!("  Next safe action: {action}");
+                }
+            }
+
+            if !locks.is_empty() {
+                println!();
+                println!("{}", "Operation locks:".bold());
+                for lock in &locks {
+                    let stale = match lock.stale_suspected {
+                        Some(true) => "stale-looking",
+                        Some(false) => "active",
+                        None => "unknown",
+                    };
+                    println!(
+                        "  - {}: {} ({stale}, retry_policy={})",
+                        doctor_serde_label(lock.lock_kind),
+                        lock.redacted_lock_path,
+                        lock.retry_policy
+                    );
+                    println!("    {}", lock.recommended_action);
+                }
+                println!(
+                    "  Do not delete lock files manually; use status/doctor receipts for evidence."
+                );
+            }
+
+            if !slow_operations.is_empty() {
+                println!();
+                println!("{}", "Slow doctor phases:".bold());
+                for slow in slow_operations.iter().take(3) {
+                    println!(
+                        "  - {}: {}ms (threshold {}ms)",
+                        slow.name, slow.elapsed_ms, slow.threshold_ms
+                    );
+                }
+            }
+
             if needs_rebuild {
                 println!();
                 println!("{}", "Recommended action:".bold());
@@ -42559,38 +44014,45 @@ pub(crate) fn run_doctor_impl(
         print_doctor_operation_outcome_human(&operation_outcome);
     }
 
-    if fail_count == 0 {
+    if fail_count == 0 || operation_exit_code_kind == DoctorExitCodeKind::Success {
         Ok(())
     } else {
-        let (code, kind, message, hint, retryable) = if operation_exit_code_kind
-            == DoctorExitCodeKind::LockBusy
-        {
-            (
-                    7,
-                    CliErrorKind::IndexBusy.kind_str(),
-                    "doctor repair blocked by an active operation lock".to_string(),
-                    Some(
-                        "Wait for the active owner to finish, then rerun 'cass doctor --json'; read operation_state.owners for the lock owner evidence."
-                            .to_string(),
-                    ),
-                    true,
-                )
-        } else {
-            (
+        let (code, kind, message, hint, retryable) = match operation_exit_code_kind {
+            DoctorExitCodeKind::Success => unreachable!("success outcomes return before error mapping"),
+            DoctorExitCodeKind::LockBusy => (
+                7,
+                CliErrorKind::IndexBusy.kind_str(),
+                "doctor repair blocked by an active operation lock".to_string(),
+                Some(
+                    "Wait for the active owner to finish, then rerun 'cass doctor --json'; read operation_state.owners for the lock owner evidence."
+                        .to_string(),
+                ),
+                true,
+            ),
+            DoctorExitCodeKind::UsageError => (
+                2,
+                CliErrorKind::Usage.kind_str(),
+                operation_outcome.reason.clone(),
+                operation_outcome.next_command.as_ref().map(|next| {
+                    format!("Inspect the structured doctor payload, then rerun `{next}`.")
+                }),
+                false,
+            ),
+            DoctorExitCodeKind::HealthFailure | DoctorExitCodeKind::RepairFailure => (
                 5,
                 CliErrorKind::Doctor.kind_str(),
                 format!("{} failure(s) remain", fail_count),
                 Some(
                     "Automatic safe repairs were attempted. Run 'cass index --full' \
-                 to rebuild from source sessions. Re-run `cass doctor -v` or \
-                 with CASS_TRACE_FILE=<path> for detailed logs — cass doctor \
-                 does not produce a cass.log file itself (the rolling \
-                 cass.log.YYYY-MM-DD appender is installed only for `cass \
-                 tui`)."
+                     to rebuild from source sessions. Re-run `cass doctor -v` or \
+                     with CASS_TRACE_FILE=<path> for detailed logs - cass doctor \
+                     does not produce a cass.log file itself (the rolling \
+                     cass.log.YYYY-MM-DD appender is installed only for `cass \
+                     tui`)."
                         .to_string(),
                 ),
                 true,
-            )
+            ),
         };
         let err = CliError {
             code,
@@ -45381,6 +46843,7 @@ fn response_schema_doctor_operation_state() -> serde_json::Value {
                         "owned_by_current_process": { "type": "boolean" },
                         "owner_confidence": { "type": "string", "description": "current_process | active_advisory_lock | active_missing_metadata | stale_metadata_only | unavailable" },
                         "pid": { "type": ["integer", "null"] },
+                        "owner_command": { "type": ["string", "null"], "description": "Command recorded by cass-owned lock metadata when safe to report; cass does not scrape arbitrary process command lines." },
                         "started_at_ms": { "type": ["integer", "null"] },
                         "started_at": { "type": ["string", "null"] },
                         "updated_at_ms": { "type": ["integer", "null"] },
@@ -45432,6 +46895,92 @@ fn response_schema_doctor_operation_state() -> serde_json::Value {
             "next_action",
             "notes"
         ]
+    })
+}
+
+fn response_schema_doctor_locks() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "description": "Structured doctor lock diagnostics. Paths are paired with redacted paths; robots should display redacted_lock_path and never advise deleting lock files manually.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "schema_version": { "type": "integer" },
+                "lock_kind": { "type": "string", "description": "index_run | watch_ingestion | doctor_repair" },
+                "lock_path": { "type": "string" },
+                "redacted_lock_path": { "type": "string" },
+                "active": { "type": "boolean" },
+                "owned_by_current_process": { "type": "boolean" },
+                "owner_confidence": { "type": "string", "description": "current_process | active_advisory_lock | active_missing_metadata | stale_metadata_only | unavailable" },
+                "pid": { "type": ["integer", "null"] },
+                "owner_command": { "type": ["string", "null"] },
+                "pid_metadata_status": { "type": "string" },
+                "pid_reuse_ambiguous": { "type": "boolean" },
+                "age_ms": { "type": ["integer", "null"] },
+                "last_heartbeat_age_ms": { "type": ["integer", "null"] },
+                "stale_suspected": { "type": ["boolean", "null"] },
+                "wait_duration_ms": { "type": ["integer", "null"] },
+                "retry_policy": { "type": "string" },
+                "safe_to_wait": { "type": "boolean" },
+                "manual_delete_allowed": { "type": "boolean" },
+                "recommended_action": { "type": "string" },
+                "evidence": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["schema_version", "lock_kind", "lock_path", "redacted_lock_path", "active", "owned_by_current_process", "owner_confidence", "pid", "owner_command", "pid_metadata_status", "pid_reuse_ambiguous", "age_ms", "last_heartbeat_age_ms", "stale_suspected", "wait_duration_ms", "retry_policy", "safe_to_wait", "manual_delete_allowed", "recommended_action", "evidence"]
+        }
+    })
+}
+
+fn response_schema_doctor_timing_summary() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "elapsed_ms": { "type": "integer" },
+            "measured_operation_count": { "type": "integer" },
+            "slow_operation_count": { "type": "integer" },
+            "default_threshold_ms": { "type": "integer" },
+            "slowest_operation": { "type": ["string", "null"] },
+            "slowest_elapsed_ms": { "type": ["integer", "null"] },
+            "notes": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["schema_version", "elapsed_ms", "measured_operation_count", "slow_operation_count", "default_threshold_ms", "slowest_operation", "slowest_elapsed_ms", "notes"]
+    })
+}
+
+fn response_schema_doctor_slow_operations() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "schema_version": { "type": "integer" },
+                "name": { "type": "string" },
+                "phase": { "type": "string" },
+                "elapsed_ms": { "type": "integer" },
+                "threshold_ms": { "type": "integer" },
+                "severity": { "type": "string" },
+                "event_log_correlation_id": { "type": "string" },
+                "recommended_action": { "type": "string" }
+            },
+            "required": ["schema_version", "name", "phase", "elapsed_ms", "threshold_ms", "severity", "event_log_correlation_id", "recommended_action"]
+        }
+    })
+}
+
+fn response_schema_doctor_retry_recommendation() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "policy": { "type": "string" },
+            "safe_to_retry": { "type": "boolean" },
+            "retry_after_ms": { "type": ["integer", "null"] },
+            "command": { "type": ["string", "null"] },
+            "reason": { "type": "string" },
+            "notes": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["schema_version", "policy", "safe_to_retry", "retry_after_ms", "command", "reason", "notes"]
     })
 }
 
@@ -47052,6 +48601,35 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "failure_marker_write_error": { "type": ["string", "null"] },
                 "operation_outcome": response_schema_doctor_operation_outcome(),
                 "operation_state": response_schema_doctor_operation_state(),
+                "locks": response_schema_doctor_locks(),
+                "slow_operations": response_schema_doctor_slow_operations(),
+                "timing_summary": response_schema_doctor_timing_summary(),
+                "retry_recommendation": response_schema_doctor_retry_recommendation(),
+                "primary_incident_id": { "type": ["string", "null"], "description": "incident_id for the highest-priority root-cause incident, or null when no incident was found." },
+                "incidents": {
+                    "type": "array",
+                    "description": "Root-cause incident groups derived from checks, coverage, lock, and candidate state. Robots should use root_cause_kind and evidence_check_ids instead of scraping check prose.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "schema_version": { "type": "integer" },
+                            "incident_id": { "type": "string" },
+                            "root_cause_kind": { "type": "string" },
+                            "severity": { "type": "string" },
+                            "affected_asset_classes": { "type": "array", "items": { "type": "string" } },
+                            "archive_risk_level": { "type": "string" },
+                            "derived_risk_level": { "type": "string" },
+                            "confidence": { "type": "string" },
+                            "evidence_check_ids": { "type": "array", "items": { "type": "string" } },
+                            "blocked_actions": { "type": "array", "items": { "type": "string" } },
+                            "safe_next_actions": { "type": "array", "items": { "type": "string" } },
+                            "stale_or_unknown_fields": { "type": "array", "items": { "type": "string" } },
+                            "redacted_evidence_paths": { "type": "array", "items": { "type": "string" } },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["schema_version", "incident_id", "root_cause_kind", "severity", "affected_asset_classes", "archive_risk_level", "derived_risk_level", "confidence", "evidence_check_ids", "blocked_actions", "safe_next_actions", "stale_or_unknown_fields", "redacted_evidence_paths", "summary"]
+                    }
+                },
                 "event_log": response_schema_doctor_event_log_metadata(),
                 "lexical": response_schema_index_state(),
                 "semantic": response_schema_semantic_state(),
@@ -47094,7 +48672,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     }
                 }
             },
-            "required": ["status", "health_class", "risk_level", "healthy", "initialized", "recommended_action", "fallback_mode", "doctor_command", "check_scope", "repair_previously_failed", "failure_marker_path", "repeat_refusal_reason", "override_available", "override_used", "active_repair", "post_repair_probes", "repair_failure_marker", "operation_outcome", "operation_state", "event_log", "lexical", "semantic", "storage_pressure", "raw_mirror_backfill", "coverage_summary", "sole_copy_warnings", "coverage_risk", "source_authority", "candidate_staging", "checks"]
+            "required": ["status", "health_class", "risk_level", "healthy", "initialized", "recommended_action", "fallback_mode", "doctor_command", "check_scope", "repair_previously_failed", "failure_marker_path", "repeat_refusal_reason", "override_available", "override_used", "active_repair", "post_repair_probes", "repair_failure_marker", "operation_outcome", "operation_state", "locks", "slow_operations", "timing_summary", "retry_recommendation", "primary_incident_id", "incidents", "event_log", "lexical", "semantic", "storage_pressure", "raw_mirror_backfill", "coverage_summary", "sole_copy_warnings", "coverage_risk", "source_authority", "candidate_staging", "checks"]
         }),
     );
 

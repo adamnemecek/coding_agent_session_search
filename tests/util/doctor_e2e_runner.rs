@@ -31,9 +31,18 @@ pub struct DoctorE2eScenarioSpec {
     pub scenario_id: String,
     pub labels: BTreeSet<String>,
     pub fixture_scenario: DoctorFixtureScenario,
+    pub command_mode: DoctorE2eCommandMode,
     pub expect_exit_success: Option<bool>,
     pub allow_mutation: bool,
+    pub extra_env: BTreeMap<String, String>,
     pub required_json_pointers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorE2eCommandMode {
+    Check,
+    Fix,
+    CleanupApply,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +131,21 @@ struct DoctorE2eRedactor {
     replacements: Vec<(String, String)>,
 }
 
+struct RecordedDoctorCommand {
+    record: DoctorE2eCommandRecord,
+    parsed_json: Option<(Value, String)>,
+    redacted_stdout: String,
+    redacted_stderr: String,
+    parse_failure: Option<String>,
+}
+
+struct DoctorCommandArtifactPaths<'a> {
+    command_id: &'a str,
+    stdout: &'a str,
+    stderr: &'a str,
+    parsed_json: &'a str,
+}
+
 impl DoctorE2eCliArgs {
     pub fn parse_from<I, S>(args: I) -> Result<Self, String>
     where
@@ -185,8 +209,10 @@ impl DoctorE2eScenarioSpec {
             scenario_id: scenario_id.into(),
             labels: labels.into_iter().map(Into::into).collect(),
             fixture_scenario,
+            command_mode: DoctorE2eCommandMode::Check,
             expect_exit_success: None,
             allow_mutation: false,
+            extra_env: BTreeMap::new(),
             required_json_pointers: Vec::new(),
         }
     }
@@ -198,6 +224,22 @@ impl DoctorE2eScenarioSpec {
 
     pub fn allow_mutation(mut self, allow: bool) -> Self {
         self.allow_mutation = allow;
+        if allow && self.command_mode == DoctorE2eCommandMode::Check {
+            self.command_mode = DoctorE2eCommandMode::Fix;
+        } else if !allow {
+            self.command_mode = DoctorE2eCommandMode::Check;
+        }
+        self
+    }
+
+    pub fn cleanup_apply(mut self) -> Self {
+        self.allow_mutation = true;
+        self.command_mode = DoctorE2eCommandMode::CleanupApply;
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_env.insert(key.into(), value.into());
         self
     }
 
@@ -289,71 +331,110 @@ impl DoctorE2eRunner {
             &mut artifacts,
         )?;
 
-        let command_env = doctor_command_env(&fixture);
-        let command_start = Instant::now();
-        let mut command = Command::new(&self.cass_bin);
+        let mut command_env = doctor_command_env(&fixture);
+        for (key, value) in &spec.extra_env {
+            command_env.insert(key.clone(), value.clone());
+        }
         let fixture_data_dir = fixture.data_dir().to_str().ok_or_else(|| {
             format!(
                 "fixture data dir is not utf8: {}",
                 fixture.data_dir().display()
             )
         })?;
-        let mut doctor_args = vec!["doctor".to_string()];
-        if spec.allow_mutation {
-            doctor_args.push("--json".to_string());
-            doctor_args.push("--fix".to_string());
-        } else {
-            doctor_args.push("check".to_string());
-            doctor_args.push("--json".to_string());
+
+        let mut command_records = Vec::new();
+        let mut cleanup_approval_fingerprint = None;
+        if spec.command_mode == DoctorE2eCommandMode::CleanupApply {
+            let preview_args = vec![
+                "doctor".to_string(),
+                "cleanup".to_string(),
+                "--json".to_string(),
+                "--data-dir".to_string(),
+                fixture_data_dir.to_string(),
+            ];
+            let preview = run_recorded_doctor_command(
+                &self.cass_bin,
+                &command_env,
+                preview_args,
+                &scenario_artifact_dir,
+                &mut artifacts,
+                &redactor,
+                DoctorCommandArtifactPaths {
+                    command_id: "doctor-cleanup-preview",
+                    stdout: "stdout/doctor-cleanup-preview.out",
+                    stderr: "stderr/doctor-cleanup-preview.err",
+                    parsed_json: "parsed-json/doctor-cleanup-preview.json",
+                },
+            )?;
+            if let Some(parse_failure) = &preview.parse_failure {
+                failures.push(format!("cleanup preview {parse_failure}"));
+            }
+            cleanup_approval_fingerprint = preview
+                .parsed_json
+                .as_ref()
+                .and_then(|(value, _)| cleanup_approval_fingerprint_from_json(value));
+            if cleanup_approval_fingerprint.is_none() {
+                failures.push(
+                    "cleanup preview did not expose an approval fingerprint for apply".to_string(),
+                );
+            }
+            command_records.push(preview.record);
         }
+
+        let mut doctor_args = match spec.command_mode {
+            DoctorE2eCommandMode::Check => {
+                vec![
+                    "doctor".to_string(),
+                    "check".to_string(),
+                    "--json".to_string(),
+                ]
+            }
+            DoctorE2eCommandMode::Fix => {
+                vec![
+                    "doctor".to_string(),
+                    "--json".to_string(),
+                    "--fix".to_string(),
+                ]
+            }
+            DoctorE2eCommandMode::CleanupApply => vec![
+                "doctor".to_string(),
+                "cleanup".to_string(),
+                "--yes".to_string(),
+                "--plan-fingerprint".to_string(),
+                cleanup_approval_fingerprint
+                    .clone()
+                    .unwrap_or_else(|| "missing-cleanup-approval-fingerprint".to_string()),
+                "--json".to_string(),
+            ],
+        };
         doctor_args.push("--data-dir".to_string());
         doctor_args.push(fixture_data_dir.to_string());
-        command.args(&doctor_args);
-        for (key, value) in &command_env {
-            command.env(key, value);
+
+        let final_command = run_recorded_doctor_command(
+            &self.cass_bin,
+            &command_env,
+            doctor_args,
+            &scenario_artifact_dir,
+            &mut artifacts,
+            &redactor,
+            DoctorCommandArtifactPaths {
+                command_id: "doctor-json",
+                stdout: "stdout/doctor-json.out",
+                stderr: "stderr/doctor-json.err",
+                parsed_json: "parsed-json/doctor-json.json",
+            },
+        )?;
+        let exit_code = final_command.record.exit_code;
+        let redacted_stdout = final_command.redacted_stdout.clone();
+        let redacted_stderr = final_command.redacted_stderr.clone();
+        let parsed_json = final_command.parsed_json.clone();
+        if let Some(parse_failure) = &final_command.parse_failure {
+            failures.push(parse_failure.clone());
         }
-        let output = command
-            .output()
-            .map_err(|err| format!("failed to run cass doctor --json: {err}"))?;
-        let duration_ms = elapsed_ms(command_start);
-        let exit_code = output.status.code();
-        let stdout_text = String::from_utf8_lossy(&output.stdout);
-        let stderr_text = String::from_utf8_lossy(&output.stderr);
-        let redacted_stdout = redactor.redact(&stdout_text);
-        let redacted_stderr = redactor.redact(&stderr_text);
-
-        let stdout_path = write_text_artifact(
-            &scenario_artifact_dir,
-            "stdout/doctor-json.out",
-            &redacted_stdout,
-            &mut artifacts,
-        )?;
-        let stderr_path = write_text_artifact(
-            &scenario_artifact_dir,
-            "stderr/doctor-json.err",
-            &redacted_stderr,
-            &mut artifacts,
-        )?;
-
-        let parsed_json = match serde_json::from_slice::<Value>(&output.stdout) {
-            Ok(value) => {
-                let redacted_value = redact_json_value(value, &redactor);
-                let parsed_path = write_json_artifact(
-                    &scenario_artifact_dir,
-                    "parsed-json/doctor-json.json",
-                    &redacted_value,
-                    &mut artifacts,
-                )?;
-                Some((redacted_value, parsed_path))
-            }
-            Err(err) => {
-                failures.push(format!("doctor stdout was not valid JSON: {err}"));
-                None
-            }
-        };
+        command_records.push(final_command.record);
 
         if let Some(expected) = spec.expect_exit_success {
-            let actual = output.status.success();
+            let actual = exit_code == Some(0);
             if actual != expected {
                 failures.push(format!(
                     "exit success mismatch: expected={expected} actual={actual}"
@@ -425,11 +506,17 @@ impl DoctorE2eRunner {
             "timing.json",
             &json!({
                 "scenario_id": spec.scenario_id,
-                "commands": [{
-                    "command_id": "doctor-json",
-                    "duration_ms": duration_ms
-                }],
-                "total_duration_ms": duration_ms
+                "commands": command_records
+                    .iter()
+                    .map(|record| json!({
+                        "command_id": record.command_id,
+                        "duration_ms": record.duration_ms
+                    }))
+                    .collect::<Vec<_>>(),
+                "total_duration_ms": command_records
+                    .iter()
+                    .map(|record| record.duration_ms)
+                    .sum::<u64>()
             }),
             &mut artifacts,
         )?;
@@ -480,38 +567,17 @@ impl DoctorE2eRunner {
             &mut artifacts,
         )?;
 
-        let mut redacted_argv = vec![
-            redactor.redact(&self.cass_bin.display().to_string()),
-            "doctor".to_string(),
-        ];
-        if spec.allow_mutation {
-            redacted_argv.push("--json".to_string());
-            redacted_argv.push("--fix".to_string());
-        } else {
-            redacted_argv.push("check".to_string());
-            redacted_argv.push("--json".to_string());
-        }
-        redacted_argv.push("--data-dir".to_string());
-        redacted_argv.push(redactor.redact(&fixture.data_dir().display().to_string()));
-        let command_record = DoctorE2eCommandRecord {
-            command_id: "doctor-json".to_string(),
-            argv: redacted_argv,
-            env: command_env
-                .iter()
-                .map(|(key, value)| (key.clone(), redactor.redact(value)))
-                .collect(),
-            exit_code,
-            duration_ms,
-            stdout_path,
-            stderr_path,
-            parsed_json_path: parsed_json.as_ref().map(|(_, path)| path.clone()),
-            parsed_json_ok: parsed_json.is_some(),
-            failure_reason: failures.first().cloned(),
-        };
+        let final_command_record = command_records
+            .last()
+            .cloned()
+            .expect("at least final doctor command recorded");
         write_jsonl_artifact(
             &scenario_artifact_dir,
             "commands.jsonl",
-            &[serde_json::to_value(&command_record).expect("command record json")],
+            &command_records
+                .iter()
+                .map(|record| serde_json::to_value(record).expect("command record json"))
+                .collect::<Vec<_>>(),
             &mut artifacts,
         )?;
         let execution_flow = build_execution_flow_log(
@@ -520,7 +586,7 @@ impl DoctorE2eRunner {
             &source_inventory_before,
             &source_inventory_after,
             parsed_json.as_ref().map(|(value, _)| value),
-            &command_record,
+            &final_command_record,
             &mutation_diffs,
         );
         write_jsonl_artifact(
@@ -566,7 +632,7 @@ impl DoctorE2eRunner {
             fixture_root: redactor.redact(&fixture.root().display().to_string()),
             home_dir: redactor.redact(&fixture.home_dir().display().to_string()),
             data_dir: redactor.redact(&fixture.data_dir().display().to_string()),
-            command_count: 1,
+            command_count: command_records.len(),
             artifacts,
             failure_context: failure_context.clone(),
         };
@@ -582,6 +648,101 @@ impl DoctorE2eRunner {
             failure_context,
         })
     }
+}
+
+fn run_recorded_doctor_command(
+    cass_bin: &Path,
+    command_env: &BTreeMap<String, String>,
+    args: Vec<String>,
+    artifact_dir: &Path,
+    artifacts: &mut BTreeMap<String, String>,
+    redactor: &DoctorE2eRedactor,
+    artifact_paths: DoctorCommandArtifactPaths<'_>,
+) -> Result<RecordedDoctorCommand, String> {
+    let command_start = Instant::now();
+    let mut command = Command::new(cass_bin);
+    command.args(&args);
+    for (key, value) in command_env {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to run {}: {err}", artifact_paths.command_id))?;
+    let duration_ms = elapsed_ms(command_start);
+    let exit_code = output.status.code();
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    let redacted_stdout = redactor.redact(&stdout_text);
+    let redacted_stderr = redactor.redact(&stderr_text);
+
+    let stdout_path = write_text_artifact(
+        artifact_dir,
+        artifact_paths.stdout,
+        &redacted_stdout,
+        artifacts,
+    )?;
+    let stderr_path = write_text_artifact(
+        artifact_dir,
+        artifact_paths.stderr,
+        &redacted_stderr,
+        artifacts,
+    )?;
+
+    let (parsed_json, parse_failure) = match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(value) => {
+            let redacted_value = redact_json_value(value, redactor);
+            let parsed_path = write_json_artifact(
+                artifact_dir,
+                artifact_paths.parsed_json,
+                &redacted_value,
+                artifacts,
+            )?;
+            (Some((redacted_value, parsed_path)), None)
+        }
+        Err(err) => (
+            None,
+            Some(format!("doctor stdout was not valid JSON: {err}")),
+        ),
+    };
+
+    let argv = std::iter::once(redactor.redact(&cass_bin.display().to_string()))
+        .chain(args.iter().map(|arg| redactor.redact(arg)))
+        .collect();
+    let record = DoctorE2eCommandRecord {
+        command_id: artifact_paths.command_id.to_string(),
+        argv,
+        env: command_env
+            .iter()
+            .map(|(key, value)| (key.clone(), redactor.redact(value)))
+            .collect(),
+        exit_code,
+        duration_ms,
+        stdout_path,
+        stderr_path,
+        parsed_json_path: parsed_json.as_ref().map(|(_, path)| path.clone()),
+        parsed_json_ok: parsed_json.is_some(),
+        failure_reason: parse_failure.clone(),
+    };
+
+    Ok(RecordedDoctorCommand {
+        record,
+        parsed_json,
+        redacted_stdout,
+        redacted_stderr,
+        parse_failure,
+    })
+}
+
+fn cleanup_approval_fingerprint_from_json(value: &Value) -> Option<String> {
+    value
+        .pointer("/quarantine/lexical_cleanup_dry_run/approval_fingerprint")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/quarantine/summary/cleanup_dry_run_approval_fingerprint")
+                .and_then(Value::as_str)
+        })
+        .map(ToOwned::to_owned)
 }
 
 impl DoctorE2eFileTreeSnapshot {
@@ -905,6 +1066,14 @@ fn build_execution_flow_log(
         .and_then(|value| value.pointer("/candidate_staging"))
         .cloned()
         .unwrap_or(Value::Null);
+    let storage_pressure = parsed_json
+        .and_then(|value| value.pointer("/storage_pressure"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let cleanup_apply = parsed_json
+        .and_then(|value| value.pointer("/cleanup_apply"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let candidate_latest_build = candidate_staging
         .pointer("/latest_build")
         .cloned()
@@ -982,6 +1151,25 @@ fn build_execution_flow_log(
                 "completed_candidate_count": candidate_staging.get("completed_candidate_count").cloned().unwrap_or(Value::Null),
                 "warnings": candidate_staging.get("warnings").cloned().unwrap_or(Value::Null),
             },
+        }),
+        json!({
+            "phase": "storage_pressure",
+            "scenario_id": spec.scenario_id,
+            "status": storage_pressure
+                .get("status")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "details": storage_pressure,
+        }),
+        json!({
+            "phase": "cleanup_apply",
+            "scenario_id": spec.scenario_id,
+            "status": cleanup_apply
+                .get("outcome_kind")
+                .cloned()
+                .or_else(|| cleanup_apply.get("mode").cloned())
+                .unwrap_or(Value::Null),
+            "details": cleanup_apply,
         }),
         json!({
             "phase": "source_inventory_before",
@@ -1143,6 +1331,10 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/raw_mirror")
         .require_json_pointer("/operation_outcome/kind")
         .require_json_pointer("/operation_state/mutating_doctor_allowed")
+        .require_json_pointer("/locks")
+        .require_json_pointer("/slow_operations")
+        .require_json_pointer("/timing_summary")
+        .require_json_pointer("/retry_recommendation")
         .require_json_pointer("/source_authority/selected_authority"),
         DoctorE2eScenarioSpec::new(
             "quick-source-truncated",
@@ -1183,6 +1375,18 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/candidate_staging/latest_build/candidate_id")
         .require_json_pointer("/candidate_staging/latest_build/live_inventory_unchanged")
         .require_json_pointer("/candidate_staging/latest_build/manifest_path"),
+        DoctorE2eScenarioSpec::new(
+            "cleanup-low-disk-derived-only",
+            DoctorFixtureScenario::LowDisk,
+            ["quick", "cleanup", "low-disk", "mutation"],
+        )
+        .cleanup_apply()
+        .env("CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES", "1024")
+        .require_json_pointer("/storage_pressure")
+        .require_json_pointer("/quarantine/lexical_cleanup_dry_run")
+        .require_json_pointer("/cleanup_apply")
+        .require_json_pointer("/cleanup_apply/actions")
+        .require_json_pointer("/candidate_staging"),
     ]
 }
 
