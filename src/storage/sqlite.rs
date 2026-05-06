@@ -2,7 +2,7 @@
 
 use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use frankensqlite::{
     Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
     compat::{
@@ -1255,6 +1255,12 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
             .with_context(|| format!("syncing destination directory {}", parent.display()))?;
     }
 
+    if !copyable_bundle_file_exists(source_root)? {
+        bail!(
+            "database bundle root is missing before copy: {}",
+            source_root.display()
+        );
+    }
     fs::copy(source_root, destination_root).with_context(|| {
         format!(
             "copying database bundle {} -> {}",
@@ -1271,7 +1277,7 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
 
     for suffix in ["-wal", "-shm"] {
         let source_sidecar = database_sidecar_path(source_root, suffix);
-        if !source_sidecar.exists() {
+        if !copyable_bundle_file_exists(&source_sidecar)? {
             continue;
         }
         let destination_sidecar = database_sidecar_path(destination_root, suffix);
@@ -1296,6 +1302,34 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
     }
 
     Ok(())
+}
+
+fn copyable_bundle_file_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "refusing to copy database bundle symlink: {}",
+                    path.display()
+                );
+            }
+            if !file_type.is_file() {
+                bail!(
+                    "refusing to copy non-file database bundle path: {}",
+                    path.display()
+                );
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "checking database bundle path before copy: {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 /// Helper to safely remove a database file and its potential WAL/SHM sidecars.
@@ -14945,6 +14979,54 @@ mod tests {
             std::fs::read(database_sidecar_path(&copied_path, "-wal")).unwrap(),
             b"wal"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_database_bundle_rejects_symlink_source_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside_db = dir.path().join("outside.db");
+        let db_path = dir.path().join("test.db");
+        let copied_path = dir.path().join("copy.db");
+
+        std::fs::write(&outside_db, b"outside").unwrap();
+        symlink(&outside_db, &db_path).unwrap();
+
+        let err = copy_database_bundle(&db_path, &copied_path).unwrap_err();
+
+        assert!(
+            err.to_string().contains("bundle symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!copied_path.exists());
+        assert_eq!(std::fs::read(&outside_db).unwrap(), b"outside");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_database_bundle_rejects_symlink_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let copied_path = dir.path().join("copy.db");
+        let outside_wal = dir.path().join("outside.wal");
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+
+        std::fs::write(&db_path, b"db").unwrap();
+        std::fs::write(&outside_wal, b"outside wal").unwrap();
+        symlink(&outside_wal, &wal_path).unwrap();
+
+        let err = copy_database_bundle(&db_path, &copied_path).unwrap_err();
+
+        assert!(
+            err.to_string().contains("bundle symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(&outside_wal).unwrap(), b"outside wal");
+        assert!(!database_sidecar_path(&copied_path, "-wal").exists());
     }
 
     #[test]
