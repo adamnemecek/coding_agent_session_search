@@ -87,7 +87,7 @@ fn hold_active_lexical_rebuild_lock(
             "total_messages": 20,
             "storage_fingerprint": "10:20:0:0"
         },
-        "page_size": 1000,
+        "page_size": 1024,
         "committed_offset": 4,
         "committed_conversation_id": 4,
         "processed_conversations": 4,

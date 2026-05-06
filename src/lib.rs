@@ -8700,6 +8700,28 @@ fn search_lexical_self_heal_diagnosis(
             "lexical checkpoint page-size contract is incompatible with this cass binary",
         )));
     }
+    let current_storage_fingerprint =
+        crate::indexer::lexical_storage_fingerprint_for_db(db_path).map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::StorageFingerprint.kind_str(),
+            message: format!(
+                "failed to fingerprint cass database {} while validating lexical assets: {e}",
+                db_path.display()
+            ),
+            hint: Some(
+                "cass will rebuild the derived lexical index after the canonical database can be fingerprinted"
+                    .to_string(),
+            ),
+            retryable: true,
+        })?;
+    if !crate::search::asset_state::lexical_storage_fingerprints_match(
+        &current_storage_fingerprint,
+        &checkpoint.storage_fingerprint,
+    ) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
+            "lexical checkpoint storage fingerprint no longer matches active database",
+        )));
+    }
 
     Ok(None)
 }
@@ -9177,6 +9199,68 @@ mod search_lexical_self_heal_tests {
             )
             .expect("query superseded-db term");
         assert_eq!(old_hits.len(), 0);
+    }
+
+    #[test]
+    fn search_self_heal_rebuilds_when_same_db_content_changes_after_checkpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = data_dir.join("agent_search.db");
+        seed_search_db_at(
+            &db_path,
+            "oldsamepathneedle is present in the first lexical generation",
+            "old-same-path-search-self-heal-conversation",
+        );
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("initial rebuild from active database");
+
+        seed_search_db_at(
+            &db_path,
+            "newsamepathneedle is appended to the same canonical database",
+            "new-same-path-search-self-heal-conversation",
+        );
+        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
+            .expect("diagnose changed same-path database")
+            .expect("changed same-path database should require repair");
+        assert_eq!(
+            diagnosis.reason,
+            "lexical checkpoint storage fingerprint no longer matches active database"
+        );
+
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+        )
+        .expect("search self-heal should rebuild after same-db content changes");
+        assert_eq!(repair.action, "rebuilt-from-canonical-db");
+        assert_eq!(repair.indexed_docs, Some(2));
+
+        let client = SearchClient::open(&index_path, Some(&db_path))
+            .expect("open search client")
+            .expect("repaired index should open");
+        let hits = client
+            .search(
+                "newsamepathneedle",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect("query repaired active-db index");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("newsamepathneedle"));
     }
 
     #[test]

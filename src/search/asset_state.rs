@@ -404,7 +404,7 @@ fn parse_lexical_storage_fingerprint(raw: &str) -> Option<ParsedLexicalStorageFi
     .filter(|_| parts.next().is_none())
 }
 
-fn lexical_storage_fingerprints_match(current: &str, saved: &str) -> bool {
+pub(crate) fn lexical_storage_fingerprints_match(current: &str, saved: &str) -> bool {
     match (
         parse_lexical_storage_fingerprint(current),
         parse_lexical_storage_fingerprint(saved),
