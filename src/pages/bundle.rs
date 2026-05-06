@@ -198,12 +198,7 @@ impl BundleBuilder {
         let encrypted_dir = encrypted_dir.as_ref();
         let output_dir = output_dir.as_ref();
 
-        if output_dir.exists() && !output_dir.is_dir() {
-            bail!(
-                "bundle output path points to a file, expected a directory: {}",
-                output_dir.display()
-            );
-        }
+        ensure_replaceable_bundle_output_dir(output_dir)?;
 
         // Validate encrypted_dir has required files
         let config_path = encrypted_dir.join("config.json");
@@ -411,8 +406,32 @@ fn bundle_sidecar_random_nonce() -> Result<u128> {
     Ok(u128::from_le_bytes(bytes))
 }
 
+fn ensure_replaceable_bundle_output_dir(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "bundle output path must not be a symlink: {}",
+                    path.display()
+                );
+            }
+            if !file_type.is_dir() {
+                bail!(
+                    "bundle output path points to a file, expected a directory: {}",
+                    path.display()
+                );
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed inspecting bundle output path {}", path.display())),
+    }
+}
+
 fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
-    if !final_dir.exists() {
+    if !ensure_replaceable_bundle_output_dir(final_dir)? {
         fs::rename(temp_dir, final_dir).with_context(|| {
             format!(
                 "failed renaming completed bundle {} into place at {}",
@@ -1598,6 +1617,40 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_build_rejects_symlinked_output_directory() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempDir::new().unwrap();
+        let output_parent = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let output_dir = output_parent.path().join("bundle-link");
+
+        write_unencrypted_source(source.path(), "data.db", "payload");
+        symlink(outside.path(), &output_dir).unwrap();
+
+        let err = BundleBuilder::new()
+            .build(source.path(), output_dir.as_path(), |_, _| {})
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            fs::symlink_metadata(&output_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected symlink output path must be preserved for operator inspection"
+        );
+        assert!(
+            !outside.path().join("site").exists(),
+            "build must not write through a symlinked output directory"
+        );
+    }
+
+    #[test]
     fn test_replace_dir_from_temp_overwrites_existing_bundle() {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
@@ -1621,6 +1674,34 @@ mod tests {
         assert!(
             !sidecars.iter().any(|name| name.contains(".bundle.bak.")),
             "backup sidecar should be cleaned up, found: {sidecars:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_replace_dir_from_temp_rejects_dangling_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+
+        fs::create_dir_all(staged_dir.join("site")).unwrap();
+        fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+        symlink(temp.path().join("missing-target"), &final_dir).unwrap();
+
+        let err = replace_dir_from_temp(&staged_dir, &final_dir).unwrap_err();
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(staged_dir.join("site/new.txt").exists());
+        assert!(
+            fs::symlink_metadata(&final_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "dangling symlink target must not be silently replaced"
         );
     }
 }
