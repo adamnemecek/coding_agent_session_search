@@ -61,7 +61,7 @@ struct RawMirrorBlobCacheKey {
     source_mtime_ns: Option<u128>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RawMirrorBlobRecord {
     blob_blake3: String,
     bytes_copied: u64,
@@ -651,21 +651,61 @@ fn cached_raw_mirror_blob_record(
     root: &Path,
 ) -> Option<RawMirrorBlobRecord> {
     let cache = BLOB_CAPTURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().ok()?;
-    let record = guard.get(key).cloned()?;
-    let Some(blob_relative_path) = raw_mirror_blob_relative_path(&record.blob_blake3) else {
-        guard.remove(key);
-        return None;
+    let record = {
+        let mut guard = cache.lock().ok()?;
+        let record = guard.get(key).cloned()?;
+        if raw_mirror_blob_relative_path(&record.blob_blake3).is_none() {
+            guard.remove(key);
+            return None;
+        }
+        record
     };
+
+    let blob_relative_path = raw_mirror_blob_relative_path(&record.blob_blake3)?;
     let blob_path = root.join(blob_relative_path);
-    if fs::symlink_metadata(&blob_path)
+    let metadata_valid = fs::symlink_metadata(&blob_path)
         .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !metadata_valid {
+        remove_cached_raw_mirror_blob_record_if_unchanged(cache, key, &record);
+        return None;
+    }
+
+    match file_blake3(&blob_path) {
+        Ok(actual) if actual == record.blob_blake3 => Some(record),
+        Ok(actual) => {
+            tracing::warn!(
+                path = %blob_path.display(),
+                expected_blake3 = %record.blob_blake3,
+                actual_blake3 = %actual,
+                "discarding raw mirror blob cache entry with mismatched content"
+            );
+            remove_cached_raw_mirror_blob_record_if_unchanged(cache, key, &record);
+            None
+        }
+        Err(err) => {
+            tracing::debug!(
+                path = %blob_path.display(),
+                error = %err,
+                "discarding unreadable raw mirror blob cache entry"
+            );
+            remove_cached_raw_mirror_blob_record_if_unchanged(cache, key, &record);
+            None
+        }
+    }
+}
+
+fn remove_cached_raw_mirror_blob_record_if_unchanged(
+    cache: &Mutex<HashMap<RawMirrorBlobCacheKey, RawMirrorBlobRecord>>,
+    key: &RawMirrorBlobCacheKey,
+    stale_record: &RawMirrorBlobRecord,
+) {
+    if let Ok(mut guard) = cache.lock()
+        && guard
+            .get(key)
+            .is_some_and(|current| current == stale_record)
     {
-        Some(record)
-    } else {
         guard.remove(key);
-        None
     }
 }
 
@@ -1230,6 +1270,48 @@ mod tests {
             .collect::<std::io::Result<Vec<_>>>()
             .expect("manifest entries");
         assert_eq!(manifests.len(), 2);
+    }
+
+    #[test]
+    fn capture_source_file_revalidates_cached_blob_contents() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("cached-source.jsonl");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"cache me\"}\n";
+        fs::write(&source_path, source_bytes).expect("write source");
+
+        let first = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("first capture");
+
+        let blob_path = data_dir
+            .join(RAW_MIRROR_ROOT_DIR)
+            .join(RAW_MIRROR_VERSION_DIR)
+            .join(&first.blob_relative_path);
+        fs::write(&blob_path, b"corrupted cached blob").expect("corrupt cached blob");
+
+        let err = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect_err("corrupted content-addressed blob must be rejected");
+        assert!(
+            err.to_string().contains("existing raw mirror blob"),
+            "unexpected cached-blob error: {err:#}"
+        );
+        assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
     }
 
     #[test]
