@@ -2,7 +2,7 @@
 # scripts/lib/e2e_log.sh
 # Unified E2E logging library for shell scripts.
 #
-# Implements the schema from test-results/e2e/SCHEMA.md
+# Implements the schema from docs/reference/E2E_LOGGING_SCHEMA.md
 #
 # Usage:
 #   source scripts/lib/e2e_log.sh

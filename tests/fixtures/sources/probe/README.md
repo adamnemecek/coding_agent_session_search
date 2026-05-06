@@ -39,4 +39,4 @@ constructed `HostProbeResult` structs. The fixture approach:
 3. Is easier to maintain and extend
 4. Follows the project's no-mock testing policy
 
-See `test-results/no_mock_audit.md` for the full audit.
+See `docs/artifacts/no-mock-audit.md` for the full audit.

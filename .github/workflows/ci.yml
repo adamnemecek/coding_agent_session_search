@@ -30,6 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Run repository artifact hygiene check
+        run: ./scripts/validate_ci.sh --artifact-hygiene-only
+
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
@@ -40,7 +43,7 @@ jobs:
           set -euo pipefail
           mkdir -p test-results
 
-          ALLOWLIST_FILE="test-results/no_mock_allowlist.json"
+          ALLOWLIST_FILE="tests/policies/no_mock_allowlist.json"
           AUDIT_REPORT="test-results/no_mock_ci_audit.md"
 
           echo "# No-Mock CI Audit" > "$AUDIT_REPORT"
@@ -121,7 +124,7 @@ jobs:
             echo "### How to Fix" >> "$AUDIT_REPORT"
             echo "" >> "$AUDIT_REPORT"
             echo "1. Replace mock/fake/stub with real fixtures (preferred)" >> "$AUDIT_REPORT"
-            echo "2. OR add to \`test-results/no_mock_allowlist.json\` with:" >> "$AUDIT_REPORT"
+            echo "2. OR add to \`tests/policies/no_mock_allowlist.json\` with:" >> "$AUDIT_REPORT"
             echo "   - \`rationale\`: Why this exception is necessary" >> "$AUDIT_REPORT"
             echo "   - \`review_date\`: 6-month review date" >> "$AUDIT_REPORT"
             echo "   - \`permanent: true\` only for true platform boundaries" >> "$AUDIT_REPORT"

@@ -278,8 +278,8 @@ See [`models/README.md`](models/README.md) for full documentation.
 | File/Dir | Description |
 |----------|-------------|
 | `agent_search.db` | Pre-populated SQLite database |
-| `index/v1/` | Legacy index format (migration testing) |
-| `index/v7/` | Current index format |
+| `index/v1/` | Frozen legacy lexical index fixture (migration testing) |
+| `index/v*/` | Locally generated current-schema indexes are ignored and should be rebuilt by tests |
 | `watch_state.json` | File watcher state fixture |
 
 **Tested by:** `tests/e2e_search_index.rs`, `src/search/query.rs`

@@ -5,26 +5,101 @@ set -e
 
 # Parse arguments
 NO_MOCK_ONLY=false
-for arg in "$@"; do
-    case $arg in
+ARTIFACT_HYGIENE_ONLY=false
+NO_MOCK_FAILED=false
+E2E_COMPLIANCE_FAILED=false
+
+usage() {
+    cat <<'USAGE'
+Usage: scripts/validate_ci.sh [--no-mock-only|--artifact-hygiene-only]
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
         --no-mock-only)
             NO_MOCK_ONLY=true
             shift
             ;;
+        --artifact-hygiene-only)
+            ARTIFACT_HYGIENE_ONLY=true
+            shift
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
     esac
 done
+
+if [ "$NO_MOCK_ONLY" = true ] && [ "$ARTIFACT_HYGIENE_ONLY" = true ]; then
+    echo "--no-mock-only and --artifact-hygiene-only are mutually exclusive" >&2
+    usage >&2
+    exit 2
+fi
 
 echo "=== Validating CI Pipeline ==="
 
 # ============================================================
+# Repository Artifact Hygiene Check
+# ============================================================
+if [ "$NO_MOCK_ONLY" != true ] || [ "$ARTIFACT_HYGIENE_ONLY" = true ]; then
+    echo "0. Checking repository artifact hygiene..."
+
+    FORBIDDEN_TRACKED=$(
+        git ls-files | while IFS= read -r path; do
+            case "$path" in
+                .ntm/*|.claude/*|.ruff_cache/*|artifacts/*|ci-artifacts/*|data/*|logs/*|proptest-regressions/*|refactor/*|test-results/*|tests/artifacts/*|tests/e2e/exports/*|tests/e2e/pages_preview/*|tests/test-results/*|tests/tests/*|tmp/*)
+                    echo "$path"
+                    continue
+                    ;;
+                *.db-wal|*.db-shm|*.db-journal|*.sqlite-wal|*.sqlite-shm|*.sqlite-journal|*.sqlite3-wal|*.sqlite3-shm|*.sqlite3-journal|*.sqlite3.bak|*.sqlite3.bak-*|*.sqlite3-wal.bak|*.sqlite3.corrupt-*|*.sqlite3-wal.corrupt-*)
+                    echo "$path"
+                    continue
+                    ;;
+            esac
+
+            if [[ "$path" != */* ]]; then
+                case "$path" in
+                    .aider.chat.history.md|a.out|claude-upgrade-progress.json|clippy*.txt|fix_*.py|*.log|*.mcp.json|parse_ubs.py|path_test|perf.data|perf.data.old|scan.txt|storage.sqlite3*|temp_*.rs|test_empty_db.rs|ubs.json|ubs_filtered.txt|ubs-report.*|*.sarif)
+                        echo "$path"
+                        ;;
+                esac
+            fi
+        done
+    )
+
+    if [ -n "$FORBIDDEN_TRACKED" ]; then
+        echo "  ERROR: generated or local-only artifacts are tracked:"
+        printf '%s\n' "$FORBIDDEN_TRACKED" | sed 's/^/    - /'
+        echo ""
+        echo "  Move durable evidence to docs/artifacts/, docs/assets/, docs/planning/,"
+        echo "  or tests/policies/ as appropriate. Keep generated run output, local"
+        echo "  SQLite state, logs, scratch files, and agent harness state ignored."
+        exit 1
+    fi
+
+    echo "  No forbidden tracked artifacts found - OK"
+
+    if [ "$ARTIFACT_HYGIENE_ONLY" = true ]; then
+        exit 0
+    fi
+fi
+
+# ============================================================
 # No-Mock Policy Check
 # ============================================================
-echo "0. Checking no-mock policy compliance..."
+echo "1. Checking no-mock policy compliance..."
 
 if [ "$SKIP_NO_MOCK_CHECK" = "1" ]; then
     echo "  (Skipping no-mock check: SKIP_NO_MOCK_CHECK=1)"
 elif command -v rg &> /dev/null && command -v jq &> /dev/null; then
-    ALLOWLIST_FILE="test-results/no_mock_allowlist.json"
+    ALLOWLIST_FILE="tests/policies/no_mock_allowlist.json"
     VIOLATIONS_FILE=$(mktemp)
 
     # Search for mock/fake/stub patterns
@@ -91,8 +166,13 @@ elif command -v rg &> /dev/null && command -v jq &> /dev/null; then
                 echo "  All patterns are allowlisted - OK"
             fi
         else
-            echo "  WARNING: Allowlist file not found at $ALLOWLIST_FILE"
+            echo "  ERROR: Allowlist file not found at $ALLOWLIST_FILE"
             echo "  Run 'br show bd-28iz' for setup instructions"
+            if [ "$NO_MOCK_ONLY" = true ]; then
+                rm -f "$VIOLATIONS_FILE"
+                exit 1
+            fi
+            NO_MOCK_FAILED=true
         fi
     else
         echo "  No mock/fake/stub patterns found - OK"
@@ -112,7 +192,7 @@ if [ "$NO_MOCK_ONLY" = true ]; then
     exit 0
 fi
 
-echo "1. Checking workflow syntax..."
+echo "2. Checking workflow syntax..."
 # Requires 'yq' or similar, skipping strict syntax check for now if not present
 if command -v yq &> /dev/null; then
     for f in .github/workflows/*.yml; do
@@ -123,7 +203,7 @@ else
     echo "  (Skipping YAML syntax check: yq not found)"
 fi
 
-echo "2. Running local CI simulation..."
+echo "3. Running local CI simulation..."
 echo "  - Checking formatting..."
 cargo fmt --all -- --check
 
@@ -155,7 +235,7 @@ fi
 # ============================================================
 # E2E Logging Compliance Check
 # ============================================================
-echo "3. Checking E2E logging compliance..."
+echo "4. Checking E2E logging compliance..."
 
 E2E_ERRORS=0
 E2E_WARNINGS=0

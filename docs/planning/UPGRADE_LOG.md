@@ -160,5 +160,4 @@ Breaking: none (fsqlite::Connection, compat layer, params! macro unchanged).
 ### Files modified
 - `Cargo.toml` (5 lines: 4 ftui revs + 1 frankensqlite rev + 1 fsqlite-types rev)
 - `Cargo.lock` (ftui family, fsqlite family, asupersync 0.3.0→0.3.1 for ftui/fsqlite subgraphs, added `simdutf8 0.1.5`)
-- `UPGRADE_LOG.md` (this entry)
-
+- `docs/planning/UPGRADE_LOG.md` (this entry)

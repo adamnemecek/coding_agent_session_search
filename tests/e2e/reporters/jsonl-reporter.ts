@@ -1,7 +1,7 @@
 /**
  * Playwright JSONL Reporter
  *
- * Emits structured JSONL events following the schema in test-results/e2e/SCHEMA.md.
+ * Emits structured JSONL events following the schema in docs/reference/E2E_LOGGING_SCHEMA.md.
  * Output: test-results/e2e/playwright_<timestamp>.jsonl
  *
  * Usage in playwright.config.ts:

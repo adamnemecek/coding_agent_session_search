@@ -38,7 +38,7 @@ Mocks are problematic because they:
 ### Allowlist: True Boundaries
 
 Some scenarios require deterministic fixture constructors. These are explicitly
-allowlisted (see `test-results/no_mock_allowlist.json`):
+allowlisted (see `tests/policies/no_mock_allowlist.json`):
 
 1. **Fixture constructors** (`#[cfg(test)]` only):
    - `mock_system_info` in `src/sources/install.rs` - deterministic SystemInfo for pure logic tests
@@ -46,7 +46,22 @@ allowlisted (see `test-results/no_mock_allowlist.json`):
 
 ### CI Enforcement
 
-The CI pipeline enforces the no-mock policy:
+The CI pipeline enforces repository artifact hygiene before the no-mock policy:
+
+```bash
+# Run only the tracked-artifact hygiene check
+./scripts/validate_ci.sh --artifact-hygiene-only
+```
+
+This check fails if generated or local-only artifacts become tracked again,
+including root-level SQLite databases and sidecars, ad-hoc logs, scratch Rust or
+Python files, clippy/UBS output, `.ntm` state, local E2E export output, and
+refactor proof bundles left under their old scratch roots. Durable evidence
+belongs under `docs/artifacts/`, project-owned images under `docs/assets/`,
+planning material under `docs/planning/`, and machine-enforced policy inputs
+under `tests/policies/`.
+
+The CI pipeline also enforces the no-mock policy:
 
 ```bash
 # Run the no-mock check
@@ -58,7 +73,7 @@ SKIP_NO_MOCK_CHECK=1 ./scripts/validate_ci.sh
 
 The check:
 1. Searches for `Mock*`, `Fake*`, `Stub*`, `mock_`, `fake_`, `stub_` patterns
-2. Compares against the allowlist in `test-results/no_mock_allowlist.json`
+2. Compares against the allowlist in `tests/policies/no_mock_allowlist.json`
 3. Fails if unapproved patterns are found
 
 ### Requesting an Allowlist Exception
@@ -66,7 +81,7 @@ The check:
 To request a new allowlist entry:
 
 1. Create a bead explaining why a real implementation is impossible
-2. Add an entry to `test-results/no_mock_allowlist.json`:
+2. Add an entry to `tests/policies/no_mock_allowlist.json`:
    ```json
    {
      "path": "src/your/file.rs",
@@ -382,12 +397,13 @@ The full CI pipeline runs:
 ```
 
 Which includes:
-1. No-mock policy check
-2. `cargo fmt --check`
-3. `cargo clippy`
-4. `cargo test`
-5. Crypto vector tests
-6. `cargo audit` (if installed)
+1. Repository artifact hygiene check
+2. No-mock policy check
+3. `cargo fmt --check`
+4. `cargo clippy`
+5. `cargo test`
+6. Crypto vector tests
+7. `cargo audit` (if installed)
 
 ### Browser E2E Tests
 
@@ -527,7 +543,7 @@ When coverage drops on a PR:
 
 All E2E test infrastructure emits structured JSONL logs following a unified schema. This enables consistent log aggregation, CI integration, and debugging across all test runners.
 
-**Schema Documentation:** `test-results/e2e/SCHEMA.md`
+**Schema Documentation:** `docs/reference/E2E_LOGGING_SCHEMA.md`
 
 **Event Types:**
 - `run_start` - Test run begins, captures environment metadata
@@ -668,17 +684,49 @@ The validator runs automatically in CI after E2E tests. Schema violations fail t
 file.jsonl:15: Event 'test_end' missing required field 'result.status'
 ```
 
+### Doctor V2 Filesystem Portability Scenarios
+
+Doctor v2 tests split portability into two layers:
+
+1. Portable invariants that must pass on every platform:
+   - relative paths cannot escape fixture or artifact roots
+   - manifest and artifact paths reject backslashes, drive prefixes, trailing dot/space names, control characters, and Windows reserved device names
+   - mutating repair receipts name the filesystem method through `fallback_kind`
+   - before/after inventories, receipts, event logs, parsed doctor JSON, and command transcripts are captured for every scripted e2e mutation
+
+2. Platform-specific behavior that must be tested where CI support exists:
+   - Linux: atomic rename/exchange paths and simulated cross-device fallback
+   - macOS: parked-rename fallback, case-sensitive/case-insensitive path expectations, and standard app-support data roots
+   - Windows: reserved-name rejection, drive-prefix refusal, locked-file behavior, long paths where enabled, and non-Unix rename semantics
+
+When Linux CI cannot exercise a non-Linux filesystem behavior directly, the
+doctor e2e runner must use a documented simulation instead of silently skipping
+the contract. The current cross-device promotion coverage uses
+`CASS_TEST_DOCTOR_RENAME_FAILURE=cross-device` and the
+`candidate-promote-corrupt-db-cross-device-fallback` scenario to force the
+copy-and-verified-replace path. The emitted artifacts must include
+`fallback_kind: "cross_device_copy_replace"` in doctor JSON and in the
+execution-flow log so support reviews can distinguish a fallback from an atomic
+rename.
+
+Unsupported or host-dependent behavior must be named in the test evidence. For
+example, a platform without atomic exchange support should still prove that
+readers see either the old generation or the verified replacement, never a
+half-applied bundle. Doctor tests and docs must not imply that users should
+manually delete archive paths to work around platform limits.
+
 ---
 
 ## Test Reports
 
-Generated reports go in `test-results/`:
+Generated reports go in `test-results/`; durable policy and reference files live
+outside generated-output directories:
 
 | File | Description |
 |------|-------------|
-| `no_mock_audit.md` | Mock pattern audit results |
-| `no_mock_allowlist.json` | Approved mock exceptions |
-| `e2e/SCHEMA.md` | E2E logging schema documentation |
+| `docs/artifacts/no-mock-audit.md` | Preserved mock pattern audit narrative |
+| `tests/policies/no_mock_allowlist.json` | Approved mock-pattern exceptions consumed by CI |
+| `docs/reference/E2E_LOGGING_SCHEMA.md` | Durable E2E logging schema documentation |
 | `e2e/<suite>/<test>/` | Per-test artifacts (stdout/stderr/cass.log/trace.jsonl) |
 | `e2e/*.jsonl` | Per-suite JSONL logs |
 | `e2e/combined.jsonl` | Aggregated JSONL from all suites |
@@ -715,9 +763,9 @@ fn test_parsing() { }
 ## Related Documentation
 
 - `AGENTS.md` - Agent guidelines (E2E browser test policy)
-- `test-results/no_mock_audit.md` - Current mock audit
-- `test-results/no_mock_allowlist.json` - Approved exceptions
-- `test-results/e2e/SCHEMA.md` - Unified E2E logging schema
+- `docs/artifacts/no-mock-audit.md` - Current mock audit
+- `tests/policies/no_mock_allowlist.json` - Approved exceptions
+- `docs/reference/E2E_LOGGING_SCHEMA.md` - Unified E2E logging schema
 - `scripts/tests/run_all.sh` - Orchestrated E2E runner
 - `scripts/lib/e2e_log.sh` - Shell E2E logging library
 - `tests/util/e2e_log.rs` - Rust E2E logging module

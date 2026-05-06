@@ -1,7 +1,7 @@
 //! E2E Logging utilities for structured JSONL output.
 //!
 //! This module provides helpers for Rust E2E tests to emit structured logs
-//! following the unified schema defined in `test-results/e2e/SCHEMA.md`.
+//! following the unified schema defined in `docs/reference/E2E_LOGGING_SCHEMA.md`.
 //!
 //! # Usage
 //!

@@ -1,7 +1,7 @@
 # 🔎 coding-agent-search (cass)
 
 <div align="center">
-  <img src="cass_illustration.webp" alt="coding-agent-search (cass) illustration">
+  <img src="docs/assets/images/cass_illustration.webp" alt="coding-agent-search (cass) illustration">
 </div>
 
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)
@@ -157,21 +157,21 @@ curl -sS -X POST http://127.0.0.1:8765/mcp -H 'Content-Type: application/json' -
 ### Search Results Across All Your Agents
 *Three-pane layout with semantic styling: filter bar with pills, results list with color-coded agents and score tiers, and syntax-highlighted detail preview with tab navigation*
 
-<img src="screenshots/screenshot_01.webp" alt="Main TUI showing search results across multiple coding agents" width="800">
+<img src="docs/assets/screenshots/screenshot_01.webp" alt="Main TUI showing search results across multiple coding agents" width="800">
 
 ---
 
 ### Rich Conversation Detail View
 *Full conversation rendering with markdown formatting, code blocks, headers, and structured content*
 
-<img src="screenshots/screenshot_02.webp" alt="Detail view showing formatted conversation content" width="800">
+<img src="docs/assets/screenshots/screenshot_02.webp" alt="Detail view showing formatted conversation content" width="800">
 
 ---
 
 ### Quick Start & Keyboard Reference
 *Built-in help screen (press `F1` or `?`) with all shortcuts, filters, modes, and navigation tips*
 
-<img src="screenshots/screenshot_03.webp" alt="Help screen showing keyboard shortcuts and features" width="500">
+<img src="docs/assets/screenshots/screenshot_03.webp" alt="Help screen showing keyboard shortcuts and features" width="500">
 
 </div>
 
@@ -516,6 +516,24 @@ cass sources sync
 # Check source health and connectivity
 cass sources doctor
 ```
+
+#### Remote Archive Safety
+
+Remote source diagnostics are intentionally local-only. `cass doctor --json`,
+`cass health --json`, and `cass status --json` report the
+`remote_source_sync` summary from cass-owned evidence: `sources.toml`,
+`sync_status.json`, the local `remotes/<source>/mirror/` copy, and archive DB
+provenance rows. They do not open SSH sessions, mutate remote machines, or
+rewrite provider session logs while classifying source gaps.
+
+This matters because agent harnesses can prune their own logs. If a laptop is
+retired, a remote path disappears, or a provider truncates older sessions, the
+cass archive DB and cass-owned local mirror may be the only remaining evidence
+for those conversations. Treat gap names such as `remote_source_unavailable`,
+`remote_source_pruned`, `local_archive_ahead_of_remote`, and
+`remote_copy_ahead_verified` as preservation signals first: keep the archive and
+mirror intact, then run the recommended `cass sources sync --all --json` or
+source-specific sync command after reviewing the reported evidence.
 
 #### Configuration File
 
@@ -2811,7 +2829,8 @@ and quality gates) lives in `docs/planning/TESTING.md` under
 Playwright E2E runs emit a setup metadata file at `tests/e2e/exports/setup-metadata.json` and
 export its path as `TEST_EXPORT_SETUP_LOG` in `tests/e2e/.env.test`. On failures, tests attach
 per-test browser logs (console/pageerror/requestfailed). Set `E2E_LOG_ALWAYS=1` to attach logs
-for every test.
+for every test. These paths are generated run artifacts and are intentionally ignored; durable
+logging schema documentation lives in `docs/reference/E2E_LOGGING_SCHEMA.md`.
 
 ### Release Build Optimizations
 

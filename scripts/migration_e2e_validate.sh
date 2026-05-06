@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CASS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FS_ROOT="/data/projects/frankensearch"
 FAD_ROOT="/data/projects/franken_agent_detection"
-BASELINE_DIR="${CASS_ROOT}/.beads/migration_baseline"
+BASELINE_DIR="${CASS_ROOT}/docs/artifacts/migration-baseline"
 
 # Colors (only when stdout is a terminal)
 if [[ -t 1 ]]; then
@@ -213,27 +213,32 @@ section "3. Clippy"
 STEP_START=$(date +%s)
 
 log "Clippy: frankensearch..."
-if (cd "$FS_ROOT" && cargo_cmd clippy --all-targets 2>&1 | grep -q "error\[") ; then
-    fail "frankensearch clippy: has errors"
-else
+if (cd "$FS_ROOT" && cargo_cmd clippy --all-targets -- -D warnings) >> "$LOG_FILE" 2>&1; then
     pass "frankensearch clippy: clean (no errors)"
+else
+    fail "frankensearch clippy: failed with errors or denied warnings"
 fi
 
 log "Clippy: FAD..."
-if (cd "$FAD_ROOT" && cargo_cmd clippy --all-targets 2>&1 | grep -q "error\[") ; then
-    fail "FAD clippy: has errors"
-else
+if (cd "$FAD_ROOT" && cargo_cmd clippy --all-targets -- -D warnings) >> "$LOG_FILE" 2>&1; then
     pass "FAD clippy: clean (no errors)"
+else
+    fail "FAD clippy: failed with errors or denied warnings"
 fi
 
 log "Clippy: cass..."
-if (cd "$CASS_ROOT" && cargo_cmd clippy --all-targets 2>&1 | grep -q "error\[") ; then
-    fail "cass clippy: has errors"
-else
+if (cd "$CASS_ROOT" && cargo_cmd clippy --all-targets -- -D warnings) >> "$LOG_FILE" 2>&1; then
     pass "cass clippy: clean (no errors)"
+else
+    fail "cass clippy: failed with errors or denied warnings"
 fi
 
 log "  Clippy step: $(elapsed_since "$STEP_START")s"
+
+if [[ "$QUICK_MODE" -eq 1 ]]; then
+    section "4. Quick Mode"
+    log "Skipping binary size, search quality, serialization compatibility, and FAD feature gate checks (--quick)."
+else
 
 # =============================================================================
 # 4. BINARY SIZE COMPARISON
@@ -400,6 +405,8 @@ if (cd "$FAD_ROOT" && cargo_cmd check --features all-connectors 2>&1) >> "$LOG_F
     pass "FAD all-connectors: builds"
 else
     fail "FAD all-connectors: builds failed"
+fi
+
 fi
 
 # =============================================================================

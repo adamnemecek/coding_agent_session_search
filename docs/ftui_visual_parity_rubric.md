@@ -178,13 +178,13 @@ Use it as the source of truth for parity evidence and root-cause ownership.
 
 | Scenario ID | Required state | Baseline artifact (ratatui v0.1.64) | Candidate artifact (current ftui) | Status | Owner beads for remaining gaps |
 |---|---|---|---|---|---|
-| `S1-search-results-wide` | Query submitted, wide dual-pane layout, selected hit visible | `screenshots/screenshot_01.webp` | `tests/snapshots/cassapp_search_surface_breakpoint_medium.snap` | captured | n/a |
-| `S2-detail-messages-tab` | Detail modal open on Messages tab | `screenshots/screenshot_02.webp` | `test-results/e2e/tui/tui-19c3f31b889_pty_search_detail_output.raw` | captured | n/a |
-| `S3-detail-snippets-tab` | Detail modal open on Snippets tab | `screenshots/screenshot_02.webp` | `tests/snapshots/cassapp_baseline_detail_tabs_snippets_active.snap` | captured | n/a |
-| `S4-detail-json-tab` | Detail modal open on Json tab | `screenshots/screenshot_02.webp` | `tests/snapshots/cassapp_baseline_detail_tabs_json_active.snap` | captured | n/a |
-| `S5-detail-find-bar-open` | Detail modal with find bar active + match counter | `screenshots/screenshot_02.webp` | `tests/snapshots/cassapp_baseline_detail_find_current_match.snap` | captured | n/a |
-| `S6-search-results-narrow` | Query submitted, narrow single-pane layout | `screenshots/screenshot_01.webp` | `tests/snapshots/cassapp_search_surface_breakpoint_narrow.snap` | captured | n/a |
-| `S7-command-palette-open` | Palette open over search/detail surfaces | `screenshots/screenshot_03.webp` | `tests/snapshots/cassapp_command_palette.snap` | captured | n/a |
+| `S1-search-results-wide` | Query submitted, wide dual-pane layout, selected hit visible | `docs/assets/screenshots/screenshot_01.webp` | `tests/snapshots/cassapp_search_surface_breakpoint_medium.snap` | captured | n/a |
+| `S2-detail-messages-tab` | Detail modal open on Messages tab | `docs/assets/screenshots/screenshot_02.webp` | `test-results/e2e/tui/tui-19c3f31b889_pty_search_detail_output.raw` | captured | n/a |
+| `S3-detail-snippets-tab` | Detail modal open on Snippets tab | `docs/assets/screenshots/screenshot_02.webp` | `tests/snapshots/cassapp_baseline_detail_tabs_snippets_active.snap` | captured | n/a |
+| `S4-detail-json-tab` | Detail modal open on Json tab | `docs/assets/screenshots/screenshot_02.webp` | `tests/snapshots/cassapp_baseline_detail_tabs_json_active.snap` | captured | n/a |
+| `S5-detail-find-bar-open` | Detail modal with find bar active + match counter | `docs/assets/screenshots/screenshot_02.webp` | `tests/snapshots/cassapp_baseline_detail_find_current_match.snap` | captured | n/a |
+| `S6-search-results-narrow` | Query submitted, narrow single-pane layout | `docs/assets/screenshots/screenshot_01.webp` | `tests/snapshots/cassapp_search_surface_breakpoint_narrow.snap` | captured | n/a |
+| `S7-command-palette-open` | Palette open over search/detail surfaces | `docs/assets/screenshots/screenshot_03.webp` | `tests/snapshots/cassapp_command_palette.snap` | captured | n/a |
 
 Canonical machine-readable manifest:
 - `docs/ftui_visual_parity_manifest.json`
@@ -228,7 +228,7 @@ No major baseline failure is left unowned. Scenario captures `S1`-`S7` are now m
 | Screenshot refresh x release gate | Visual updates must align with verification bundle to avoid stale evidence | Track G + Track K |
 
 ## Decision Log (For Future Sessions)
-- Keep legacy `screenshots/*.webp` as ratatui baseline anchors until dedicated ratatui replay capture is added.
+- Keep legacy TUI screenshot captures in `docs/assets/screenshots/*.webp` as ratatui baseline anchors until dedicated ratatui replay capture is added.
 - Use deterministic snapshot + PTY raw artifacts for current ftui evidence to avoid subjective comparisons.
 - Keep scenario IDs stable so future evidence bundles and release reports can diff by scenario key.
 - Treat any newly introduced scenario captures as explicit backlog work, never implicit TODOs.
