@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -134,9 +134,8 @@ pub(crate) fn capture_source_file(
         ));
     }
 
-    let root = raw_mirror_root(input.data_dir);
-    ensure_private_dir(&root)?;
-    ensure_private_dir(&root.join("tmp"))?;
+    let root = ensure_raw_mirror_root(input.data_dir)?;
+    ensure_private_dir_descendant(&root, &root.join("tmp"))?;
 
     let cache_key = raw_mirror_blob_cache_key(&input, &source_metadata);
     let (blob_blake3, bytes_copied, blob_already_present) =
@@ -144,7 +143,7 @@ pub(crate) fn capture_source_file(
             Some(record) => (record.blob_blake3, record.bytes_copied, true),
             None => {
                 let temp_dir = unique_capture_temp_dir(&root);
-                ensure_private_dir(&temp_dir)?;
+                ensure_private_dir_descendant(&root, &temp_dir)?;
                 let CopyToTempResult {
                     temp_path,
                     blob_blake3,
@@ -154,7 +153,7 @@ pub(crate) fn capture_source_file(
                     .ok_or_else(|| anyhow!("computed invalid raw mirror blake3 digest"))?;
                 let blob_path = root.join(&blob_relative_path);
                 let already_present =
-                    publish_content_addressed_temp(&temp_path, &blob_path, &blob_blake3)?;
+                    publish_content_addressed_temp(&root, &temp_path, &blob_path, &blob_blake3)?;
                 remove_empty_temp_dir_best_effort(&temp_dir);
                 cache_raw_mirror_blob_record(
                     cache_key.clone(),
@@ -383,11 +382,13 @@ fn source_file_changed_during_capture(
 }
 
 fn publish_content_addressed_temp(
+    root: &Path,
     temp_path: &Path,
     final_path: &Path,
     expected_blake3: &str,
 ) -> Result<bool> {
-    ensure_private_dir(
+    ensure_private_dir_descendant(
+        root,
         final_path
             .parent()
             .ok_or_else(|| anyhow!("raw mirror blob path has no parent"))?,
@@ -424,7 +425,8 @@ fn publish_manifest_bytes_create_new(
     manifest_bytes: &[u8],
     blob_blake3: &str,
 ) -> Result<bool> {
-    ensure_private_dir(
+    ensure_private_dir_descendant(
+        root,
         manifest_path
             .parent()
             .ok_or_else(|| anyhow!("raw mirror manifest path has no parent"))?,
@@ -435,7 +437,7 @@ fn publish_manifest_bytes_create_new(
     }
 
     let temp_dir = unique_capture_temp_dir(root);
-    ensure_private_dir(&temp_dir)?;
+    ensure_private_dir_descendant(root, &temp_dir)?;
     let temp_path = unique_temp_path(&temp_dir, "manifest");
     let mut temp = private_create_new_file(&temp_path)?;
     temp.write_all(manifest_bytes)
@@ -506,13 +508,14 @@ fn merge_raw_mirror_manifest_db_links(
 }
 
 fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
-    ensure_private_dir(
+    ensure_private_dir_descendant(
+        root,
         manifest_path
             .parent()
             .ok_or_else(|| anyhow!("raw mirror manifest path has no parent"))?,
     )?;
     let temp_dir = unique_capture_temp_dir(root);
-    ensure_private_dir(&temp_dir)?;
+    ensure_private_dir_descendant(root, &temp_dir)?;
     let temp_path = unique_temp_path(&temp_dir, "manifest-update");
     let mut temp = private_create_new_file(&temp_path)?;
     temp.write_all(manifest_bytes).with_context(|| {
@@ -645,6 +648,14 @@ fn raw_mirror_root(data_dir: &Path) -> PathBuf {
     data_dir
         .join(RAW_MIRROR_ROOT_DIR)
         .join(RAW_MIRROR_VERSION_DIR)
+}
+
+fn ensure_raw_mirror_root(data_dir: &Path) -> Result<PathBuf> {
+    let root_parent = data_dir.join(RAW_MIRROR_ROOT_DIR);
+    ensure_private_dir(&root_parent)?;
+    let root = root_parent.join(RAW_MIRROR_VERSION_DIR);
+    ensure_private_dir(&root)?;
+    Ok(root)
 }
 
 fn raw_mirror_blob_cache_key(
@@ -849,7 +860,55 @@ fn file_blake3(path: &Path) -> Result<String> {
 fn ensure_private_dir(path: &Path) -> Result<()> {
     create_private_dir_all(path)
         .with_context(|| format!("create raw mirror dir {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("stat raw mirror dir {}", path.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(anyhow!(
+            "refusing to use symlink raw mirror dir {}",
+            path.display()
+        ));
+    }
+    if !file_type.is_dir() {
+        return Err(anyhow!(
+            "refusing to use non-directory raw mirror path {}",
+            path.display()
+        ));
+    }
     set_private_dir_permissions(path)?;
+    Ok(())
+}
+
+fn ensure_private_dir_descendant(root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(root).with_context(|| {
+        format!(
+            "raw mirror private dir {} is not under root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+
+    if let Some(root_parent) = root.parent() {
+        ensure_private_dir(root_parent)?;
+    }
+    ensure_private_dir(root)?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => {
+                current.push(part);
+                ensure_private_dir(&current)?;
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(anyhow!(
+                    "raw mirror private dir contains non-normal component: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1374,6 +1433,86 @@ mod tests {
         );
         assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
         assert_eq!(fs::read(&outside).expect("outside bytes"), source_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_source_file_rejects_symlinked_raw_mirror_root_dir() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source.jsonl");
+        let outside_mirror = temp.path().join("outside-mirror");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"do not redirect archive\"}\n";
+
+        fs::create_dir_all(&data_dir).expect("data dir");
+        fs::create_dir_all(&outside_mirror).expect("outside mirror dir");
+        fs::write(&source_path, source_bytes).expect("write source");
+        std::os::unix::fs::symlink(&outside_mirror, data_dir.join(RAW_MIRROR_ROOT_DIR))
+            .expect("symlink raw mirror root");
+
+        let err = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect_err("symlinked raw-mirror root must be rejected");
+
+        assert!(
+            err.to_string().contains("symlink raw mirror dir"),
+            "unexpected symlink-root error: {err:#}"
+        );
+        assert!(
+            !outside_mirror.join(RAW_MIRROR_VERSION_DIR).exists(),
+            "raw mirror capture must not create redirected archive state outside data_dir"
+        );
+        assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_source_file_rejects_symlinked_blob_directory_component() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = data_dir
+            .join(RAW_MIRROR_ROOT_DIR)
+            .join(RAW_MIRROR_VERSION_DIR);
+        let source_path = temp.path().join("source.jsonl");
+        let outside_blobs = temp.path().join("outside-blobs");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"do not redirect blobs\"}\n";
+
+        fs::create_dir_all(&root).expect("raw mirror root");
+        fs::create_dir_all(&outside_blobs).expect("outside blobs dir");
+        fs::write(&source_path, source_bytes).expect("write source");
+        std::os::unix::fs::symlink(&outside_blobs, root.join("blobs")).expect("symlink blobs dir");
+
+        let err = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect_err("symlinked blob directory must be rejected");
+
+        assert!(
+            err.to_string().contains("symlink raw mirror dir"),
+            "unexpected symlink-blob-dir error: {err:#}"
+        );
+        assert!(
+            !outside_blobs.join(RAW_MIRROR_HASH_ALGORITHM).exists(),
+            "raw mirror capture must not create redirected blob state outside data_dir"
+        );
+        assert!(
+            !root.join("manifests").exists(),
+            "failed blob publish must not write a manifest"
+        );
+        assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
     }
 
     #[test]
