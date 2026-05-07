@@ -39650,10 +39650,23 @@ fn execute_doctor_copy_file_to_staging(
 
     match sync_file(request.target_path, "copied staging target") {
         Ok(()) => {
-            receipt.status = DoctorActionStatus::Applied;
             receipt
                 .precondition_checks
                 .push("target_file_sync_completed".to_string());
+        }
+        Err(err) => {
+            receipt.status = DoctorActionStatus::Failed;
+            receipt.blocked_reasons.push(err);
+            return receipt;
+        }
+    }
+
+    match sync_directory(parent) {
+        Ok(()) => {
+            receipt.status = DoctorActionStatus::Applied;
+            receipt
+                .precondition_checks
+                .push("target_parent_sync_completed".to_string());
         }
         Err(err) => {
             receipt.status = DoctorActionStatus::Failed;
@@ -43493,6 +43506,7 @@ mod doctor_asset_taxonomy_tests {
             "filesystem_copy_completed",
             "target_blake3_matched_source",
             "target_file_sync_completed",
+            "target_parent_sync_completed",
         ] {
             assert!(
                 receipt
@@ -43514,6 +43528,79 @@ mod doctor_asset_taxonomy_tests {
         assert!(
             db_path.exists(),
             "copy must not touch the canonical archive DB"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_reports_copy_parent_sync_failure_after_file_sync() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"precious archive").expect("write db placeholder");
+
+        let source_path = data_dir.join("raw-mirror").join("source.raw");
+        let source_bytes = b"source bytes preserved through copy";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let staging_root = data_dir.join("doctor-staging").join("copy-dir-sync-fail");
+        let target_path = staging_root.join("candidate.raw");
+        std::fs::create_dir_all(target_path.parent().expect("target parent"))
+            .expect("create copy target parent");
+
+        doctor_test_inject_next_directory_sync_failure();
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-dir-sync-fail",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Failed);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("injected test failure syncing directory")),
+            "copy parent sync failure should be explicit: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "target_file_sync_completed"),
+            "copy parent sync failure should record that the file fsync completed"
+        );
+        assert!(
+            !receipt
+                .precondition_checks
+                .iter()
+                .any(|check| check == "target_parent_sync_completed"),
+            "failed parent fsync must not be reported as completed"
+        );
+        assert_eq!(
+            std::fs::read(&target_path).expect("read copied target after sync failure"),
+            source_bytes,
+            "failed receipt must leave copied staging bytes available for inspection"
+        );
+        assert!(
+            source_path.exists(),
+            "copy parent sync failure must preserve source evidence"
         );
     }
 
