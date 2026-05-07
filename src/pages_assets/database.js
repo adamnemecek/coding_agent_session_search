@@ -349,12 +349,11 @@ function normalizeTimestampFilterValue(value) {
     }
 
     const numeric = Number(value);
-    const integer = Math.trunc(numeric);
-    if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(integer)) {
+    if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(numeric)) {
         return null;
     }
 
-    return integer;
+    return numeric;
 }
 
 /**

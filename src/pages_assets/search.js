@@ -130,11 +130,11 @@ function parseTimestampFilterValue(value) {
     }
 
     const numeric = Number(value);
-    if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(Math.trunc(numeric))) {
+    if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(numeric)) {
         return null;
     }
 
-    return Math.trunc(numeric);
+    return numeric;
 }
 
 function calculateTimeFilterRange(value) {

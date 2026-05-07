@@ -776,6 +776,23 @@ mod tests {
     }
 
     #[test]
+    fn test_archive_search_timestamp_filters_reject_fractional_values() {
+        let database_js = include_str!("../src/pages_assets/database.js");
+        let search_js = include_str!("../src/pages_assets/search.js");
+
+        assert!(
+            search_js.contains("!Number.isSafeInteger(numeric)")
+                && !search_js.contains("Number.isSafeInteger(Math.trunc(numeric))"),
+            "routed timestamp filters should reject malformed fractional values instead of truncating them"
+        );
+        assert!(
+            database_js.contains("!Number.isSafeInteger(numeric)")
+                && !database_js.contains("Math.trunc(numeric)"),
+            "SQL timestamp filter normalization should reject fractional values before binding"
+        );
+    }
+
+    #[test]
     fn test_archive_search_time_filters_are_applied_before_pagination() {
         let database_js = include_str!("../src/pages_assets/database.js");
         let search_js = include_str!("../src/pages_assets/search.js");
