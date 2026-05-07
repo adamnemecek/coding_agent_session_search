@@ -64595,6 +64595,16 @@ fn load_opencode_session_for_export(
             .unwrap_or(u64::MAX)
     }
 
+    fn opencode_message_order(path: &Path, msg_id: &str) -> u64 {
+        trailing_ascii_number(msg_id)
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(trailing_ascii_number)
+            })
+            .unwrap_or(u64::MAX)
+    }
+
     let mut parts_by_msg: HashMap<String, Vec<PartInfo>> = HashMap::new();
     if part_dir.exists() {
         let mut part_records: Vec<(std::path::PathBuf, PartInfo)> = Vec::new();
@@ -64662,7 +64672,7 @@ fn load_opencode_session_for_export(
         created: Option<i64>,
     }
 
-    let mut messages: Vec<(i64, std::path::PathBuf, serde_json::Value)> = Vec::new();
+    let mut messages: Vec<(i64, u64, std::path::PathBuf, serde_json::Value)> = Vec::new();
     let mut message_ts_min: Option<i64> = None;
     let mut message_ts_max: Option<i64> = None;
 
@@ -64731,6 +64741,7 @@ fn load_opencode_session_for_export(
             continue;
         }
 
+        let message_order = opencode_message_order(p, &msg_info.id);
         let role = msg_info.role.unwrap_or_else(|| "assistant".to_string());
         let timestamp = normalize_opencode_ts(msg_info.time.as_ref().and_then(|t| t.created));
         if let Some(ts) = timestamp {
@@ -64749,14 +64760,22 @@ fn load_opencode_session_for_export(
         }
 
         // Keep unknown timestamps at the end while preserving deterministic output.
-        messages.push((timestamp.unwrap_or(i64::MAX), p.to_path_buf(), msg_json));
+        messages.push((
+            timestamp.unwrap_or(i64::MAX),
+            message_order,
+            p.to_path_buf(),
+            msg_json,
+        ));
     }
 
     // Sort by timestamp
-    messages.sort_by(|(a_ts, a_path, _), (b_ts, b_path, _)| {
-        a_ts.cmp(b_ts).then_with(|| a_path.cmp(b_path))
+    messages.sort_by(|(a_ts, a_order, a_path, _), (b_ts, b_order, b_path, _)| {
+        a_ts.cmp(b_ts)
+            .then_with(|| a_order.cmp(b_order))
+            .then_with(|| a_path.cmp(b_path))
     });
-    let sorted_messages: Vec<serde_json::Value> = messages.into_iter().map(|(_, _, m)| m).collect();
+    let sorted_messages: Vec<serde_json::Value> =
+        messages.into_iter().map(|(_, _, _, m)| m).collect();
 
     // Compute timestamps from messages if not available in session metadata.
     let start = session_start.or(message_ts_min);
@@ -67348,6 +67367,66 @@ mod opencode_export_tests {
             messages[1].get("timestamp").is_none(),
             "message without timestamp should not get an artificial 0"
         );
+    }
+
+    #[test]
+    fn load_opencode_export_orders_equal_timestamp_messages_by_provider_message_number() {
+        let temp = TempDir::new().expect("tempdir");
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("session/project-1");
+        let message_dir = storage.join("message/session-1");
+        let part_root = storage.join("part");
+
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+
+        let session_path = session_dir.join("session-1.json");
+        fs::write(
+            &session_path,
+            json!({
+                "id": "session-1",
+                "title": "OpenCode Equal Timestamp Messages"
+            })
+            .to_string(),
+        )
+        .expect("write session");
+
+        for (id, text) in [("m10", "third"), ("m2", "second"), ("m1", "first")] {
+            fs::write(
+                message_dir.join(format!("{id}.json")),
+                json!({
+                    "id": id,
+                    "role": "assistant",
+                    "time": {
+                        "created": 1733000000
+                    }
+                })
+                .to_string(),
+            )
+            .expect("write message");
+
+            let part_dir = part_root.join(id);
+            fs::create_dir_all(&part_dir).expect("create part dir");
+            fs::write(
+                part_dir.join("part1.json"),
+                json!({
+                    "messageID": id,
+                    "type": "text",
+                    "text": text
+                })
+                .to_string(),
+            )
+            .expect("write part");
+        }
+
+        let (_title, _start, _end, messages) =
+            load_opencode_session_for_export(&session_path).expect("load opencode export");
+
+        let contents: Vec<_> = messages
+            .iter()
+            .map(|message| message.get("content").and_then(|value| value.as_str()))
+            .collect();
+        assert_eq!(contents, vec![Some("first"), Some("second"), Some("third")]);
     }
 
     #[test]
