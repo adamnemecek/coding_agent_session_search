@@ -1026,6 +1026,8 @@ pub(crate) fn write_private_artifacts_encrypted(
     generate_qr: bool,
     cleanup_missing_recovery: bool,
 ) -> Result<()> {
+    ensure_private_artifact_dir(private_dir)?;
+
     let recovery_secret_path = private_dir.join("recovery-secret.txt");
     let qr_png_path = private_dir.join("qr-code.png");
     let qr_svg_path = private_dir.join("qr-code.svg");
@@ -1384,6 +1386,42 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "rejected private artifact symlink should be left intact"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_private_artifacts_cleanup_rejects_symlinked_private_dir_before_removal() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside_dir = temp.path().join("outside");
+        let private_dir = temp.path().join("private");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("recovery-secret.txt"), "keep recovery").unwrap();
+        fs::write(outside_dir.join("qr-code.png"), "keep png").unwrap();
+        fs::write(outside_dir.join("qr-code.svg"), "keep svg").unwrap();
+        symlink(&outside_dir, &private_dir).unwrap();
+
+        let config = encrypted_config_for_files(Vec::new());
+        let err = write_private_artifacts_encrypted(&private_dir, &config, None, false, true)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(outside_dir.join("recovery-secret.txt")).unwrap(),
+            "keep recovery"
+        );
+        assert_eq!(
+            fs::read_to_string(outside_dir.join("qr-code.png")).unwrap(),
+            "keep png"
+        );
+        assert_eq!(
+            fs::read_to_string(outside_dir.join("qr-code.svg")).unwrap(),
+            "keep svg"
         );
     }
 
