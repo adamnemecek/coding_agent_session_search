@@ -1276,6 +1276,10 @@ fn private_dir_for_archive(archive_dir: &Path) -> Result<Option<std::path::PathB
                 if file_type.is_dir() {
                     return Ok(Some(private_dir));
                 }
+                bail!(
+                    "private artifact path must be a directory: {}",
+                    private_dir.display()
+                );
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
@@ -1421,6 +1425,25 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "rejected private directory symlink should remain untouched"
+        );
+    }
+
+    #[test]
+    fn test_private_dir_for_archive_rejects_non_directory_private_path() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("bundle/site");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::write(temp.path().join("bundle/private"), "not a directory").unwrap();
+
+        let err = private_dir_for_archive(&site_dir).unwrap_err();
+
+        assert!(
+            err.to_string().contains("must be a directory"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("bundle/private")).unwrap(),
+            "not a directory"
         );
     }
 
