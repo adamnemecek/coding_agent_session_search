@@ -13,7 +13,7 @@
 //! - **Trace bundle** (directory): render trace + event stream + `tui_state.json`
 //!   + `system_info.json`.
 
-use std::io::Write;
+use std::io::{Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -101,18 +101,20 @@ pub struct TraceWriter {
 impl TraceWriter {
     /// Open a trace writer.  Pass `None` for paths you don't want to record.
     pub fn open(render_path: Option<&Path>, events_path: Option<&Path>) -> std::io::Result<Self> {
-        let render_file = render_path
-            .map(|p| -> std::io::Result<_> {
-                let f = std::fs::File::create(p)?;
-                Ok(std::io::BufWriter::new(f))
-            })
-            .transpose()?;
-        let events_file = events_path
-            .map(|p| -> std::io::Result<_> {
-                let f = std::fs::File::create(p)?;
-                Ok(std::io::BufWriter::new(f))
-            })
-            .transpose()?;
+        if let (Some(render_path), Some(events_path)) = (render_path, events_path)
+            && render_path == events_path
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "render and event trace outputs must use distinct paths: {}",
+                    render_path.display()
+                ),
+            ));
+        }
+
+        let render_file = render_path.map(open_trace_output).transpose()?;
+        let events_file = events_path.map(open_trace_output).transpose()?;
         Ok(Self {
             render_file,
             events_file,
@@ -191,6 +193,25 @@ impl TraceWriter {
     }
 }
 
+fn open_trace_output(path: &Path) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!("trace output already exists: {}", path.display()),
+            ));
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    Ok(std::io::BufWriter::new(file))
+}
+
 impl Drop for TraceWriter {
     fn drop(&mut self) {
         let _ = self.flush();
@@ -211,19 +232,52 @@ pub fn write_trace_bundle(
     system_info: &SystemInfo,
     tui_state_json: Option<&str>,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(bundle_dir)?;
+    ensure_trace_bundle_dir(bundle_dir)?;
 
     // System info
     let sys_path = bundle_dir.join("system_info.json");
-    let sys_file = std::fs::File::create(sys_path)?;
-    serde_json::to_writer_pretty(sys_file, system_info)?;
+    let mut sys_file = open_trace_output(&sys_path)?;
+    serde_json::to_writer_pretty(&mut sys_file, system_info)?;
 
     // TUI state
     if let Some(state) = tui_state_json {
-        std::fs::write(bundle_dir.join("tui_state.json"), state)?;
+        let mut state_file = open_trace_output(&bundle_dir.join("tui_state.json"))?;
+        state_file.write_all(state.as_bytes())?;
     }
 
     Ok(())
+}
+
+fn ensure_trace_bundle_dir(bundle_dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(bundle_dir) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "trace bundle directory must not be a symlink: {}",
+                        bundle_dir.display()
+                    ),
+                ));
+            }
+            if !file_type.is_dir() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "trace bundle path must be a directory: {}",
+                        bundle_dir.display()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            std::fs::create_dir_all(bundle_dir)?;
+            ensure_trace_bundle_dir(bundle_dir)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 // =========================================================================
@@ -419,6 +473,71 @@ mod tests {
     }
 
     #[test]
+    fn trace_writer_refuses_existing_output_path() {
+        let tmp = TempDir::new().unwrap();
+        let render_path = tmp.path().join("render.trace.jsonl");
+        std::fs::write(&render_path, "existing trace").unwrap();
+
+        let err = match TraceWriter::open(Some(&render_path), None) {
+            Ok(_) => panic!("expected existing trace output to be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&render_path).unwrap(),
+            "existing trace"
+        );
+    }
+
+    #[test]
+    fn trace_writer_refuses_shared_render_and_event_path() {
+        let tmp = TempDir::new().unwrap();
+        let trace_path = tmp.path().join("trace.jsonl");
+
+        let err = match TraceWriter::open(Some(&trace_path), Some(&trace_path)) {
+            Ok(_) => panic!("expected shared trace output path to be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            !trace_path.exists(),
+            "shared-path validation should not create a partial trace file"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn trace_writer_refuses_symlinked_output_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let protected_path = tmp.path().join("protected.jsonl");
+        let trace_path = tmp.path().join("render.trace.jsonl");
+        std::fs::write(&protected_path, "do not overwrite").unwrap();
+        symlink(&protected_path, &trace_path).unwrap();
+
+        let err = match TraceWriter::open(Some(&trace_path), None) {
+            Ok(_) => panic!("expected symlinked trace output to be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&protected_path).unwrap(),
+            "do not overwrite"
+        );
+        assert!(
+            std::fs::symlink_metadata(&trace_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected trace symlink should remain untouched"
+        );
+    }
+
+    #[test]
     fn write_and_read_trace_bundle() {
         let tmp = TempDir::new().unwrap();
         let bundle_dir = tmp.path().join("bundle");
@@ -431,6 +550,33 @@ mod tests {
 
         let state = std::fs::read_to_string(bundle_dir.join("tui_state.json")).unwrap();
         assert!(state.contains("test"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_trace_bundle_rejects_symlinked_bundle_dir() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside_dir = tmp.path().join("outside");
+        let bundle_dir = tmp.path().join("bundle");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, &bundle_dir).unwrap();
+
+        let err = write_trace_bundle(&bundle_dir, &SystemInfo::capture(), Some("{}")).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            !outside_dir.join("system_info.json").exists(),
+            "trace bundle writer must not follow a symlinked bundle directory"
+        );
+        assert!(
+            std::fs::symlink_metadata(&bundle_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "rejected trace bundle symlink should remain untouched"
+        );
     }
 
     #[test]

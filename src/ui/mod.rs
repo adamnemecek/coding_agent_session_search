@@ -12,6 +12,7 @@ pub mod shortcuts;
 pub mod style_system;
 pub mod theme;
 pub mod time_parser;
+pub mod trace;
 pub mod tui;
 
 #[cfg(test)]
