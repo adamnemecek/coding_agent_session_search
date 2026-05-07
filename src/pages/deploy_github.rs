@@ -612,8 +612,12 @@ fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Re
 
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
+        let file_name = entry.file_name();
+        if file_name == std::ffi::OsStr::new(".git") {
+            continue;
+        }
         let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
+        let dst_path = dst.join(file_name);
         let metadata = std::fs::symlink_metadata(&src_path)?;
         let file_type = metadata.file_type();
 
@@ -1133,6 +1137,31 @@ mod tests {
         assert!(repo_dir.path().join(".nojekyll").exists());
         assert!(!repo_dir.path().join("private").exists());
         assert!(!repo_dir.path().join("site").exists());
+    }
+
+    #[test]
+    fn test_copy_bundle_to_repo_ignores_bundle_git_directory_without_modifying_repo_git() {
+        use tempfile::TempDir;
+
+        let bundle_root = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let site_dir = bundle_root.path().join("site");
+        let bundle_git_dir = site_dir.join(".git");
+        let repo_git_dir = repo_dir.path().join(".git");
+
+        std::fs::create_dir_all(&bundle_git_dir).unwrap();
+        std::fs::create_dir_all(&repo_git_dir).unwrap();
+        std::fs::write(site_dir.join("index.html"), "<html></html>").unwrap();
+        std::fs::write(bundle_git_dir.join("config"), "bundle git config").unwrap();
+        std::fs::write(repo_git_dir.join("config"), "repo git config").unwrap();
+
+        copy_bundle_to_repo(bundle_root.path(), repo_dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo_git_dir.join("config")).unwrap(),
+            "repo git config"
+        );
+        assert!(repo_dir.path().join("index.html").exists());
     }
 
     #[test]
