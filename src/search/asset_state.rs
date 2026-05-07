@@ -1391,21 +1391,17 @@ pub(crate) fn evaluate_maintenance_coordination_from_snapshot(
     if !snapshot.active {
         return MaintenanceCoordinationOutcome::Idle;
     }
-    let job_id = match snapshot.job_id {
-        Some(ref id) if !id.is_empty() => id.clone(),
-        _ => return MaintenanceCoordinationOutcome::Idle,
-    };
-    let heartbeat_age_ms = snapshot
-        .updated_at_ms
-        .map(|ts| now_ms.saturating_sub(ts))
-        .unwrap_or(i64::MAX);
-    if heartbeat_age_ms > HEARTBEAT_STALE_THRESHOLD_MS {
-        return MaintenanceCoordinationOutcome::Stale {
-            job_id,
-            reason: format!(
-                "heartbeat is {heartbeat_age_ms}ms old (threshold {HEARTBEAT_STALE_THRESHOLD_MS}ms)"
-            ),
-        };
+    let job_id = maintenance_snapshot_job_id(snapshot);
+    if let Some(updated_at_ms) = snapshot.updated_at_ms {
+        let heartbeat_age_ms = now_ms.saturating_sub(updated_at_ms);
+        if heartbeat_age_ms > HEARTBEAT_STALE_THRESHOLD_MS {
+            return MaintenanceCoordinationOutcome::Stale {
+                job_id,
+                reason: format!(
+                    "heartbeat is {heartbeat_age_ms}ms old (threshold {HEARTBEAT_STALE_THRESHOLD_MS}ms)"
+                ),
+            };
+        }
     }
     MaintenanceCoordinationOutcome::Active {
         job_id,
@@ -1416,6 +1412,45 @@ pub(crate) fn evaluate_maintenance_coordination_from_snapshot(
         started_at_ms: snapshot.started_at_ms.unwrap_or(0),
         updated_at_ms: snapshot.updated_at_ms.unwrap_or(now_ms),
     }
+}
+
+fn maintenance_snapshot_job_id(snapshot: &SearchMaintenanceSnapshot) -> String {
+    snapshot
+        .job_id
+        .as_ref()
+        .filter(|job_id| !job_id.is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            let mode = snapshot
+                .mode
+                .map(|mode| mode.as_lock_value())
+                .unwrap_or("unknown");
+            let owner = snapshot
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown-owner".to_string());
+            format!("{mode}-active-lock-{owner}")
+        })
+}
+
+fn maintenance_snapshot_job_kind(snapshot: &SearchMaintenanceSnapshot) -> SearchMaintenanceJobKind {
+    snapshot
+        .job_kind
+        .unwrap_or(SearchMaintenanceJobKind::LexicalRefresh)
+}
+
+fn maintenance_elapsed_ms(snapshot: &SearchMaintenanceSnapshot, now_ms: i64) -> u64 {
+    snapshot
+        .started_at_ms
+        .map(|started_at_ms| u64::try_from(now_ms.saturating_sub(started_at_ms)).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn stale_heartbeat_phase(snapshot: &SearchMaintenanceSnapshot) -> Option<String> {
+    snapshot
+        .phase
+        .clone()
+        .or_else(|| Some("stale-heartbeat".to_string()))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1429,9 +1464,13 @@ pub(crate) fn decide_maintenance_action_from_snapshot(
     now_ms: i64,
 ) -> MaintenanceDecision {
     match evaluate_maintenance_coordination_from_snapshot(snapshot, now_ms) {
-        MaintenanceCoordinationOutcome::Idle | MaintenanceCoordinationOutcome::Stale { .. } => {
-            MaintenanceDecision::Launch
-        }
+        MaintenanceCoordinationOutcome::Idle => MaintenanceDecision::Launch,
+        MaintenanceCoordinationOutcome::Stale { job_id, .. } => MaintenanceDecision::AttachOrWait {
+            job_id,
+            job_kind: maintenance_snapshot_job_kind(snapshot),
+            phase: stale_heartbeat_phase(snapshot),
+            elapsed_ms: maintenance_elapsed_ms(snapshot, now_ms),
+        },
         MaintenanceCoordinationOutcome::Active {
             job_id,
             job_kind,
@@ -1442,7 +1481,7 @@ pub(crate) fn decide_maintenance_action_from_snapshot(
             job_id,
             job_kind,
             phase,
-            elapsed_ms: (now_ms.saturating_sub(started_at_ms)) as u64,
+            elapsed_ms: u64::try_from(now_ms.saturating_sub(started_at_ms)).unwrap_or(0),
         },
     }
 }
@@ -1455,8 +1494,22 @@ pub(crate) fn decide_search_failopen(
 ) -> MaintenanceDecision {
     let snapshot = read_search_maintenance_snapshot(data_dir);
     match evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms) {
-        MaintenanceCoordinationOutcome::Idle | MaintenanceCoordinationOutcome::Stale { .. } => {
-            MaintenanceDecision::Launch
+        MaintenanceCoordinationOutcome::Idle => MaintenanceDecision::Launch,
+        MaintenanceCoordinationOutcome::Stale { job_id, reason } => {
+            if lexical_available {
+                MaintenanceDecision::FailOpen {
+                    reason: format!(
+                        "maintenance job {job_id} has a stale heartbeat ({reason}); lexical index is available, failing open"
+                    ),
+                }
+            } else {
+                MaintenanceDecision::AttachOrWait {
+                    job_id,
+                    job_kind: maintenance_snapshot_job_kind(&snapshot),
+                    phase: stale_heartbeat_phase(&snapshot),
+                    elapsed_ms: maintenance_elapsed_ms(&snapshot, now_ms),
+                }
+            }
         }
         MaintenanceCoordinationOutcome::Active {
             job_id,
@@ -1476,7 +1529,7 @@ pub(crate) fn decide_search_failopen(
                     job_id,
                     job_kind,
                     phase,
-                    elapsed_ms: (now_ms.saturating_sub(started_at_ms)) as u64,
+                    elapsed_ms: u64::try_from(now_ms.saturating_sub(started_at_ms)).unwrap_or(0),
                 }
             }
         }
@@ -1506,29 +1559,26 @@ pub(crate) fn poll_maintenance_until_idle(
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
         let outcome = evaluate_maintenance_coordination(data_dir, now_ms);
         polls += 1;
-        match outcome {
-            MaintenanceCoordinationOutcome::Idle | MaintenanceCoordinationOutcome::Stale { .. } => {
-                return PollResult {
-                    outcome,
-                    polls,
-                    elapsed: start.elapsed(),
-                    timed_out: false,
-                };
-            }
-            MaintenanceCoordinationOutcome::Active { .. } => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return PollResult {
-                        outcome,
-                        polls,
-                        elapsed: start.elapsed(),
-                        timed_out: true,
-                    };
-                }
-                let remaining = deadline - now;
-                std::thread::sleep(interval.min(remaining));
-            }
+        if matches!(outcome, MaintenanceCoordinationOutcome::Idle) {
+            return PollResult {
+                outcome,
+                polls,
+                elapsed: start.elapsed(),
+                timed_out: false,
+            };
         }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return PollResult {
+                outcome,
+                polls,
+                elapsed: start.elapsed(),
+                timed_out: true,
+            };
+        }
+        let remaining = deadline - now;
+        std::thread::sleep(interval.min(remaining));
     }
 }
 
@@ -1710,6 +1760,13 @@ pub(crate) fn unified_maintenance_view(
                     phase.as_deref().unwrap_or("unknown")
                 ),
             },
+            MaintenanceCoordinationOutcome::Stale { job_id, reason } => {
+                MaintenanceDecision::FailOpen {
+                    reason: format!(
+                        "maintenance job {job_id} has a stale heartbeat ({reason}); lexical available, failing open"
+                    ),
+                }
+            }
             _ => decide_maintenance_action_from_snapshot(&snapshot, now_ms),
         }
     } else {
@@ -2723,15 +2780,29 @@ mod tests {
     }
 
     #[test]
-    fn coordination_no_active_job_when_no_job_id() {
+    fn coordination_tracks_active_legacy_lock_without_job_id() {
         let snapshot = SearchMaintenanceSnapshot {
             active: true,
             pid: Some(12345),
             job_id: None,
+            mode: Some(SearchMaintenanceMode::Index),
             ..Default::default()
         };
         let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, 1_733_000_000_000);
-        assert_eq!(outcome, MaintenanceCoordinationOutcome::Idle);
+        if let MaintenanceCoordinationOutcome::Active {
+            ref job_id,
+            job_kind,
+            ..
+        } = outcome
+        {
+            assert_eq!(job_id, "index-active-lock-12345");
+            assert_eq!(job_kind, SearchMaintenanceJobKind::LexicalRefresh);
+        } else {
+            assert!(
+                matches!(outcome, MaintenanceCoordinationOutcome::Active { .. }),
+                "legacy active lock must remain active, got {outcome:?}"
+            );
+        }
     }
 
     #[test]
@@ -2779,17 +2850,21 @@ mod tests {
     }
 
     #[test]
-    fn coordination_stale_job_when_no_heartbeat_timestamp() {
+    fn coordination_missing_heartbeat_timestamp_still_respects_active_flock() {
         let now_ms = 1_733_000_000_000i64;
         let snapshot = SearchMaintenanceSnapshot {
             updated_at_ms: None,
             ..make_active_snapshot(now_ms)
         };
         let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
-        assert!(
-            matches!(outcome, MaintenanceCoordinationOutcome::Stale { .. }),
-            "missing heartbeat must be treated as stale"
-        );
+        if let MaintenanceCoordinationOutcome::Active { updated_at_ms, .. } = outcome {
+            assert_eq!(updated_at_ms, now_ms);
+        } else {
+            assert!(
+                matches!(outcome, MaintenanceCoordinationOutcome::Active { .. }),
+                "missing heartbeat metadata must not hide an active flock, got {outcome:?}"
+            );
+        }
     }
 
     #[test]
@@ -2807,14 +2882,29 @@ mod tests {
     }
 
     #[test]
-    fn decision_launch_when_stale_job() {
+    fn decision_attaches_when_active_lock_has_stale_heartbeat() {
         let now_ms = 1_733_000_000_000i64;
         let snapshot = SearchMaintenanceSnapshot {
             updated_at_ms: Some(now_ms - 60_000),
             ..make_active_snapshot(now_ms)
         };
         let decision = decide_maintenance_action_from_snapshot(&snapshot, now_ms);
-        assert_eq!(decision, MaintenanceDecision::Launch);
+        if let MaintenanceDecision::AttachOrWait {
+            ref job_id,
+            ref phase,
+            elapsed_ms,
+            ..
+        } = decision
+        {
+            assert_eq!(job_id, "lexical_refresh-1000-12345");
+            assert_eq!(phase.as_deref(), Some("scanning"));
+            assert_eq!(elapsed_ms, 5_000);
+        } else {
+            assert!(
+                matches!(decision, MaintenanceDecision::AttachOrWait { .. }),
+                "stale heartbeat still has an active lock, got {decision:?}"
+            );
+        }
     }
 
     #[test]
@@ -2896,6 +2986,45 @@ mod tests {
                 MaintenanceCoordinationOutcome::Active { .. }
             ),
             "expected ActiveJob on timeout"
+        );
+
+        let _ = FileExt::unlock(&owner);
+    }
+
+    #[test]
+    fn poll_times_out_instead_of_declaring_stale_held_lock_idle() {
+        use fs2::FileExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("index-run.lock");
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let owner = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .expect("open owner handle");
+        owner.try_lock_exclusive().expect("acquire lock");
+        std::fs::write(
+            &lock_path,
+            format!(
+                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-stale\njob_kind=lexical_refresh\nphase=scanning\n",
+                now_ms - 120_000,
+                now_ms - 120_000,
+            ),
+        )
+        .expect("write lock metadata");
+
+        let result = poll_maintenance_until_idle(
+            temp.path(),
+            Some(Duration::from_millis(150)),
+            Some(Duration::from_millis(25)),
+        );
+        assert!(result.timed_out, "held stale lock is still not idle");
+        assert!(
+            matches!(result.outcome, MaintenanceCoordinationOutcome::Stale { .. }),
+            "expected stale held lock on timeout, got {:?}",
+            result.outcome
         );
 
         let _ = FileExt::unlock(&owner);
@@ -2985,6 +3114,55 @@ mod tests {
                 MaintenanceDecision::AttachOrWait { .. }
             ),
             "without lexical must attach, got {decision_no_lexical:?}"
+        );
+
+        let _ = FileExt::unlock(&owner);
+    }
+
+    #[test]
+    fn failopen_handles_active_stale_heartbeat_without_launching_repair() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("index-run.lock");
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+
+        use fs2::FileExt;
+        let owner = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .expect("open owner handle");
+        owner.try_lock_exclusive().expect("acquire lock");
+        std::fs::write(
+            &lock_path,
+            format!(
+                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-stale-1\njob_kind=lexical_refresh\nphase=indexing\n",
+                now_ms - 120_000,
+                now_ms - 120_000,
+            ),
+        )
+        .expect("write lock metadata");
+
+        let decision = decide_search_failopen(temp.path(), now_ms, true);
+        if let MaintenanceDecision::FailOpen { ref reason } = decision {
+            assert!(reason.contains("fo-stale-1"), "reason={reason}");
+            assert!(reason.contains("stale heartbeat"), "reason={reason}");
+            assert!(reason.contains("failing open"), "reason={reason}");
+        } else {
+            assert!(
+                matches!(decision, MaintenanceDecision::FailOpen { .. }),
+                "expected FailOpen for searchable stale active lock, got {decision:?}"
+            );
+        }
+
+        let decision_no_lexical = decide_search_failopen(temp.path(), now_ms, false);
+        assert!(
+            matches!(
+                decision_no_lexical,
+                MaintenanceDecision::AttachOrWait { .. }
+            ),
+            "without lexical must wait for the held lock, got {decision_no_lexical:?}"
         );
 
         let _ = FileExt::unlock(&owner);
