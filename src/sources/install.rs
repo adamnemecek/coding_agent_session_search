@@ -379,8 +379,7 @@ impl RemoteInstaller {
         // 2. Try pre-built binary if available and compatible for this system.
         if let Some(url) = self.get_prebuilt_url() {
             // Attempt to fetch checksum (non-blocking - proceed without if unavailable)
-            let checksum_url = Self::get_checksum_url(&url);
-            let checksum = self.fetch_remote_checksum(&checksum_url);
+            let checksum = self.fetch_remote_prebuilt_checksum(&url);
             return Some(InstallMethod::PrebuiltBinary { url, checksum });
         }
 
@@ -490,38 +489,111 @@ impl RemoteInstaller {
         format!("{}.sha256", binary_url)
     }
 
+    fn prebuilt_asset_name(binary_url: &str) -> Option<String> {
+        let path = binary_url.split(['?', '#']).next().unwrap_or(binary_url);
+        let (_, name) = path.rsplit_once('/')?;
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    fn sibling_url(binary_url: &str, sibling_name: &str) -> Option<String> {
+        let base = binary_url.split(['?', '#']).next().unwrap_or(binary_url);
+        let (dir, _) = base.rsplit_once('/')?;
+        Some(format!("{dir}/{sibling_name}"))
+    }
+
+    fn checksum_urls_for_prebuilt(binary_url: &str) -> Vec<String> {
+        let mut urls = vec![Self::get_checksum_url(binary_url)];
+        if let Some(url) = Self::sibling_url(binary_url, "SHA256SUMS.txt") {
+            urls.push(url);
+        }
+        if let Some(url) = Self::sibling_url(binary_url, "SHA256SUMS") {
+            urls.push(url);
+        }
+        urls
+    }
+
+    fn checksum_url_is_aggregate(checksum_url: &str) -> bool {
+        Self::prebuilt_asset_name(checksum_url)
+            .is_some_and(|name| matches!(name.as_str(), "SHA256SUMS.txt" | "SHA256SUMS"))
+    }
+
     fn shell_quote_arg(value: &str) -> String {
         format!("'{}'", value.replace('\'', r#"'\''"#))
+    }
+
+    fn normalize_sha256_token(token: &str) -> Option<String> {
+        if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(token.to_lowercase())
+        } else {
+            None
+        }
+    }
+
+    fn parse_remote_checksum_output(output: &str, expected_asset: Option<&str>) -> Option<String> {
+        for line in output.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(candidate) = fields.next() else {
+                continue;
+            };
+            let Some(checksum) = Self::normalize_sha256_token(candidate) else {
+                continue;
+            };
+
+            let Some(expected_asset) = expected_asset else {
+                return Some(checksum);
+            };
+            let Some(asset_name) = fields.next() else {
+                continue;
+            };
+            if asset_name.trim_start_matches('*') == expected_asset {
+                return Some(checksum);
+            }
+        }
+
+        None
+    }
+
+    fn fetch_remote_prebuilt_checksum(&self, binary_url: &str) -> Option<String> {
+        let asset_name = Self::prebuilt_asset_name(binary_url)?;
+        for checksum_url in Self::checksum_urls_for_prebuilt(binary_url) {
+            let expected_asset = if Self::checksum_url_is_aggregate(&checksum_url) {
+                Some(asset_name.as_str())
+            } else {
+                None
+            };
+            if let Some(checksum) = self.fetch_remote_checksum(&checksum_url, expected_asset) {
+                return Some(checksum);
+            }
+        }
+
+        None
     }
 
     /// Fetch checksum from remote URL via SSH.
     ///
     /// Returns the SHA256 hex string if successful, None if checksum unavailable.
     /// This is non-blocking - if checksum can't be fetched, installation proceeds without verification.
-    fn fetch_remote_checksum(&self, checksum_url: &str) -> Option<String> {
+    fn fetch_remote_checksum(
+        &self,
+        checksum_url: &str,
+        expected_asset: Option<&str>,
+    ) -> Option<String> {
         // Use curl or wget to fetch the checksum file
         let checksum_url_arg = Self::shell_quote_arg(checksum_url);
         let fetch_cmd = if self.system_info.has_curl {
-            format!("curl -fsSL {checksum_url_arg} 2>/dev/null | head -1")
+            format!("curl -fsSL {checksum_url_arg} 2>/dev/null")
         } else if self.system_info.has_wget {
-            format!("wget -qO- {checksum_url_arg} 2>/dev/null | head -1")
+            format!("wget -qO- {checksum_url_arg} 2>/dev/null")
         } else {
             return None;
         };
 
         match self.run_ssh_command(&fetch_cmd, Duration::from_secs(10)) {
-            Ok(output) => {
-                // Parse checksum - format is either just the hash or "hash  filename"
-                let line = output.trim();
-                let checksum = line.split_whitespace().next().unwrap_or(line);
-
-                // Validate it looks like a SHA256 hex string (64 chars, all hex)
-                if checksum.len() == 64 && checksum.chars().all(|c| c.is_ascii_hexdigit()) {
-                    Some(checksum.to_lowercase())
-                } else {
-                    None
-                }
-            }
+            Ok(output) => Self::parse_remote_checksum_output(&output, expected_asset),
             Err(_) => None, // Checksum unavailable - proceed without verification
         }
     }
@@ -1591,6 +1663,62 @@ mod tests {
         assert_eq!(
             checksum_url,
             "https://github.com/example/repo/releases/download/v1.0.0/binary-linux-x86_64.sha256"
+        );
+    }
+
+    #[test]
+    fn test_checksum_urls_for_prebuilt_include_release_manifests() {
+        let binary_url =
+            "https://github.com/example/repo/releases/download/v1.0.0/cass-linux-amd64.tar.gz";
+
+        assert_eq!(
+            RemoteInstaller::checksum_urls_for_prebuilt(binary_url),
+            vec![
+                "https://github.com/example/repo/releases/download/v1.0.0/cass-linux-amd64.tar.gz.sha256",
+                "https://github.com/example/repo/releases/download/v1.0.0/SHA256SUMS.txt",
+                "https://github.com/example/repo/releases/download/v1.0.0/SHA256SUMS",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_remote_checksum_output_matches_expected_manifest_asset() {
+        let expected = "a".repeat(64);
+        let other = "b".repeat(64);
+        let manifest =
+            format!("{other}  cass-darwin-arm64.tar.gz\n{expected}  cass-linux-amd64.tar.gz\n");
+
+        assert_eq!(
+            RemoteInstaller::parse_remote_checksum_output(
+                &manifest,
+                Some("cass-linux-amd64.tar.gz")
+            ),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn test_parse_remote_checksum_output_rejects_wrong_manifest_asset() {
+        let other = "b".repeat(64);
+        let manifest = format!("{other}  cass-darwin-arm64.tar.gz\n");
+
+        assert_eq!(
+            RemoteInstaller::parse_remote_checksum_output(
+                &manifest,
+                Some("cass-linux-amd64.tar.gz")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_remote_checksum_output_accepts_per_file_checksum_line() {
+        let expected = "A".repeat(64);
+        let output = format!("{expected}  cass-linux-amd64.tar.gz\n");
+
+        assert_eq!(
+            RemoteInstaller::parse_remote_checksum_output(&output, None),
+            Some(expected.to_lowercase())
         );
     }
 
