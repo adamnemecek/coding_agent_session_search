@@ -1155,6 +1155,43 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_format_bytes_handles_large_and_invalid_values() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                globalThis.window = { location: { href: 'https://example.com/archive/index.html#/' } };
+                Object.defineProperty(globalThis, 'navigator', {
+                    value: { storage: {} },
+                    configurable: true,
+                    writable: true,
+                });
+
+                const { formatBytes } = await import('./src/pages_assets/storage.js');
+                const cases = [
+                    [0, '0 B'],
+                    [-1, '0 B'],
+                    [Number.NaN, '0 B'],
+                    [512, '512 B'],
+                    [1024, '1.0 KB'],
+                    [1024 ** 3, '1.0 GB'],
+                    [1024 ** 4, '1.0 TB'],
+                    [1024 ** 5, '1.0 PB'],
+                    [1024 ** 6, '1024.0 PB'],
+                ];
+
+                for (const [input, expected] of cases) {
+                    const actual = formatBytes(input);
+                    if (actual !== expected) {
+                        throw new Error(`formatBytes(${String(input)}) = ${actual}, expected ${expected}`);
+                    }
+                    if (actual.includes('undefined') || actual.includes('NaN')) {
+                        throw new Error(`formatBytes(${String(input)}) leaked invalid display text: ${actual}`);
+                    }
+                }
+            "#,
+        )
+    }
+
+    #[test]
     fn test_variable_virtual_list_coalesces_scroll_frames() -> Result<()> {
         run_node_module_assertions(
             r#"
