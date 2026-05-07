@@ -103,6 +103,75 @@ checksum_matches() {
   exit 1
 }
 
+archive_member_allowed() {
+  local member
+  member="${1#./}"
+
+  case "$member" in
+    cass|cass.exe|coding-agent-search) return 0 ;;
+  esac
+
+  if [ -n "$TARGET" ]; then
+    case "$member" in
+      "cass-${TARGET}"|"cass-${TARGET}/"|"cass-${TARGET}/cass"|"cass-${TARGET}/cass.exe") return 0 ;;
+    esac
+  fi
+
+  return 1
+}
+
+archive_member_is_installable_binary() {
+  local member
+  member="${1#./}"
+
+  case "$member" in
+    cass|cass.exe|coding-agent-search) return 0 ;;
+  esac
+
+  if [ -n "$TARGET" ]; then
+    case "$member" in
+      "cass-${TARGET}/cass"|"cass-${TARGET}/cass.exe") return 0 ;;
+    esac
+  fi
+
+  return 1
+}
+
+validate_archive_members() {
+  local archive="$1"
+  local member_list="$TMP/archive-members.txt"
+  local member
+  local saw_binary=0
+
+  case "$TAR" in
+    *.zip) unzip -Z1 "$archive" > "$member_list" ;;
+    *.tar.gz) tar -tzf "$archive" > "$member_list" ;;
+    *.tar.xz) tar -tJf "$archive" > "$member_list" ;;
+    *) tar -tf "$archive" > "$member_list" ;;
+  esac || { err "Could not list archive members"; exit 1; }
+
+  if [ ! -s "$member_list" ]; then
+    err "Archive is empty"
+    exit 1
+  fi
+
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    if ! archive_member_allowed "$member"; then
+      err "Unsafe archive member: $member"
+      exit 1
+    fi
+    if archive_member_is_installable_binary "$member"; then
+      saw_binary=1
+    fi
+  done < "$member_list"
+
+  if [ "$saw_binary" -ne 1 ]; then
+    err "Archive does not contain a cass binary"
+    exit 1
+  fi
+}
+
 resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
   local latest=""
@@ -342,6 +411,9 @@ fi
 
 checksum_matches "$TMP/$TAR" || { err "Checksum mismatch"; exit 1; }
 ok "Checksum verified"
+
+validate_archive_members "$TMP/$TAR"
+ok "Archive layout verified"
 
 info "Extracting"
 case "$TAR" in

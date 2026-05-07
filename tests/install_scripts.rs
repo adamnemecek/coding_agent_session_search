@@ -1,4 +1,5 @@
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -19,6 +20,32 @@ fn isolated_home() -> tempfile::TempDir {
     fs::write(home.path().join(".bashrc"), "").unwrap();
     fs::write(home.path().join(".zshrc"), "").unwrap();
     home
+}
+
+fn isolated_install_tmp_root() -> tempfile::TempDir {
+    tempfile::TempDir::new().expect("installer temp root")
+}
+
+fn install_sh_command(tmp_root: &tempfile::TempDir) -> Command {
+    let mut command = Command::new("bash");
+    command.arg("install.sh").env("TMPDIR", tmp_root.path());
+    command
+}
+
+fn file_sha256_hex(path: &std::path::Path) -> String {
+    let mut file = fs::File::open(path).expect("open file for sha256");
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = file.read(&mut buffer).expect("read file for sha256");
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(unix)]
@@ -116,8 +143,6 @@ fn handle_http_request(mut stream: TcpStream, routes: &BTreeMap<String, (Vec<u8>
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn install_sh_succeeds_with_valid_checksum() {
-    // Clean up any stale lock from previous runs (CI race condition mitigation)
-    let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
     let tar = fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let checksum = fs::read_to_string(
         "tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz.sha256",
@@ -127,9 +152,9 @@ fn install_sh_succeeds_with_valid_checksum() {
     .to_string();
     let dest = tempfile::TempDir::new().unwrap();
     let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
 
-    let status = Command::new("bash")
-        .arg("install.sh")
+    let status = install_sh_command(&tmp_root)
         .arg("--version")
         .arg("vtest")
         .arg("--dest")
@@ -152,15 +177,75 @@ fn install_sh_succeeds_with_valid_checksum() {
 #[test]
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
+fn install_sh_rejects_archive_path_traversal_before_extracting() {
+    let artifact_dir = tempfile::TempDir::new().unwrap();
+    let payload_dir = tempfile::TempDir::new().unwrap();
+    let payload_cass = payload_dir.path().join("cass");
+    make_executable_script(&payload_cass, "#!/bin/sh\necho fixture-linux\n");
+
+    let tar_path = artifact_dir.path().join("cass-linux-amd64.tar.gz");
+    let tar_status = Command::new("tar")
+        .arg("-czf")
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(payload_dir.path())
+        .arg("--transform")
+        .arg("s#^cass$#../pwned#")
+        .arg("cass")
+        .status()
+        .expect("create traversal tarball");
+    assert!(tar_status.success(), "test tarball should be created");
+
+    let checksum = file_sha256_hex(&tar_path);
+    let dest = tempfile::TempDir::new().unwrap();
+    let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
+
+    let output = install_sh_command(&tmp_root)
+        .arg("--version")
+        .arg("vtest")
+        .arg("--dest")
+        .arg(dest.path())
+        .arg("--easy-mode")
+        .env("HOME", home.path())
+        .env("ARTIFACT_URL", format!("file://{}", tar_path.display()))
+        .env("CHECKSUM", checksum)
+        .output()
+        .expect("run install.sh with traversal archive");
+
+    assert!(
+        !output.status.success(),
+        "install.sh should reject path traversal archive members"
+    );
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("Unsafe archive member: ../pwned"),
+        "installer should explain the rejected member, got: {combined_output}"
+    );
+    assert!(
+        !dest.path().join("cass").exists(),
+        "cass binary should not be installed from a rejected archive"
+    );
+    assert!(
+        !tmp_root.path().join("pwned").exists(),
+        "path traversal member should not be extracted into the temp root"
+    );
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(target_os = "linux"), ignore)]
 fn install_sh_fails_with_bad_checksum() {
-    // Clean up any stale lock from previous runs (CI race condition mitigation)
-    let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
     let tar = fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let dest = tempfile::TempDir::new().unwrap();
     let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
 
-    let status = Command::new("bash")
-        .arg("install.sh")
+    let status = install_sh_command(&tmp_root)
         .arg("--version")
         .arg("vtest")
         .arg("--dest")
@@ -186,7 +271,6 @@ fn install_sh_fails_with_bad_checksum() {
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn install_sh_falls_back_to_sha256sums_when_per_file_checksum_is_missing() {
-    let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
     let fixture_tar =
         fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let checksum = fs::read_to_string(
@@ -208,9 +292,9 @@ fn install_sh_falls_back_to_sha256sums_when_per_file_checksum_is_missing() {
     .unwrap();
     let dest = tempfile::TempDir::new().unwrap();
     let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
 
-    let output = Command::new("bash")
-        .arg("install.sh")
+    let output = install_sh_command(&tmp_root)
         .arg("--version")
         .arg("vtest")
         .arg("--dest")
@@ -233,7 +317,6 @@ fn install_sh_falls_back_to_sha256sums_when_per_file_checksum_is_missing() {
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn install_sh_falls_back_to_sha256sums_when_per_file_checksum_is_invalid() {
-    let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
     let fixture_tar =
         fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let checksum = fs::read_to_string(
@@ -260,9 +343,9 @@ fn install_sh_falls_back_to_sha256sums_when_per_file_checksum_is_invalid() {
     .unwrap();
     let dest = tempfile::TempDir::new().unwrap();
     let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
 
-    let output = Command::new("bash")
-        .arg("install.sh")
+    let output = install_sh_command(&tmp_root)
         .arg("--version")
         .arg("vtest")
         .arg("--dest")
@@ -285,7 +368,6 @@ fn install_sh_falls_back_to_sha256sums_when_per_file_checksum_is_invalid() {
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn install_sh_strips_query_suffixes_when_deriving_default_checksum_url() {
-    let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
     let tar = fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let checksum = fs::read_to_string(
         "tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz.sha256",
@@ -309,9 +391,9 @@ fn install_sh_strips_query_suffixes_when_deriving_default_checksum_url() {
     ]);
     let dest = tempfile::TempDir::new().unwrap();
     let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
 
-    let output = Command::new("bash")
-        .arg("install.sh")
+    let output = install_sh_command(&tmp_root)
         .arg("--version")
         .arg("vtest")
         .arg("--dest")
@@ -340,7 +422,6 @@ fn install_sh_strips_query_suffixes_when_deriving_default_checksum_url() {
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn install_sh_falls_back_to_shasum_when_sha256sum_fails() {
-    let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
     let tar = fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let checksum = fs::read_to_string(
         "tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz.sha256",
@@ -350,6 +431,7 @@ fn install_sh_falls_back_to_shasum_when_sha256sum_fails() {
     .to_string();
     let dest = tempfile::TempDir::new().unwrap();
     let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
     let tool_dir = tempfile::TempDir::new().unwrap();
     let sha256sum_fixture_path = tool_dir.path().join("sha256sum");
     make_executable_script(
@@ -363,8 +445,7 @@ fn install_sh_falls_back_to_shasum_when_sha256sum_fails() {
         std::env::var("PATH").expect("PATH should be set")
     );
 
-    let status = Command::new("bash")
-        .arg("install.sh")
+    let status = install_sh_command(&tmp_root)
         .arg("--version")
         .arg("vtest")
         .arg("--dest")
@@ -657,9 +738,6 @@ fn install_ps1_parses_local_aggregate_checksum_by_artifact_name() {
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn upgrade_replaces_existing_binary() {
-    // Clean up any stale lock from previous runs
-    let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
-
     let tar = fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let checksum = fs::read_to_string(
         "tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz.sha256",
@@ -669,6 +747,7 @@ fn upgrade_replaces_existing_binary() {
     .to_string();
     let dest = tempfile::TempDir::new().unwrap();
     let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
 
     // Step 1: Create a test "old" binary to simulate an existing installation
     let bin_path = dest.path().join("cass");
@@ -690,8 +769,7 @@ fn upgrade_replaces_existing_binary() {
     );
 
     // Step 2: Run the installer to "upgrade"
-    let status = Command::new("bash")
-        .arg("install.sh")
+    let status = install_sh_command(&tmp_root)
         .arg("--version")
         .arg("vtest")
         .arg("--dest")
@@ -729,9 +807,6 @@ fn upgrade_replaces_existing_binary() {
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn concurrent_installs_are_serialized() {
-    // Clean up any stale lock
-    let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
-
     let tar = fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let checksum = fs::read_to_string(
         "tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz.sha256",
@@ -743,12 +818,15 @@ fn concurrent_installs_are_serialized() {
     let dest2 = tempfile::TempDir::new().unwrap();
     let home1 = isolated_home();
     let home2 = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
+    let tmp_root_path = tmp_root.path().to_path_buf();
 
     // Spawn two concurrent installs
     let tar1 = tar.clone();
     let checksum1 = checksum.clone();
     let dest1_path = dest1.path().to_path_buf();
     let home1_path = home1.path().to_path_buf();
+    let tmp_root_path1 = tmp_root_path.clone();
 
     let handle1 = std::thread::spawn(move || {
         Command::new("bash")
@@ -759,6 +837,7 @@ fn concurrent_installs_are_serialized() {
             .arg(&dest1_path)
             .arg("--easy-mode")
             .env("HOME", home1_path)
+            .env("TMPDIR", tmp_root_path1)
             .env("ARTIFACT_URL", format!("file://{}", tar1.display()))
             .env("CHECKSUM", checksum1)
             .status()
@@ -771,6 +850,7 @@ fn concurrent_installs_are_serialized() {
     let checksum2 = checksum;
     let dest2_path = dest2.path().to_path_buf();
     let home2_path = home2.path().to_path_buf();
+    let tmp_root_path2 = tmp_root_path;
 
     let handle2 = std::thread::spawn(move || {
         Command::new("bash")
@@ -781,6 +861,7 @@ fn concurrent_installs_are_serialized() {
             .arg(&dest2_path)
             .arg("--easy-mode")
             .env("HOME", home2_path)
+            .env("TMPDIR", tmp_root_path2)
             .env("ARTIFACT_URL", format!("file://{}", tar2.display()))
             .env("CHECKSUM", checksum2)
             .status()
@@ -813,9 +894,6 @@ fn concurrent_installs_are_serialized() {
 #[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn verify_flag_runs_self_test() {
-    // Clean up any stale lock
-    let _ = std::fs::remove_dir_all("/tmp/coding-agent-search-install.lock.d");
-
     let tar = fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
     let checksum = fs::read_to_string(
         "tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz.sha256",
@@ -825,9 +903,9 @@ fn verify_flag_runs_self_test() {
     .to_string();
     let dest = tempfile::TempDir::new().unwrap();
     let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
 
-    let output = Command::new("bash")
-        .arg("install.sh")
+    let output = install_sh_command(&tmp_root)
         .arg("--version")
         .arg("vtest")
         .arg("--dest")
