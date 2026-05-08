@@ -211,8 +211,8 @@ fn budget_exhaustion(input: &QueryCostPlanInput) -> Option<BudgetExhaustion> {
         return Some(BudgetExhaustion {
             kind: BudgetExhaustionKind::Timeout,
             reason: format!(
-                "search reported partial results after timeout budget {:?}ms",
-                input.timeout_ms
+                "search reported partial results after timeout budget {}",
+                format_timeout_budget(input.timeout_ms)
             ),
         });
     }
@@ -220,8 +220,9 @@ fn budget_exhaustion(input: &QueryCostPlanInput) -> Option<BudgetExhaustion> {
         return Some(BudgetExhaustion {
             kind: BudgetExhaustionKind::TokenBudget,
             reason: format!(
-                "output was clamped to max_tokens={:?} after estimating {:?} tokens",
-                input.max_tokens, input.tokens_estimated
+                "output was clamped to max_tokens={} after estimating {} tokens",
+                format_optional_usize(input.max_tokens),
+                format_optional_usize(input.tokens_estimated)
             ),
         });
     }
@@ -299,8 +300,8 @@ fn semantic_reason(input: &QueryCostPlanInput, realized: bool) -> String {
         "semantic phase realized for semantic or hybrid search".to_string()
     } else if let Some(reason) = &input.fallback_reason {
         format!(
-            "semantic phase planned but fell back to {:?}: {reason}",
-            input.fallback_tier
+            "semantic phase planned but fell back to {}: {reason}",
+            input.fallback_tier.as_deref().unwrap_or("unknown")
         )
     } else if input.requested_mode == "lexical" {
         "semantic phase not planned for lexical mode".to_string()
@@ -312,8 +313,9 @@ fn semantic_reason(input: &QueryCostPlanInput, realized: bool) -> String {
 fn output_reason(input: &QueryCostPlanInput) -> String {
     if input.hits_clamped {
         format!(
-            "projection {} was clamped by max_tokens={:?}",
-            input.output_projection, input.max_tokens
+            "projection {} was clamped by max_tokens={}",
+            input.output_projection,
+            format_optional_usize(input.max_tokens)
         )
     } else {
         format!(
@@ -321,6 +323,18 @@ fn output_reason(input: &QueryCostPlanInput) -> String {
             input.output_projection, input.returned_count
         )
     }
+}
+
+fn format_timeout_budget(timeout_ms: Option<u64>) -> String {
+    timeout_ms
+        .map(|timeout_ms| format!("{timeout_ms}ms"))
+        .unwrap_or_else(|| "unspecified".to_string())
+}
+
+fn format_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unspecified".to_string())
 }
 
 #[cfg(test)]
@@ -394,6 +408,15 @@ mod tests {
                 .reason
                 .contains("max_tokens")
         );
+        let budget_reason = &plan
+            .budget_exhaustion
+            .as_ref()
+            .expect("budget exhaustion")
+            .reason;
+        assert!(
+            !budget_reason.contains("Some(") && !budget_reason.contains("None"),
+            "robot metadata reason must not leak Rust Option debug syntax: {budget_reason}"
+        );
     }
 
     #[test]
@@ -413,7 +436,13 @@ mod tests {
             .expect("semantic phase");
         assert!(semantic.planned);
         assert!(!semantic.realized);
+        assert!(semantic.reason.contains("fell back to lexical"));
         assert!(semantic.reason.contains("semantic assets unavailable"));
+        assert!(
+            !semantic.reason.contains("Some(") && !semantic.reason.contains("None"),
+            "robot metadata reason must not leak Rust Option debug syntax: {}",
+            semantic.reason
+        );
     }
 
     #[test]
