@@ -308,11 +308,19 @@ fn has_dot_components(path: &Path) -> bool {
 }
 
 fn validate_ssh_host(host: &str) -> Result<(), ConfigError> {
-    let host = host.trim();
+    let trimmed = host.trim();
 
-    if host.is_empty() {
+    if trimmed.is_empty() {
         return Err(ConfigError::Validation("SSH host cannot be empty".into()));
     }
+
+    if trimmed != host {
+        return Err(ConfigError::Validation(
+            "SSH host cannot have leading or trailing whitespace".into(),
+        ));
+    }
+
+    let host = trimmed;
 
     if host.starts_with('-') {
         return Err(ConfigError::Validation(
@@ -1457,6 +1465,9 @@ mod tests {
         assert!(source.validate().is_err());
 
         for host in [
+            " user@host",
+            "user@host ",
+            "\tuser@host",
             "user@host;touch /tmp/cass-owned",
             "user@host`hostname`",
             "user@host$(hostname)",
