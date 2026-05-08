@@ -5,8 +5,11 @@
 #
 # Usage:
 #   ./scripts/migration_e2e_validate.sh           # Run all checks
-#   ./scripts/migration_e2e_validate.sh --local    # Build locally (no rch)
 #   ./scripts/migration_e2e_validate.sh --quick    # Skip benchmarks and slow checks
+#
+# Environment:
+#   RCH_BIN         rch executable (default: rch)
+#   RCH_TARGET_DIR  cargo target dir for offloaded validation commands
 #
 # Exit code: 0 if all pass, 1 if any fail.
 
@@ -21,6 +24,8 @@ CASS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FS_ROOT="/data/projects/frankensearch"
 FAD_ROOT="/data/projects/franken_agent_detection"
 BASELINE_DIR="${CASS_ROOT}/docs/artifacts/migration-baseline"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_migration_e2e_validate}"
 
 # Colors (only when stdout is a terminal)
 if [[ -t 1 ]]; then
@@ -35,17 +40,19 @@ else
 fi
 
 # Options
-USE_RCH=1
 QUICK_MODE=0
 for arg in "$@"; do
     case "$arg" in
-        --local) USE_RCH=0 ;;
         --quick) QUICK_MODE=1 ;;
         --help)
-            echo "Usage: $0 [--local] [--quick]"
-            echo "  --local    Build locally (no rch)"
+            echo "Usage: $0 [--quick]"
+            echo "  --local    Unsupported; agent builds must use rch"
             echo "  --quick    Skip benchmarks and slow checks"
             exit 0
+            ;;
+        --local)
+            echo "Error: --local is unsupported; migration validation cargo commands must be offloaded through rch" >&2
+            exit 2
             ;;
     esac
 done
@@ -98,11 +105,11 @@ warn() {
 }
 
 cargo_cmd() {
-    if [[ "$USE_RCH" -eq 1 ]]; then
-        rch exec -- cargo "$@"
-    else
-        cargo "$@"
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        echo "Error: rch is required for offloaded Cargo execution" >&2
+        return 127
     fi
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
 }
 
 elapsed_since() {
@@ -387,7 +394,7 @@ else
 fi
 
 # Check: default build should NOT have rusqlite or aes-gcm
-FAD_DEFAULT_DEPS=$(cd "$FAD_ROOT" && cargo tree --no-dedupe --depth 1 2>/dev/null || echo "")
+FAD_DEFAULT_DEPS=$(cd "$FAD_ROOT" && cargo_cmd tree --no-dedupe --depth 1 2>/dev/null || echo "")
 if echo "$FAD_DEFAULT_DEPS" | grep -qi "rusqlite"; then
     fail "FAD default: rusqlite present in dep tree (should be optional)"
 else
