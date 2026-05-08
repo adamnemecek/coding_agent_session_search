@@ -1411,15 +1411,7 @@ fn rendered_answer_pack(
         &request.readiness.source_sync_gaps,
         &mut envelope_redactions,
     );
-    let stale_evidence_count = evidence
-        .iter()
-        .filter(|item| {
-            !matches!(
-                item.citation_source_readiness(),
-                PackSourceReadiness::Healthy
-            )
-        })
-        .count();
+    let stale_evidence_count = stale_evidence_count(&evidence, request);
     let redacted_count = plan
         .omitted
         .iter()
@@ -2005,6 +1997,24 @@ fn rendered_source_sync_gaps(
         .collect()
 }
 
+fn stale_evidence_count(evidence: &[RenderedEvidence], request: &PackRenderRequest) -> usize {
+    evidence
+        .iter()
+        .filter(|item| evidence_is_stale(item, request))
+        .count()
+}
+
+fn evidence_is_stale(item: &RenderedEvidence, request: &PackRenderRequest) -> bool {
+    let Some(created_at_ms) = item.citation.created_at_ms else {
+        return !matches!(request.freshness_policy, PackFreshnessPolicy::AllowStale);
+    };
+    let window_ms = request
+        .freshness_window_seconds
+        .max(1)
+        .saturating_mul(1_000);
+    request.generated_at_ms.saturating_sub(created_at_ms).max(0) > window_ms
+}
+
 impl RenderedEvidence {
     fn citation_source_readiness(&self) -> PackSourceReadiness {
         if !self.citation.verified {
@@ -2530,8 +2540,34 @@ mod tests {
             value["health"]["source_readiness"][0]["readiness"],
             "stale_readable"
         );
-        assert_eq!(value["freshness"]["stale_evidence_count"], 1);
+        assert_eq!(value["freshness"]["stale_evidence_count"], 0);
         assert_eq!(value["pack"]["source_summary"][0]["healthy"], false);
+    }
+
+    #[test]
+    fn render_stale_evidence_count_uses_age_not_source_readiness() {
+        let mut old_healthy = candidate("old-healthy", "local", "/s/old.jsonl", 10.0);
+        old_healthy.created_at_ms = Some(999_999);
+        let mut recent_stale_source =
+            candidate("recent-stale-source", "remote", "/s/recent.jsonl", 9.0);
+        recent_stale_source.created_at_ms = Some(1_060_000);
+        recent_stale_source.source_readiness = PackSourceReadiness::StaleReadable;
+
+        let plan = plan_answer_pack(request(vec![old_healthy, recent_stale_source])).unwrap();
+        let req = render_request(PackRenderFormat::Json);
+
+        let value = render_answer_pack_value(&plan, &req).unwrap();
+
+        assert_eq!(value["freshness"]["window_seconds"], 60);
+        assert_eq!(value["freshness"]["stale_evidence_count"], 1);
+        assert_eq!(value["health"]["healthy"], false);
+        assert!(
+            value["health"]["source_readiness"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|source| source["readiness"] == "stale_readable")
+        );
     }
 
     #[test]
