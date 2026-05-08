@@ -38,6 +38,8 @@ VERBOSE=${VERBOSE:-0}
 USE_NEXTEST=${USE_NEXTEST:-1}
 FAIL_FAST=${FAIL_FAST:-0}
 INCLUDE_MASTER=${INCLUDE_MASTER:-0}
+RCH_BIN=${RCH_BIN:-rch}
+RCH_TARGET_DIR=${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_pages_e2e}
 
 # =============================================================================
 # Logging Functions
@@ -85,12 +87,23 @@ log_section() {
 # Test Runner Functions
 # =============================================================================
 
+ensure_rch() {
+    if ! command -v "$RCH_BIN" &> /dev/null; then
+        log ERROR "rch binary not found; pages E2E cargo tests must be offloaded"
+        return 1
+    fi
+}
+
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
+
 check_nextest() {
     if [[ $USE_NEXTEST -eq 1 ]]; then
-        if command -v cargo-nextest &> /dev/null || cargo nextest --version &> /dev/null 2>&1; then
+        if run_cargo nextest --version > /dev/null 2>&1; then
             return 0
         else
-            log WARN "cargo-nextest not found, falling back to cargo test"
+            log WARN "cargo-nextest unavailable through rch, falling back to rch cargo test"
             USE_NEXTEST=0
             return 1
         fi
@@ -114,7 +127,7 @@ run_pages_e2e_tests() {
         log INFO "Running $test_file..."
 
         if [[ $USE_NEXTEST -eq 1 ]]; then
-            if cargo nextest run --profile e2e -E "binary($test_file)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
+            if run_cargo nextest run --profile e2e -E "binary($test_file)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
                 log INFO "  $test_file PASSED"
                 echo "{\"test_file\":\"$test_file\",\"status\":\"PASS\"}" >> "$JSON_LOG_FILE"
             else
@@ -124,7 +137,7 @@ run_pages_e2e_tests() {
                 [[ $FAIL_FAST -eq 1 ]] && break
             fi
         else
-            if cargo test --test "$test_file" --color=always -- --nocapture 2>&1 | tee -a "$LOG_FILE"; then
+            if run_cargo test --test "$test_file" --color=always -- --nocapture 2>&1 | tee -a "$LOG_FILE"; then
                 log INFO "  $test_file PASSED"
                 echo "{\"test_file\":\"$test_file\",\"status\":\"PASS\"}" >> "$JSON_LOG_FILE"
             else
@@ -154,7 +167,7 @@ run_pages_accessibility_tests() {
     log_section "Pages Accessibility Tests"
 
     if [[ $USE_NEXTEST -eq 1 ]]; then
-        if cargo nextest run --profile ci -E "binary(pages_accessibility_e2e)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo nextest run --profile ci -E "binary(pages_accessibility_e2e)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "Accessibility tests PASSED"
             return 0
         else
@@ -162,7 +175,7 @@ run_pages_accessibility_tests() {
             return 1
         fi
     else
-        if cargo test --test pages_accessibility_e2e --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo test --test pages_accessibility_e2e --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "Accessibility tests PASSED"
             return 0
         else
@@ -176,7 +189,7 @@ run_pages_error_handling_tests() {
     log_section "Pages Error Handling Tests"
 
     if [[ $USE_NEXTEST -eq 1 ]]; then
-        if cargo nextest run --profile ci -E "binary(pages_error_handling_e2e)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo nextest run --profile ci -E "binary(pages_error_handling_e2e)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "Error handling tests PASSED"
             return 0
         else
@@ -184,7 +197,7 @@ run_pages_error_handling_tests() {
             return 1
         fi
     else
-        if cargo test --test pages_error_handling_e2e --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo test --test pages_error_handling_e2e --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "Error handling tests PASSED"
             return 0
         else
@@ -208,7 +221,7 @@ Options:
   -v, --verbose       Verbose output (set RUST_LOG=debug)
   --fail-fast         Stop on first failure
   --include-master    Include master E2E tests (slower)
-  --no-nextest        Use cargo test instead of nextest
+  --no-nextest        Use rch cargo test instead of rch cargo nextest
   -h, --help          Show this help
 
 Environment Variables:
@@ -216,6 +229,8 @@ Environment Variables:
   FAIL_FAST=1         Same as --fail-fast
   INCLUDE_MASTER=1    Same as --include-master
   USE_NEXTEST=0       Same as --no-nextest
+  RCH_BIN=rch         Remote compilation helper binary
+  RCH_TARGET_DIR=...  Remote Cargo target dir (default: \${TMPDIR:-/tmp}/rch_target_cass_pages_e2e)
 
 Output:
   Text log: test-logs/pages_e2e_TIMESTAMP.log
@@ -245,17 +260,20 @@ main() {
     log INFO "Log directory: $LOG_DIR"
     log INFO "Timestamp: $TIMESTAMP"
 
+    cd "$PROJECT_ROOT"
+    ensure_rch || exit 1
+    log INFO "RCH binary: $RCH_BIN"
+    log INFO "RCH target dir: $RCH_TARGET_DIR"
+
     # Check for nextest
     check_nextest
-    log INFO "Test runner: $([ $USE_NEXTEST -eq 1 ] && echo 'cargo-nextest' || echo 'cargo test')"
+    log INFO "Test runner: $([ "$USE_NEXTEST" -eq 1 ] && echo 'rch cargo-nextest' || echo 'rch cargo test')"
 
     # Set verbose logging if requested
     if [[ $VERBOSE -eq 1 ]]; then
         export RUST_LOG=debug
         log INFO "Verbose logging enabled"
     fi
-
-    cd "$PROJECT_ROOT"
 
     # Track total results
     local failed=0
