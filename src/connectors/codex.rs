@@ -5,8 +5,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{
-    Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, NormalizedMessage,
-    ScanContext, extract_invocations_from_content_blocks, parse_timestamp, reindex_messages,
+    parse_timestamp, reindex_messages, Connector, DetectionResult, DiscoveredSourceFile,
+    NormalizedConversation, NormalizedMessage, ScanContext,
 };
 
 const MAX_INDEXED_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
@@ -137,9 +137,10 @@ fn response_item_message(
                 created_at,
                 content,
                 raw.clone(),
-                payload
-                    .get("content")
-                    .map_or_else(Vec::new, extract_invocations_from_content_blocks),
+                payload.get("content").map_or_else(
+                    Vec::new,
+                    franken_agent_detection::extract_invocations_from_content_blocks,
+                ),
             ))
         }
         Some("function_call") => {
