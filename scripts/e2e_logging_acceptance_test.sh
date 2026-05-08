@@ -37,6 +37,13 @@ while [[ $# -gt 0 ]]; do
             QUICK_MODE=true
             shift
             ;;
+        --help|-h)
+            echo "Usage: $0 [--quick]"
+            echo ""
+            echo "Options:"
+            echo "  --quick    Run quick validation only (skip full test run, use existing logs)"
+            exit 0
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -168,7 +175,14 @@ echo "Step 2: Verifying JSONL files created..."
 JSONL_FILES=()
 while IFS= read -r -d '' file; do
     JSONL_FILES+=("$file")
-done < <(find "$TEST_RESULTS_DIR" -type f \( -name "*.jsonl" -o -name "cass.log" \) ! -name "trace.jsonl" ! -name "combined.jsonl" -print0 2>/dev/null | sort -z)
+done < <(
+    find "$TEST_RESULTS_DIR" \
+        -type f \( -name "*.jsonl" -o -name "cass.log" \) \
+        ! -name "trace.jsonl" \
+        ! -name "combined.jsonl" \
+        ! -path "$TEST_RESULTS_DIR/.previous/*" \
+        -print0 2>/dev/null | sort -z
+)
 
 JSONL_COUNT=${#JSONL_FILES[@]}
 if [[ "$JSONL_COUNT" -eq 0 ]]; then
