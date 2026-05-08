@@ -61,6 +61,36 @@ run_cargo() {
     "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
 }
 
+archive_prior_logs() {
+    local run_id="$1"
+    local archive_dir="$TEST_RESULTS_DIR/.previous/$run_id"
+    local moved=0
+
+    mkdir -p "$TEST_RESULTS_DIR"
+    while IFS= read -r -d '' file; do
+        local rel="${file#"$TEST_RESULTS_DIR"/}"
+        local dest="$archive_dir/$rel"
+        if [[ -e "$dest" ]]; then
+            echo "Error: refusing to overwrite archived log: $dest"
+            exit 1
+        fi
+        mkdir -p "$(dirname "$dest")"
+        mv "$file" "$dest"
+        moved=$((moved + 1))
+    done < <(
+        find "$TEST_RESULTS_DIR" \
+            -type f \( -name "*.jsonl" -o -name "cass.log" \) \
+            ! -name "trace.jsonl" \
+            ! -name "combined.jsonl" \
+            ! -path "$TEST_RESULTS_DIR/.previous/*" \
+            -print0 2>/dev/null
+    )
+
+    if [[ "$moved" -gt 0 ]]; then
+        echo "Archived $moved existing log file(s) under $archive_dir"
+    fi
+}
+
 echo "=== E2E Logging Acceptance Test ==="
 echo "This test verifies the entire E2E logging system works correctly."
 echo ""
@@ -107,11 +137,10 @@ generate_run_event() {
 RUN_LOG="$TEST_RESULTS_DIR/acceptance_run.jsonl"
 if [[ "$QUICK_MODE" == false ]]; then
     echo "Step 1: Running E2E tests with logging enabled..."
-    rm -rf "$TEST_RESULTS_DIR"/*.jsonl "$TEST_RESULTS_DIR"/**/cass.log 2>/dev/null || true
-    mkdir -p "$TEST_RESULTS_DIR"
 
     # Generate a unique run ID
     RUN_ID="acceptance_$(date +%Y%m%d_%H%M%S)_$(head -c 6 /dev/urandom | xxd -p)"
+    archive_prior_logs "$RUN_ID"
 
     # Emit run_start event
     generate_run_event "run_start" "$RUN_ID" > "$RUN_LOG"
