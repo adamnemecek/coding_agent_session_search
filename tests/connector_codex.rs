@@ -216,6 +216,59 @@ fn codex_connector_parses_real_tool_call_fixture() {
 
 #[test]
 #[serial]
+fn codex_connector_indexes_modern_response_items() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2026/05/08");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-modern.jsonl");
+
+    let sample = r#"{"timestamp":"2026-05-08T23:09:00.000Z","type":"session_meta","payload":{"id":"modern-id","cwd":"/data/projects/ntm","cli_version":"0.49.0"}}
+{"timestamp":"2026-05-08T23:09:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"investigate cass"}]}}
+{"timestamp":"2026-05-08T23:09:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"git log --grep='bd-2mb03'\"}","call_id":"call-modern-1"}}
+{"timestamp":"2026-05-08T23:09:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-modern-1","output":"Output:\ncommit abc123 bd-2mb03.6.5 add CASS-backed handoff context enrichment\n"}}
+{"timestamp":"2026-05-08T23:09:04.000Z","type":"event_msg","payload":{"type":"agent_message","message":"The raw session contains bd-2mb03."}}
+{"timestamp":"2026-05-08T23:09:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The raw session contains bd-2mb03."}],"phase":"commentary"}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let conv = &convs[0];
+    assert!(
+        conv.messages
+            .iter()
+            .any(|message| message.content.contains("git log --grep='bd-2mb03'")),
+        "function_call arguments should be searchable"
+    );
+    assert!(
+        conv.messages
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("bd-2mb03.6.5")),
+        "function_call_output text should be searchable"
+    );
+    assert_eq!(
+        conv.messages
+            .iter()
+            .filter(|message| message.content == "The raw session contains bd-2mb03.")
+            .count(),
+        1,
+        "agent_message and output_text duplicates should collapse to one searchable message"
+    );
+}
+
+#[test]
+#[serial]
 fn codex_connector_ignores_unmatched_token_count() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/23");
