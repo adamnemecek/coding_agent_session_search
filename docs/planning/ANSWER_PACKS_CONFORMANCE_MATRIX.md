@@ -22,7 +22,7 @@ a proxy signal.
 | Health, freshness, and source readiness | 15 | 0 | 0 | 0 | 0 | 0/15 |
 | Privacy and redaction | 19 | 0 | 0 | 0 | 0 | 0/19 |
 | Error envelopes and output formats | 24 | 0 | 0 | 0 | 0 | 0/24 |
-| Implementation boundaries | 6 | 0 | 0 | 0 | 0 | 0/6 |
+| Implementation boundaries | 10 | 0 | 0 | 0 | 0 | 0/10 |
 | Required verification commands | 6 | 0 | 0 | 0 | 0 | 0/6 |
 
 ## Requirement Matrix
@@ -100,6 +100,10 @@ a proxy signal.
 | AP-BOUND-003 | MUST | Implementation Boundaries | New SQLite access uses frankensqlite only. | `rg "rusqlite"` delta check plus review. | Planned |
 | AP-BOUND-004 | MUST | Implementation Boundaries | Session spans are read through existing view/expand-style helpers where possible. | Citation resolution integration test. | Planned |
 | AP-BOUND-005 | MUST | Implementation Boundaries | Pack does not mutate source logs, indexes, quarantine directories, or health state. | No-mock fixture snapshots source/index metadata before and after. | Planned |
+| AP-BOUND-006 | MUST | Non-Goals | Pack does not call external LLMs or rewrite evidence into model-generated summaries. | Code-path audit plus fixture proving pack output is derived from selected evidence only. | Planned |
+| AP-BOUND-007 | MUST | Non-Goals | Pack never auto-downloads semantic models; missing models must use truthful lexical fallback or semantic errors. | Missing-model fixture that checks no model artifact is created and no acquisition path runs. | Planned |
+| AP-BOUND-008 | MUST | Non-Goals | Pack does not run hidden `doctor --fix`, manual index repair, or quarantine garbage collection. | State-snapshot integration test around pack execution. | Planned |
+| AP-BOUND-009 | MUST | Non-Goals | Pack does not delete or clean up derived assets while preparing output. | State-snapshot integration test covering index, quarantine, and publish-backup directories. | Planned |
 | AP-GATE-001 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo fmt --check` is part of closeout. | Implementation closeout evidence. | Planned |
 | AP-GATE-002 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo check --all-targets` is part of closeout. | Implementation closeout evidence. | Planned |
 | AP-GATE-003 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-answer-pack-target cargo clippy --all-targets -- -D warnings` is part of closeout. | Implementation closeout evidence. | Planned |
