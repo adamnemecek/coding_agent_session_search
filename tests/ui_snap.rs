@@ -10,6 +10,32 @@ use coding_agent_search::ui::components::theme::{ThemePalette, ThemePreset};
 use ftui::StyleFlags;
 use ftui::render::cell::PackedRgba;
 
+const AGENT_PANE_WCAG_SUBJECTS: &[&str] = &[
+    "claude_code",
+    "claude",
+    "codex",
+    "factory",
+    "cline",
+    "gemini",
+    "gemini_cli",
+    "amp",
+    "aider",
+    "cursor",
+    "chatgpt",
+    "opencode",
+    "pi_agent",
+    "clawdbot",
+    "vibe",
+    "mistral",
+    "openclaw",
+    "copilot",
+    "copilot_cli",
+    "crush",
+    "kimi",
+    "qwen",
+    "unknown",
+];
+
 #[test]
 fn cli_shows_help() {
     let mut cmd = cargo_bin_cmd!("cass");
@@ -827,23 +853,7 @@ fn role_colors_are_wcag_readable() {
 #[test]
 fn agent_pane_text_meets_wcag_aa() {
     // Test all agent pane backgrounds have sufficient contrast with primary text
-    let agents = [
-        "claude_code",
-        "claude",
-        "codex",
-        "cline",
-        "gemini",
-        "gemini_cli",
-        "amp",
-        "aider",
-        "cursor",
-        "chatgpt",
-        "opencode",
-        "pi_agent",
-        "unknown",
-    ];
-
-    for agent in agents {
+    for agent in AGENT_PANE_WCAG_SUBJECTS {
         let pane = ThemePalette::agent_pane(agent);
         let level = check_contrast(pane.fg, pane.bg);
         assert!(
@@ -859,20 +869,7 @@ fn agent_pane_text_meets_wcag_aa() {
 #[test]
 fn agent_pane_accent_meets_wcag_aa_large() {
     // Test agent pane accent colors meet at least AA-large
-    let agents = [
-        "claude_code",
-        "codex",
-        "cline",
-        "gemini",
-        "amp",
-        "aider",
-        "cursor",
-        "chatgpt",
-        "opencode",
-        "pi_agent",
-    ];
-
-    for agent in agents {
+    for agent in AGENT_PANE_WCAG_SUBJECTS {
         let pane = ThemePalette::agent_pane(agent);
         let level = check_contrast(pane.accent, pane.bg);
         assert!(
