@@ -21,6 +21,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LOG_FILE="$SCRIPT_DIR/cass_rerank_results.log"
 VERBOSE="${1:-}"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_cass_rerank_e2e}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -29,7 +31,8 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 log() {
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    local msg
+    msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
     echo -e "$msg" | tee -a "$LOG_FILE"
 }
 
@@ -58,7 +61,7 @@ log "CASS Reranker E2E Test - $(date)"
 log "=========================================="
 
 # Check if cass binary exists
-CASS_BIN="${PROJECT_ROOT}/target/release/cass"
+CASS_BIN="${CASS_BIN:-${PROJECT_ROOT}/target/release/cass}"
 if [[ ! -f "$CASS_BIN" ]]; then
     CASS_BIN="${PROJECT_ROOT}/target/debug/cass"
 fi
@@ -67,7 +70,7 @@ if [[ ! -f "$CASS_BIN" ]]; then
 fi
 
 if [[ -z "$CASS_BIN" || ! -f "$CASS_BIN" ]]; then
-    log_fail "cass binary not found. Build with: cargo build --release"
+    log_fail "cass binary not found. Build via rch, then rerun this script with CASS_BIN=/path/to/cass"
     exit 1
 fi
 
@@ -94,6 +97,7 @@ TEST_QUERIES=(
 
 TOTAL_TESTS=0
 PASSED_TESTS=0
+CRITICAL_FAILURES=0
 
 # Test 1: Basic rerank flag parsing
 log ""
@@ -104,7 +108,8 @@ if $CASS_BIN search --help 2>&1 | grep -q "rerank"; then
     log_success "rerank flag is present in CLI help"
     PASSED_TESTS=$((PASSED_TESTS + 1))
 else
-    log_warn "rerank flag not yet implemented in CLI (expected during development)"
+    log_fail "rerank flag is missing from CLI help"
+    CRITICAL_FAILURES=$((CRITICAL_FAILURES + 1))
 fi
 
 # Test 2: Search without rerank (baseline)
@@ -136,11 +141,18 @@ log "Test 3: Search with rerank"
 TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
 START_TIME=$(date +%s%N)
-RERANK_RESULT=$($CASS_BIN search "$QUERY" --limit 20 --rerank --json 2>/dev/null || echo '{"error":"not implemented"}')
+set +e
+RERANK_RESULT=$($CASS_BIN search "$QUERY" --limit 20 --rerank --json 2>>"$LOG_FILE")
+RERANK_STATUS=$?
+set -e
 END_TIME=$(date +%s%N)
 RERANK_LATENCY=$(( (END_TIME - START_TIME) / 1000000 ))
 
-if echo "$RERANK_RESULT" | jq -e '.hits' &>/dev/null; then
+if [[ "$RERANK_STATUS" -ne 0 ]]; then
+    log_fail "Rerank search command failed with exit $RERANK_STATUS"
+    log_verbose "Response: $RERANK_RESULT"
+    CRITICAL_FAILURES=$((CRITICAL_FAILURES + 1))
+elif echo "$RERANK_RESULT" | jq -e '.hits' &>/dev/null; then
     RERANK_COUNT=$(echo "$RERANK_RESULT" | jq '.hits | length')
     log "Results: $RERANK_COUNT hits"
     log "Latency: ${RERANK_LATENCY}ms"
@@ -156,8 +168,9 @@ if echo "$RERANK_RESULT" | jq -e '.hits' &>/dev/null; then
         log_warn "Rerank latency exceeds 100ms target"
     fi
 else
-    log_warn "Rerank not yet implemented or failed"
+    log_fail "Rerank search did not produce robot JSON hits"
     log_verbose "Response: $RERANK_RESULT"
+    CRITICAL_FAILURES=$((CRITICAL_FAILURES + 1))
 fi
 
 # Test 4: Reranker trait unit tests
@@ -166,22 +179,28 @@ log "Test 4: Reranker trait unit tests"
 TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
 cd "$PROJECT_ROOT"
-if cargo test reranker:: --quiet 2>&1 | grep -q "passed"; then
-    TEST_OUTPUT=$(cargo test reranker:: 2>&1 | tail -5)
+TEST_STATUS=1
+TEST_OUTPUT=""
+if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+    log_fail "rch binary not found; reranker unit tests must be offloaded"
+    CRITICAL_FAILURES=$((CRITICAL_FAILURES + 1))
+else
+    set +e
+    TEST_OUTPUT=$("$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo test reranker:: --lib -- --nocapture 2>&1)
+    TEST_STATUS=$?
+    set -e
     log_verbose "$TEST_OUTPUT"
+fi
+
+if [[ "$TEST_STATUS" -eq 0 ]] && echo "$TEST_OUTPUT" | grep -q "test result: ok"; then
     log_success "Reranker unit tests passed"
     PASSED_TESTS=$((PASSED_TESTS + 1))
 else
-    # Try to get more info
-    TEST_OUTPUT=$(cargo test reranker:: 2>&1 | tail -10)
-    if echo "$TEST_OUTPUT" | grep -q "0 passed"; then
+    if echo "$TEST_OUTPUT" | grep -q "running 0 tests"; then
         log_warn "No reranker tests found (may still be compiling)"
-    elif echo "$TEST_OUTPUT" | grep -q "FAILED"; then
-        log_fail "Reranker unit tests failed"
-        log_verbose "$TEST_OUTPUT"
     else
-        log_warn "Unable to determine test status"
-        log_verbose "$TEST_OUTPUT"
+        log_fail "Reranker unit tests failed or status could not be determined"
+        CRITICAL_FAILURES=$((CRITICAL_FAILURES + 1))
     fi
 fi
 
@@ -192,10 +211,10 @@ log "Summary: $PASSED_TESTS/$TOTAL_TESTS tests passed"
 log "=========================================="
 
 # Exit code based on critical tests
-if [[ "$PASSED_TESTS" -ge 2 ]]; then
+if [[ "$CRITICAL_FAILURES" -eq 0 && "$PASSED_TESTS" -ge 2 ]]; then
     log_success "Core reranker functionality verified"
     exit 0
 else
-    log_fail "Critical tests failed"
+    log_fail "Critical tests failed ($CRITICAL_FAILURES critical failures, $PASSED_TESTS/$TOTAL_TESTS passed)"
     exit 1
 fi
