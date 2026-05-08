@@ -205,13 +205,13 @@ All console output should be **informative, detailed, stylish, and colorful** by
 
 ```bash
 # Check for compiler errors and warnings
-cargo check --all-targets
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo check --all-targets
 
 # Check for clippy lints
-cargo clippy --all-targets -- -D warnings
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo clippy --all-targets -- -D warnings
 
 # Verify formatting
-cargo fmt --check
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo fmt --check
 ```
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
@@ -320,16 +320,16 @@ Integration and E2E tests live in the `tests/` directory. Benchmarks live in `be
 
 ```bash
 # Run all tests
-cargo test
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test
 
 # Run with output
-cargo test -- --nocapture
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test -- --nocapture
 
 # Run a specific test
-cargo test test_name
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test test_name
 
 # Run tests with all features enabled
-cargo test --all-features
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-target cargo test --all-features
 ```
 
 ### Test Categories
@@ -939,13 +939,13 @@ Parse: `file:line:col` -> location | Suggested fix -> how to fix | Exit 0/1 -> p
 
 RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
 
-**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
+**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently. Codex, Gemini, and other agents without that hook must use explicit `rch exec -- env CARGO_TARGET_DIR=... cargo ...` forms.
 
 To manually offload a build:
 ```bash
-rch exec -- cargo build --release
-rch exec -- cargo test
-rch exec -- cargo clippy
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-rch-target cargo build --release
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-rch-target cargo test
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-rch-target cargo clippy
 ```
 
 Quick commands:
