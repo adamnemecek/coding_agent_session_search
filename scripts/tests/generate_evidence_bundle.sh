@@ -6,6 +6,10 @@
 #   ./scripts/tests/generate_evidence_bundle.sh           # Full bundle
 #   ./scripts/tests/generate_evidence_bundle.sh --quick    # Subset (stress + e2e only)
 #
+# Environment:
+#   RCH_BIN         rch executable (default: rch)
+#   RCH_TARGET_DIR  cargo target dir for offloaded evidence tests
+#
 # Outputs:
 #   test-results/evidence-bundle.json   - Structured JSON manifest
 #   test-results/evidence-summary.md    - Human-readable summary
@@ -20,6 +24,8 @@ OUTPUT_DIR="${PROJECT_ROOT}/test-results"
 BUNDLE_FILE="${OUTPUT_DIR}/evidence-bundle.json"
 SUMMARY_FILE="${OUTPUT_DIR}/evidence-summary.md"
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_evidence_bundle}"
 QUICK=0
 
 # Colors
@@ -31,6 +37,7 @@ if [[ -t 1 ]]; then
     BOLD='\033[1m'
     NC='\033[0m'
 else
+    # shellcheck disable=SC2034
     RED='' GREEN='' YELLOW='' BLUE='' BOLD='' NC=''
 fi
 
@@ -40,11 +47,26 @@ for arg in "$@"; do
         --help|-h)
             echo "Usage: $0 [--quick] [--help]"
             echo "  --quick  Run subset of test categories (faster)"
+            echo ""
+            echo "Environment:"
+            echo "  RCH_BIN         rch executable (default: rch)"
+            echo "  RCH_TARGET_DIR  cargo target dir for offloaded evidence tests"
             exit 0 ;;
     esac
 done
 
 mkdir -p "$OUTPUT_DIR"
+
+ensure_rch() {
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        echo "ERROR: rch binary not found; evidence bundle tests must be offloaded" >&2
+        exit 1
+    fi
+}
+
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
 
 # =============================================================================
 # Test Category Runner
@@ -57,6 +79,8 @@ run_category() {
     local priority="$2"  # P0 or P1
     local filter="$3"
     local test_args="${4:---lib}"
+    local -a cargo_args
+    read -r -a cargo_args <<< "$test_args"
 
     echo -e "${BOLD}${BLUE}[${priority}] ${name}${NC} (filter: ${filter})"
 
@@ -64,7 +88,7 @@ run_category() {
     start_s=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
 
     local raw_output
-    raw_output=$(cargo test ${test_args} "${filter}" -- --nocapture 2>&1) || true
+    raw_output=$(run_cargo test "${cargo_args[@]}" "${filter}" -- --nocapture 2>&1) || true
 
     local end_s
     end_s=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
@@ -100,7 +124,9 @@ run_category() {
 
 echo -e "${BOLD}Evidence Bundle Generator${NC}"
 echo "Output: ${BUNDLE_FILE}"
+echo "RCH target: ${RCH_TARGET_DIR}"
 echo ""
+ensure_rch
 
 # P0 categories — must all pass for release gate
 run_category "stress_tests"              "P0" "stress_"
@@ -209,12 +235,6 @@ done
 
     # Sort by priority then name
     for name in $(echo "${!CAT_PASSED[@]}" | tr ' ' '\n' | sort); do
-        status_icon=""
-        if [[ ${CAT_FAILED[$name]} -gt 0 ]]; then
-            status_icon="FAIL"
-        else
-            status_icon="PASS"
-        fi
         echo "| ${name} | ${CAT_PRIORITY[$name]} | ${CAT_PASSED[$name]} | ${CAT_FAILED[$name]} | ${CAT_TOTAL[$name]} | ${CAT_DURATION[$name]}ms |"
     done
 
