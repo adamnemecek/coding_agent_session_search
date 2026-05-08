@@ -7,6 +7,10 @@
 #   CASS_BIN=target/debug/cass ./scripts/e2e/cli_flow.sh
 #   ./scripts/e2e/cli_flow.sh --no-build --fail-fast
 #
+# Environment:
+#   RCH_BIN         rch executable (default: rch)
+#   RCH_TARGET_DIR  cargo target dir for offloaded cass build
+#
 # Artifacts:
 #   target/e2e-cli/run_<timestamp>/
 #     run.log, run.jsonl, summary.json
@@ -17,8 +21,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_cli_flow_e2e}"
 
 # Source standard E2E logging library (emits to test-results/e2e/)
+# shellcheck disable=SC1091
 source "${PROJECT_ROOT}/scripts/lib/e2e_log.sh"
 e2e_init "shell" "cli_flow"
 
@@ -385,10 +392,32 @@ CASS_ENV=(
     "CASS_NO_COLOR=1"
 )
 
+# shellcheck disable=SC2317
+ensure_rch() {
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        log ERROR "rch binary not found; CLI flow E2E cass build must be offloaded"
+        write_summary
+        exit 1
+    fi
+}
+
+# shellcheck disable=SC2317
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
+
+# shellcheck disable=SC2317
+build_cass_binary() {
+    ensure_rch
+    (cd "$PROJECT_ROOT" && run_cargo build --bin cass)
+}
+
 if [[ -n "${CASS_BIN:-}" ]]; then
     CASS_BIN_RESOLVED="$CASS_BIN"
-else
+elif [[ -x "${PROJECT_ROOT}/target/debug/cass" ]]; then
     CASS_BIN_RESOLVED="${PROJECT_ROOT}/target/debug/cass"
+else
+    CASS_BIN_RESOLVED="${RCH_TARGET_DIR}/debug/cass"
 fi
 
 if [[ ! -x "$CASS_BIN_RESOLVED" ]]; then
@@ -397,7 +426,7 @@ if [[ ! -x "$CASS_BIN_RESOLVED" ]]; then
         write_summary
         exit 1
     fi
-    run_step "build" cargo build --bin cass
+    run_step "build" build_cass_binary
 fi
 
 log INFO "Using cass binary: ${CASS_BIN_RESOLVED}"
