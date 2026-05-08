@@ -3,10 +3,10 @@
 # Orchestrated E2E test runner with unified JSONL logging and consolidated reports.
 #
 # Usage:
-#   ./scripts/tests/run_all.sh              # Run all E2E suites
+#   ./scripts/tests/run_all.sh              # Run Rust + shell E2E suites locally
 #   ./scripts/tests/run_all.sh --rust-only  # Run only Rust E2E tests
 #   ./scripts/tests/run_all.sh --shell-only # Run only shell script tests
-#   ./scripts/tests/run_all.sh --playwright-only # Run only Playwright tests
+#   ./scripts/tests/run_all.sh --playwright-only # Run only Playwright tests on GitHub Actions
 #   ./scripts/tests/run_all.sh --fail-fast  # Stop on first failure
 #   ./scripts/tests/run_all.sh --help       # Show usage
 #
@@ -35,7 +35,15 @@ source "${PROJECT_ROOT}/scripts/lib/e2e_log.sh"
 
 RUN_RUST=${RUN_RUST:-1}
 RUN_SHELL=${RUN_SHELL:-1}
-RUN_PLAYWRIGHT=${RUN_PLAYWRIGHT:-1}
+PLAYWRIGHT_ENV_SET=0
+if [[ ${RUN_PLAYWRIGHT+x} ]]; then
+    PLAYWRIGHT_ENV_SET=1
+fi
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    RUN_PLAYWRIGHT=${RUN_PLAYWRIGHT:-1}
+else
+    RUN_PLAYWRIGHT=${RUN_PLAYWRIGHT:-0}
+fi
 FAIL_FAST=${FAIL_FAST:-0}
 VERBOSE=${VERBOSE:-0}
 RCH_BIN=${RCH_BIN:-rch}
@@ -67,7 +75,7 @@ Usage:
 Options:
     --rust-only       Run only Rust E2E tests (rch cargo test e2e_*)
     --shell-only      Run only shell script tests (scripts/test-*.sh)
-    --playwright-only Run only Playwright E2E tests
+    --playwright-only Run only Playwright E2E tests on GitHub Actions
     --fail-fast       Stop execution on first suite failure
     --verbose         Show detailed output from each suite
     --help            Show this help message
@@ -75,6 +83,10 @@ Options:
 Environment:
     RCH_BIN          rch executable to use for Rust E2E tests (default: rch)
     RCH_TARGET_DIR   remote Cargo target dir for Rust E2E tests
+
+Playwright:
+    Browser E2E suites are disabled outside GitHub Actions CI. Local runs cover
+    Rust and shell suites only; use CI for the full browser matrix.
 
 Outputs:
     test-results/e2e/<suite>/<test>/cass.log  Per-test JSONL logs (Rust E2E)
@@ -88,6 +100,8 @@ Exit Codes:
 EOF
 }
 
+PLAYWRIGHT_REQUESTED=0
+
 for arg in "$@"; do
     case "$arg" in
         --rust-only)
@@ -95,7 +109,7 @@ for arg in "$@"; do
         --shell-only)
             RUN_RUST=0; RUN_SHELL=1; RUN_PLAYWRIGHT=0 ;;
         --playwright-only)
-            RUN_RUST=0; RUN_SHELL=0; RUN_PLAYWRIGHT=1 ;;
+            RUN_RUST=0; RUN_SHELL=0; RUN_PLAYWRIGHT=1; PLAYWRIGHT_REQUESTED=1 ;;
         --fail-fast)
             FAIL_FAST=1 ;;
         --verbose)
@@ -106,6 +120,14 @@ for arg in "$@"; do
             echo "Unknown option: $arg"; show_help; exit 1 ;;
     esac
 done
+
+if [[ "$RUN_PLAYWRIGHT" -eq 1 && "${GITHUB_ACTIONS:-}" != "true" ]]; then
+    if [[ "$PLAYWRIGHT_REQUESTED" -eq 1 || "$PLAYWRIGHT_ENV_SET" -eq 1 ]]; then
+        echo "Playwright E2E suites are only run on GitHub Actions CI; push a branch for browser coverage." >&2
+        exit 1
+    fi
+    RUN_PLAYWRIGHT=0
+fi
 
 # =============================================================================
 # Suite Definitions
