@@ -10,6 +10,11 @@ evidence of conformance by itself. A row is conformant only when the named test
 exists, passes, and asserts the contract behavior directly instead of relying on
 a proxy signal.
 
+`Current Tested` counts rows with full contract-surface coverage. Planner-only
+unit tests are recorded in the row status and evidence ledger, but they do not
+count as pack conformance until the command, renderer, schema, and golden
+surfaces exist.
+
 ## Coverage Accounting
 
 | Spec Area | MUST Clauses | SHOULD Clauses | Current Tested | Passing | Divergent | Score |
@@ -63,20 +68,20 @@ a proxy signal.
 | AP-PACK-004 | MUST | Pack Object Schema | Handoff items use allowed kinds and cite supporting evidence ids. | Renderer schema test. | Planned |
 | AP-SEL-001 | MUST | Deterministic Selection | Candidate over-fetch uses `max(max_evidence * 8, max_sessions * 16, 64)` capped at 2048. | Planner config unit test. | Planned |
 | AP-SEL-002 | MUST | Deterministic Selection | Score uses the documented component weights and duplicate penalty. | Score-component unit test. | Planned |
-| AP-SEL-003 | MUST | Deterministic Selection | Tie-break order is stable across equal score, relevance, timestamp, source, path, line, and content hash. | Table-driven tie-break unit tests. | Planned |
-| AP-SEL-004 | MUST | Deterministic Selection | Null timestamps sort last in tie-breaks and score according to freshness policy. | Timestamp policy unit test. | Planned |
-| AP-SEL-005 | MUST | Deterministic Selection | Diversity scoring changes as selected sources and sessions accumulate. | Greedy selection unit test. | Planned |
-| AP-SEL-006 | MUST | Deterministic Selection | Duplicate penalties cover span hash, content hash, and overlapping source ranges. | Duplicate-heavy planner unit tests. | Planned |
+| AP-SEL-003 | MUST | Deterministic Selection | Tie-break order is stable across equal score, relevance, timestamp, source, path, line, and content hash. | `stable_tie_breaks_do_not_depend_on_input_order` covers input-order stability through source path; table cases for every later tie-break remain. | Unit Partial |
+| AP-SEL-004 | MUST | Deterministic Selection | Null timestamps sort last in tie-breaks and score according to freshness policy. | `strict_freshness_omits_stale_or_unknown_timestamps` covers strict stale/unknown omission; prefer-recent null tie-break still needs a direct case. | Unit Partial |
+| AP-SEL-005 | MUST | Deterministic Selection | Diversity scoring changes as selected sources and sessions accumulate. | `source_diversity_changes_second_pick` covers the greedy second-pick source diversity decision. | Planner Unit Passing |
+| AP-SEL-006 | MUST | Deterministic Selection | Duplicate penalties cover span hash, content hash, and overlapping source ranges. | `duplicate_content_is_omitted_after_first_selection` covers content-hash duplicate omission; span-hash and range-overlap cases remain. | Unit Partial |
 | AP-SEL-007 | MUST | Selection Fields | Without `--explain-selection`, `selection` exposes only score, token cost, and selected reason. | JSON golden pair with and without explain-selection. | Planned |
 | AP-OMIT-001 | MUST | Omitted Item Schema | Omitted rows include stable candidate id, source path, line, agent, reason, score, and estimated tokens. | Omission schema unit test. | Planned |
 | AP-OMIT-002 | MUST | Omitted Reasons | Reasons are exactly the documented snake_case values. | Enum serialization/schema test. | Planned |
-| AP-OMIT-003 | MUST | Omitted Reasons | Hard-omitted candidates are emitted once and removed from future consideration. | Planner regression for stale/duplicate hard omissions. | Planned |
-| AP-OMIT-004 | MUST | Omitted Reasons | Budget-omitted candidates are emitted once and not later emitted as max evidence. | Planner regression for exact budget boundary. | Planned |
+| AP-OMIT-003 | MUST | Omitted Reasons | Hard-omitted candidates are emitted once and removed from future consideration. | `duplicate_content_is_omitted_after_first_selection` covers the duplicate-content hard omission; stale/redacted variants remain. | Unit Partial |
+| AP-OMIT-004 | MUST | Omitted Reasons | Budget-omitted candidates are emitted once and not later emitted as max evidence. | `exact_token_budget_boundary_selects_until_budget_exhausted` covers token-budget omission at the exact boundary. | Unit Partial |
 | AP-BUDGET-001 | MUST | Token Budget | Token estimates use ceil UTF-8 char count divided by four after redaction and truncation. | Token estimator unit test. | Planned |
 | AP-BUDGET-002 | MUST | Token Budget | Budget reserves 15% metadata, 15% outline, 60% evidence, 10% omitted/warnings. | Planner budget unit test. | Planned |
 | AP-BUDGET-003 | MUST | Token Budget | Planner shortens excerpts before dropping evidence. | Truncation/drop ordering test. | Planned |
 | AP-BUDGET-004 | MUST | Token Budget | Selected evidence never loses citation fields to fit budget. | Small budget JSON golden. | Planned |
-| AP-BUDGET-005 | MUST | Token Budget | Output may exceed max tokens by no more than 5%; otherwise drop another item or return `pack-budget-too-small`. | Boundary fixture. | Planned |
+| AP-BUDGET-005 | MUST | Token Budget | Output may exceed max tokens by no more than 5%; otherwise drop another item or return `pack-budget-too-small`. | `exact_token_budget_boundary_selects_until_budget_exhausted` covers dropping the next item at an exact boundary; overshoot tolerance and too-small error remain. | Unit Partial |
 | AP-HEALTH-001 | MUST | Freshness and Health Proof | Health fields come from the same truth surfaces as `cass health --json` and `cass status --json`. | Fixture with stubbed existing health/status surfaces, not ad hoc values. | Planned |
 | AP-HEALTH-002 | MUST | Freshness and Health Proof | Required health fields include healthy, recommended action, index state, semantic state, fallback mode, active rebuild, and source readiness. | Health schema golden. | Planned |
 | AP-HEALTH-003 | MUST | Freshness and Health Proof | Source readiness includes source id, origin kind, healthy, last sync, last indexed, and recommended action. | Source readiness fixture. | Planned |
@@ -130,6 +135,20 @@ Use three layers:
    session data, indexes it through the normal path, runs `cass pack --json`, and
    verifies citations resolve without mutating source logs.
 
+## Planner Unit Evidence
+
+The current planner-only proof set lives in `src/search/pack_planner.rs`:
+
+| Test | Rows Informed | Limit |
+|------|---------------|-------|
+| `empty_corpus_returns_empty_plan` | AP-CMD-010, AP-ERR-003 | Planner only; command error/default behavior still needs robot fixtures. |
+| `duplicate_content_is_omitted_after_first_selection` | AP-SEL-006, AP-OMIT-003 | Covers content-hash duplicates only. |
+| `exact_token_budget_boundary_selects_until_budget_exhausted` | AP-BUDGET-005, AP-OMIT-004 | Covers exact boundary drop only. |
+| `source_diversity_changes_second_pick` | AP-SEL-005 | Covers planner selection, not rendered diagnostics. |
+| `strict_freshness_omits_stale_or_unknown_timestamps` | AP-SEL-004 | Covers strict policy omission, not prefer-recent tie order. |
+| `lexical_score_drives_relevance_when_semantic_is_absent` | AP-SCHEMA-003, AP-HEALTH-004 | Planner score proof only; realized mode/fallback metadata still needs command fixtures. |
+| `stable_tie_breaks_do_not_depend_on_input_order` | AP-SEL-003 | Covers source-path stability only. |
+
 ## Known Draft Gaps
 
 - Planner unit tests now exist for several selection rows, but they do not by
@@ -139,3 +158,6 @@ Use three layers:
 - Planner work is still in progress under `coding_agent_session_search-uuwye.2`.
 - The pack conformance gate must not be marked passing from planner unit tests
   alone; robot output and no-mock citation resolution are separate obligations.
+- Planner unit rows above were verified against `c9eafb8b` with
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_olive_pack_planner_review cargo test pack_planner --lib -- --nocapture`
+  passing 7/7, but they remain below full contract-surface conformance.
