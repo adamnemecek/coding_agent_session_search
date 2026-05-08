@@ -14,8 +14,12 @@
 //! See `docs/reference/E2E_LOGGING_SCHEMA.md` for log format.
 
 use assert_cmd::Command;
+use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+use coding_agent_search::sources::provenance::Source;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use serde_json::Value;
 use std::fs;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod util;
@@ -63,6 +67,237 @@ fn base_cmd() -> Command {
 
 fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_cli_flows", test_name)
+}
+
+const PACK_E2E_SECRET: &str = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+
+struct PackArchiveFixture {
+    tmp: TempDir,
+    data_dir: PathBuf,
+    artifact_dir: PathBuf,
+    source_files: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn pack_agent(slug: &str, name: &str) -> Agent {
+    Agent {
+        id: None,
+        slug: slug.to_string(),
+        name: name.to_string(),
+        version: Some("e2e-fixture".to_string()),
+        kind: AgentKind::Cli,
+    }
+}
+
+fn pack_message(idx: i64, role: MessageRole, created_at: i64, content: &str) -> Message {
+    Message {
+        id: None,
+        idx,
+        role,
+        author: None,
+        created_at: Some(created_at),
+        content: content.to_string(),
+        extra_json: serde_json::json!({}),
+        snippets: Vec::new(),
+    }
+}
+
+struct PackConversationSeed<'a> {
+    agent_slug: &'a str,
+    workspace: &'a Path,
+    source_path: &'a Path,
+    external_id: &'a str,
+    title: &'a str,
+    source_id: &'a str,
+    origin_host: Option<&'a str>,
+    started_at: i64,
+    messages: Vec<Message>,
+}
+
+fn pack_conversation(seed: PackConversationSeed<'_>) -> Conversation {
+    let ended_at = seed.messages.last().and_then(|message| message.created_at);
+    Conversation {
+        id: None,
+        agent_slug: seed.agent_slug.to_string(),
+        workspace: Some(seed.workspace.to_path_buf()),
+        external_id: Some(seed.external_id.to_string()),
+        title: Some(seed.title.to_string()),
+        source_path: seed.source_path.to_path_buf(),
+        started_at: Some(seed.started_at),
+        ended_at,
+        approx_tokens: None,
+        metadata_json: serde_json::json!({ "fixture": "pack_handoff_journey" }),
+        messages: seed.messages,
+        source_id: seed.source_id.to_string(),
+        origin_host: seed.origin_host.map(str::to_string),
+    }
+}
+
+fn write_pack_source_log(path: &Path, lines: &[&str]) -> Vec<u8> {
+    let body = format!("{}\n", lines.join("\n"));
+    fs::create_dir_all(path.parent().expect("source log parent")).expect("create source log dir");
+    fs::write(path, body.as_bytes()).expect("write source log fixture");
+    body.into_bytes()
+}
+
+fn setup_pack_archive_fixture(tracker: &PhaseTracker) -> PackArchiveFixture {
+    let tmp = TempDir::new().expect("create pack e2e tempdir");
+    let home = tmp.path();
+    let data_dir = home.join("cass_pack_data");
+    let artifact_dir = home.join("pack_artifacts");
+    let logs_dir = home.join("source_logs");
+    let workspace_checkout = home.join("workspaces/checkout-service");
+    let workspace_billing = home.join("workspaces/billing-worker");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+    fs::create_dir_all(&workspace_checkout).expect("create checkout workspace");
+    fs::create_dir_all(&workspace_billing).expect("create billing workspace");
+
+    let phase_start = tracker.start(
+        "seed_pack_archive",
+        Some("Seed real archive DB plus source log files for cass pack"),
+    );
+
+    let codex_source = logs_dir.join("codex-checkout.jsonl");
+    let claude_source = logs_dir.join("claude-checkout.jsonl");
+    let codex_original = write_pack_source_log(
+        &codex_source,
+        &[
+            "user: checkout failure appears after payment redirect",
+            "assistant: duplicate checkout failure timeout retry guard was missing",
+        ],
+    );
+    let claude_original = write_pack_source_log(
+        &claude_source,
+        &[
+            "user: remote checkout failure includes bearer token",
+            "assistant: duplicate checkout failure timeout retry guard was missing",
+        ],
+    );
+
+    let storage =
+        SqliteStorage::open(&data_dir.join("agent_search.db")).expect("create pack archive DB");
+    storage
+        .upsert_source(&Source::local())
+        .expect("seed local source");
+    storage
+        .upsert_source(&Source::remote(
+            "remote-build-node",
+            "builder@remote-build-node.internal",
+        ))
+        .expect("seed remote source");
+
+    let codex_agent_id = storage
+        .ensure_agent(&pack_agent("codex", "Codex"))
+        .expect("seed codex agent");
+    let claude_agent_id = storage
+        .ensure_agent(&pack_agent("claude", "Claude Code"))
+        .expect("seed claude agent");
+    let checkout_workspace_id = storage
+        .ensure_workspace(&workspace_checkout, Some("checkout-service"))
+        .expect("seed checkout workspace");
+    let billing_workspace_id = storage
+        .ensure_workspace(&workspace_billing, Some("billing-worker"))
+        .expect("seed billing workspace");
+
+    storage
+        .insert_conversation_tree(
+            codex_agent_id,
+            Some(checkout_workspace_id),
+            &pack_conversation(PackConversationSeed {
+                agent_slug: "codex",
+                workspace: &workspace_checkout,
+                source_path: &codex_source,
+                external_id: "codex-checkout",
+                title: "Fresh checkout failure triage",
+                source_id: "local",
+                origin_host: None,
+                started_at: 1_777_806_000_000,
+                messages: vec![
+                    pack_message(
+                        0,
+                        MessageRole::User,
+                        1_777_806_001_000,
+                        "checkout failure after redirect in checkout-service",
+                    ),
+                    pack_message(
+                        1,
+                        MessageRole::Agent,
+                        1_777_806_002_000,
+                        &format!(
+                            "duplicate checkout failure timeout retry guard was missing; pasted key {PACK_E2E_SECRET}"
+                        ),
+                    ),
+                ],
+            }),
+        )
+        .expect("insert local pack conversation");
+
+    storage
+        .insert_conversation_tree(
+            claude_agent_id,
+            Some(billing_workspace_id),
+            &pack_conversation(PackConversationSeed {
+                agent_slug: "claude",
+                workspace: &workspace_billing,
+                source_path: &claude_source,
+                external_id: "claude-checkout-remote",
+                title: "Stale remote checkout failure handoff",
+                source_id: "remote-build-node",
+                origin_host: Some("builder@remote-build-node.internal"),
+                started_at: 1_704_067_200_000,
+                messages: vec![
+                    pack_message(
+                        0,
+                        MessageRole::User,
+                        1_704_067_201_000,
+                        "remote checkout failure from billing-worker",
+                    ),
+                    pack_message(
+                        1,
+                        MessageRole::Agent,
+                        1_704_067_202_000,
+                        "duplicate checkout failure timeout retry guard was missing on remote source",
+                    ),
+                ],
+            }),
+        )
+        .expect("insert remote pack conversation");
+
+    tracker.end(
+        "seed_pack_archive",
+        Some("Seed real archive DB plus source log files for cass pack"),
+        phase_start,
+    );
+
+    PackArchiveFixture {
+        tmp,
+        data_dir,
+        artifact_dir,
+        source_files: vec![
+            (codex_source, codex_original),
+            (claude_source, claude_original),
+        ],
+    }
+}
+
+fn scrub_pack_artifact(mut value: Value) -> Value {
+    if let Some(meta) = value.get_mut("_meta").and_then(Value::as_object_mut) {
+        meta.insert(
+            "generated_at_ms".to_string(),
+            Value::String("[scrubbed]".to_string()),
+        );
+        meta.insert(
+            "elapsed_ms".to_string(),
+            Value::String("[scrubbed]".to_string()),
+        );
+    }
+    if let Some(health) = value.get_mut("health").and_then(Value::as_object_mut) {
+        health.insert(
+            "index_generation".to_string(),
+            Value::String("[scrubbed]".to_string()),
+        );
+    }
+    value
 }
 
 /// Setup test environment with fixtures and run index.
@@ -113,6 +348,183 @@ fn setup_indexed_env() -> (TempDir, std::path::PathBuf) {
 
     tracker.flush();
     (tmp, data_dir)
+}
+
+#[test]
+fn pack_handoff_journey_uses_real_archive_and_preserves_sources() {
+    let tracker = tracker_for("pack_handoff_journey_uses_real_archive_and_preserves_sources");
+    let _trace_guard = tracker.trace_env_guard();
+    let fixture = setup_pack_archive_fixture(&tracker);
+    let sessions_stdin = fixture
+        .source_files
+        .iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let trace_file = fixture.artifact_dir.join("pack.trace.jsonl");
+    let stdout_path = fixture.artifact_dir.join("pack.stdout.json");
+    let stderr_path = fixture.artifact_dir.join("pack.stderr.txt");
+    let scrubbed_path = fixture.artifact_dir.join("pack.stdout.scrubbed.json");
+    let failure_context_path = fixture.artifact_dir.join("pack.failure-context.json");
+
+    let pack_start = tracker.start(
+        "run_pack",
+        Some("Execute cass pack against real archive DB and sessions-from stdin"),
+    );
+    let mut cmd = base_cmd();
+    cmd.args(["--trace-file"])
+        .arg(&trace_file)
+        .args([
+            "pack",
+            "checkout failure",
+            "--robot",
+            "--max-tokens",
+            "4000",
+            "--limit",
+            "10",
+            "--max-evidence",
+            "6",
+            "--sessions-from",
+            "-",
+            "--data-dir",
+        ])
+        .arg(&fixture.data_dir)
+        .env("HOME", fixture.tmp.path())
+        .write_stdin(sessions_stdin);
+    let output = cmd.output().expect("run cass pack e2e");
+    let pack_ms = pack_start.elapsed().as_millis() as u64;
+    tracker.end("run_pack", Some("cass pack complete"), pack_start);
+
+    fs::write(&stdout_path, &output.stdout).expect("write pack stdout artifact");
+    fs::write(&stderr_path, &output.stderr).expect("write pack stderr artifact");
+    if !output.status.success() {
+        let failure_context = serde_json::json!({
+            "status": output.status.code(),
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "trace_file": trace_file,
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        });
+        fs::write(
+            &failure_context_path,
+            serde_json::to_vec_pretty(&failure_context).expect("serialize failure context"),
+        )
+        .expect("write pack failure context artifact");
+    }
+    assert!(
+        output.status.success(),
+        "cass pack e2e failed; artifacts in {}",
+        fixture.artifact_dir.display()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains(PACK_E2E_SECRET) && !stderr.contains(PACK_E2E_SECRET),
+        "pack output must not leak raw fixture secret"
+    );
+    assert!(
+        stdout.trim_start().starts_with('{'),
+        "robot pack stdout must be a JSON object: {stdout}"
+    );
+    let json: Value = serde_json::from_str(stdout.trim()).expect("pack stdout is valid JSON");
+    let scrubbed = scrub_pack_artifact(json.clone());
+    fs::write(
+        &scrubbed_path,
+        serde_json::to_vec_pretty(&scrubbed).expect("serialize scrubbed pack artifact"),
+    )
+    .expect("write scrubbed pack artifact");
+
+    assert_eq!(json["schema_version"], "cass.pack.v1");
+    assert_eq!(json["query"]["text"], "checkout failure");
+    assert_eq!(json["limits"]["max_tokens"], 4000);
+    assert!(
+        json["health"]["source_readiness"]
+            .as_array()
+            .is_some_and(|sources| !sources.is_empty()),
+        "pack health must include source readiness: {json}"
+    );
+    assert!(
+        json["freshness"]["newest_evidence_at_ms"].is_i64()
+            || json["freshness"]["newest_evidence_at_ms"].is_u64(),
+        "pack must report evidence freshness: {json}"
+    );
+    assert!(
+        json["privacy"]["redaction_applied"].as_bool() == Some(true)
+            || stdout.contains("[REDACTED]"),
+        "pack must redact or explicitly mark the sensitive fixture string: {json}"
+    );
+
+    let session_paths = fixture
+        .source_files
+        .iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect::<std::collections::HashSet<_>>();
+    let evidence = json["evidence"]
+        .as_array()
+        .expect("pack evidence must be an array");
+    assert!(
+        !evidence.is_empty(),
+        "pack must select at least one evidence item"
+    );
+    assert!(
+        evidence.iter().all(|item| {
+            item["citation"]["source_path"]
+                .as_str()
+                .is_some_and(|path| session_paths.contains(path))
+        }),
+        "--sessions-from - must restrict evidence to the provided sessions: {json}"
+    );
+    assert!(
+        evidence.iter().any(|item| {
+            item["citation"]["origin_kind"]
+                .as_str()
+                .is_some_and(|kind| kind != "local")
+                || item["citation"]["source_id"]
+                    .as_str()
+                    .is_some_and(|source_id| source_id != "local")
+        }),
+        "fixture must include selected remote-source provenance evidence: {json}"
+    );
+    assert!(
+        evidence.iter().any(|item| {
+            item["excerpt"]
+                .as_str()
+                .is_some_and(|excerpt| excerpt.contains("checkout failure"))
+        }),
+        "pack evidence should preserve the handoff query context: {json}"
+    );
+
+    for (path, original) in &fixture.source_files {
+        let current = fs::read(path).expect("read source log after pack");
+        assert_eq!(
+            &current,
+            original,
+            "cass pack must not mutate source session log {}",
+            path.display()
+        );
+    }
+    assert!(stdout_path.exists(), "stdout artifact should exist");
+    assert!(stderr_path.exists(), "stderr artifact should exist");
+    assert!(
+        scrubbed_path.exists(),
+        "scrubbed output artifact should exist"
+    );
+    assert!(
+        trace_file.exists(),
+        "trace artifact should exist when --trace-file is requested"
+    );
+
+    tracker.metrics(
+        "cass_pack",
+        &E2ePerformanceMetrics::new()
+            .with_duration(pack_ms)
+            .with_throughput(evidence.len() as u64, pack_ms)
+            .with_custom("operation", "pack_handoff"),
+    );
+    tracker.complete();
 }
 
 // =============================================================================
