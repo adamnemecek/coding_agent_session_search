@@ -41,6 +41,8 @@ INCLUDE_SLOW=${INCLUDE_SLOW:-0}
 USE_NEXTEST=${USE_NEXTEST:-1}
 FAIL_FAST=${FAIL_FAST:-0}
 QUICK_MODE=${QUICK_MODE:-0}
+RCH_BIN=${RCH_BIN:-rch}
+RCH_TARGET_DIR=${RCH_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_cass_test_all}
 
 # Results tracking
 declare -A TIMINGS
@@ -119,12 +121,23 @@ time_end() {
 # Test Runner Functions
 # =============================================================================
 
+ensure_rch() {
+    if ! command -v "$RCH_BIN" &> /dev/null; then
+        log ERROR "rch binary not found; test-all cargo tests must be offloaded"
+        return 1
+    fi
+}
+
+run_cargo() {
+    "$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+}
+
 check_nextest() {
     if [[ $USE_NEXTEST -eq 1 ]]; then
-        if command -v cargo-nextest &> /dev/null || cargo nextest --version &> /dev/null 2>&1; then
+        if run_cargo nextest --version > /dev/null 2>&1; then
             return 0
         else
-            log WARN "cargo-nextest not found, falling back to cargo test"
+            log WARN "cargo-nextest unavailable through rch, falling back to rch cargo test"
             USE_NEXTEST=0
             return 1
         fi
@@ -143,14 +156,14 @@ run_unit_tests() {
     local exit_code=0
 
     if [[ $USE_NEXTEST -eq 1 ]]; then
-        if cargo nextest run --profile ci --workspace -E 'kind(lib)' --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo nextest run --profile ci --workspace -E 'kind(lib)' --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "Unit tests passed"
         else
             log ERROR "Unit tests failed"
             exit_code=1
         fi
     else
-        if cargo test --lib --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo test --lib --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "Unit tests passed"
         else
             log ERROR "Unit tests failed"
@@ -181,14 +194,14 @@ run_connector_tests() {
         local filter="binary(connector_${conn})"
 
         if [[ $USE_NEXTEST -eq 1 ]]; then
-            if cargo nextest run --profile ci -E "$filter" --color=always 2>&1 | tee -a "$LOG_FILE"; then
+            if run_cargo nextest run --profile ci -E "$filter" --color=always 2>&1 | tee -a "$LOG_FILE"; then
                 log INFO "  $conn connector passed"
             else
                 log ERROR "  $conn connector failed"
                 ((failed++))
             fi
         else
-            if cargo test --test "connector_${conn}" --color=always 2>&1 | tee -a "$LOG_FILE"; then
+            if run_cargo test --test "connector_${conn}" --color=always 2>&1 | tee -a "$LOG_FILE"; then
                 log INFO "  $conn connector passed"
             else
                 log ERROR "  $conn connector failed"
@@ -225,14 +238,14 @@ run_cli_tests() {
         log_subsection "Running $test"
 
         if [[ $USE_NEXTEST -eq 1 ]]; then
-            if cargo nextest run --profile e2e -E "binary($test)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
+            if run_cargo nextest run --profile e2e -E "binary($test)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
                 log INFO "  $test passed"
             else
                 log ERROR "  $test failed"
                 ((failed++))
             fi
         else
-            if cargo test --test "$test" --color=always -- --test-threads=1 2>&1 | tee -a "$LOG_FILE"; then
+            if run_cargo test --test "$test" --color=always -- --test-threads=1 2>&1 | tee -a "$LOG_FILE"; then
                 log INFO "  $test passed"
             else
                 log ERROR "  $test failed"
@@ -266,14 +279,14 @@ run_ui_tests() {
 
     if [[ $USE_NEXTEST -eq 1 ]]; then
         # UI tests are run with the ci profile which has proper thread overrides
-        if cargo nextest run --profile ci -E 'test(ui_)' --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo nextest run --profile ci -E 'test(ui_)' --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "UI tests passed"
         else
             log ERROR "UI tests failed"
             exit_code=1
         fi
     else
-        if cargo test --tests -- ui_ --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo test --tests -- ui_ --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "UI tests passed"
         else
             log ERROR "UI tests failed"
@@ -307,14 +320,14 @@ run_ssh_tests() {
 
     # Run SSH tests (marked with #[ignore] so need --ignored flag)
     if [[ $USE_NEXTEST -eq 1 ]]; then
-        if cargo nextest run --profile e2e -E 'test(ssh)' --run-ignored=all --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo nextest run --profile e2e -E 'test(ssh)' --run-ignored=all --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "SSH tests passed"
         else
             log ERROR "SSH tests failed"
             exit_code=1
         fi
     else
-        if cargo test ssh -- --ignored --color=always 2>&1 | tee -a "$LOG_FILE"; then
+        if run_cargo test ssh -- --ignored --color=always 2>&1 | tee -a "$LOG_FILE"; then
             log INFO "SSH tests passed"
         else
             log ERROR "SSH tests failed"
@@ -344,14 +357,14 @@ run_slow_tests() {
         log_subsection "Running $test"
 
         if [[ $USE_NEXTEST -eq 1 ]]; then
-            if cargo nextest run --profile e2e -E "binary($test)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
+            if run_cargo nextest run --profile e2e -E "binary($test)" --color=always 2>&1 | tee -a "$LOG_FILE"; then
                 log INFO "  $test passed"
             else
                 log ERROR "  $test failed"
                 ((failed++))
             fi
         else
-            if cargo test --test "$test" --color=always 2>&1 | tee -a "$LOG_FILE"; then
+            if run_cargo test --test "$test" --color=always 2>&1 | tee -a "$LOG_FILE"; then
                 log INFO "  $test passed"
             else
                 log ERROR "  $test failed"
@@ -444,7 +457,7 @@ Options:
   --include-ssh       Include SSH integration tests (requires Docker)
   --include-slow      Include slow/performance tests
   --all               Include all optional tests
-  --no-nextest        Use cargo test instead of nextest
+  --no-nextest        Use rch cargo test instead of rch cargo nextest
   -h, --help          Show this help
 
 Environment Variables:
@@ -454,6 +467,8 @@ Environment Variables:
   INCLUDE_SSH=1       Same as --include-ssh
   INCLUDE_SLOW=1      Same as --include-slow
   USE_NEXTEST=0       Same as --no-nextest
+  RCH_BIN=rch         Remote compilation helper binary
+  RCH_TARGET_DIR=...  Remote Cargo target dir (default: \${TMPDIR:-/tmp}/rch_target_cass_test_all)
 
 Examples:
   $0                  # Standard test run
@@ -478,11 +493,14 @@ main() {
     log INFO "Timestamp: $TIMESTAMP"
     log INFO "Options: QUICK_MODE=$QUICK_MODE PARALLEL=$PARALLEL INCLUDE_SSH=$INCLUDE_SSH INCLUDE_SLOW=$INCLUDE_SLOW"
 
+    cd "$PROJECT_ROOT"
+    ensure_rch || exit 1
+    log INFO "RCH binary: $RCH_BIN"
+    log INFO "RCH target dir: $RCH_TARGET_DIR"
+
     # Check for nextest
     check_nextest
-    log INFO "Test runner: $([ $USE_NEXTEST -eq 1 ] && echo 'cargo-nextest' || echo 'cargo test')"
-
-    cd "$PROJECT_ROOT"
+    log INFO "Test runner: $([ "$USE_NEXTEST" -eq 1 ] && echo 'rch cargo-nextest' || echo 'rch cargo test')"
 
     # Run all phases, collecting results
     local failed=0
