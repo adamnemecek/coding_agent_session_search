@@ -21148,10 +21148,8 @@ fn doctor_remote_source_sync_runtime_summary(
 }
 
 fn doctor_sources_config_path(data_dir: &Path) -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| data_dir.to_path_buf())
-        .join("cass")
-        .join("sources.toml")
+    crate::sources::config::SourcesConfig::config_path()
+        .unwrap_or_else(|_| data_dir.join("cass").join("sources.toml"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41039,6 +41037,7 @@ fn existing_path_has_symlink_below_root(path: &Path, root: &Path) -> bool {
 #[cfg(test)]
 mod doctor_asset_taxonomy_tests {
     use super::*;
+    use serial_test::serial;
 
     const ALL_DOCTOR_ASSET_CLASSES: &[DoctorAssetClass] = &[
         DoctorAssetClass::SourceSessionLog,
@@ -47491,6 +47490,49 @@ mod doctor_asset_taxonomy_tests {
         assert_eq!(
             doctor_redacted_path("/var/tmp/external-session.jsonl", data_dir),
             "[external]/external-session.jsonl"
+        );
+    }
+
+    struct DoctorEnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for DoctorEnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn set_doctor_env(key: &'static str, value: &str) -> DoctorEnvGuard {
+        let previous = dotenvy::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        DoctorEnvGuard { key, previous }
+    }
+
+    #[test]
+    #[serial]
+    fn doctor_sources_config_path_honors_xdg_config_home() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let config_home = temp.path().join("xdg-config");
+        let data_dir = temp.path().join("cass-data");
+        let config_home_text = config_home.to_string_lossy().into_owned();
+        let _config_guard = set_doctor_env("XDG_CONFIG_HOME", &config_home_text);
+
+        assert_eq!(
+            doctor_sources_config_path(&data_dir),
+            config_home.join("cass").join("sources.toml"),
+            "doctor must inspect the same sources.toml location as sources commands"
         );
     }
 
