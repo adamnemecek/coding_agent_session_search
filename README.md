@@ -2873,7 +2873,7 @@ The CI pipeline (`.github/workflows/ci.yml`) runs on every PR and push to main:
 ```bash
 # Generate coverage locally
 cargo install cargo-llvm-cov
-cargo llvm-cov --all-features --workspace --text
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-coverage-target cargo llvm-cov --all-features --workspace --text
 
 # Run specific e2e tests
 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-e2e-target cargo test --test e2e_filters -- --test-threads=1
