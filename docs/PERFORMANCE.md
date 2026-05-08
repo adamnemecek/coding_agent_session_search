@@ -220,32 +220,33 @@ Full runtime benchmarks:
 
 ```bash
 # Using perf (Linux)
-perf record --call-graph dwarf cargo bench --bench search_perf
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-profile-search-target perf record --call-graph dwarf cargo bench --bench search_perf
+# Retrieve the generated perf.data from the rch worker before opening it locally.
 perf report
 
 # Using Instruments (macOS)
-cargo instruments -t "CPU Profiler" --bench search_perf
+# Use Instruments only in an explicitly approved local profiling session.
 ```
 
 ### Memory Profiling
 
 ```bash
 # Using heaptrack (Linux)
-heaptrack cargo bench --bench db_perf
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-profile-db-target heaptrack cargo bench --bench db_perf
+# Retrieve the generated heaptrack profile from the rch worker before opening it locally.
 heaptrack_gui heaptrack.*.gz
 
 # Using DHAT (via valgrind)
-valgrind --tool=dhat cargo bench --bench cache_micro
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-profile-cache-target valgrind --tool=dhat cargo bench --bench cache_micro
 ```
 
 ### Flamegraphs
 
 ```bash
-# Install flamegraph
-cargo install flamegraph
+# Ensure cargo-flamegraph is already installed on the rch worker.
 
 # Generate flamegraph
-cargo flamegraph --bench search_perf -- --bench
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-flamegraph-target cargo flamegraph --bench search_perf -- --bench
 ```
 
 ## Baseline Results
