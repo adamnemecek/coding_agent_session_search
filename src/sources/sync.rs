@@ -649,23 +649,15 @@ impl SyncEngine {
         let method = Self::detect_sync_method();
         let mut report = SyncReport::new(&source.name, method);
         let overall_start = Instant::now();
-        let mut valid_remote_paths = Vec::new();
-
-        for (index, remote_path) in source.paths.iter().enumerate() {
-            match validate_remote_sync_path_entry(index, remote_path) {
-                Ok(()) => valid_remote_paths.push(remote_path),
-                Err(err) => {
-                    report.add_path_result(invalid_remote_sync_path_result(remote_path, err))
-                }
-            }
-        }
 
         // Create the mirror directory
         let mirror_dir = self.mirror_dir(&source.name);
         std::fs::create_dir_all(&mirror_dir)?;
 
         // Pre-fetch remote home directory if any paths use tilde (avoids multiple SSH calls)
-        let remote_home = if valid_remote_paths.iter().any(|p| p.starts_with('~')) {
+        let remote_home = if source.paths.iter().enumerate().any(|(index, path)| {
+            path.starts_with('~') && validate_remote_sync_path_entry(index, path).is_ok()
+        }) {
             match self.get_remote_home(host) {
                 Ok(home) => Some(home),
                 Err(e) => {
@@ -677,7 +669,12 @@ impl SyncEngine {
             None
         };
 
-        for remote_path in valid_remote_paths {
+        for (index, remote_path) in source.paths.iter().enumerate() {
+            if let Err(err) = validate_remote_sync_path_entry(index, remote_path) {
+                report.add_path_result(invalid_remote_sync_path_result(remote_path, err));
+                continue;
+            }
+
             let result = match method {
                 SyncMethod::Rsync => {
                     self.sync_path_rsync(host, remote_path, &mirror_dir, remote_home.as_deref())
@@ -2830,6 +2827,38 @@ mod tests {
                 "~/Library/Application Support/Cursor/User/globalStorage"
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_sync_source_preserves_path_result_order_for_mixed_invalid_paths() {
+        let temp = TempDir::new().unwrap();
+        let engine = SyncEngine::new(temp.path()).with_connection_timeout(1);
+        let mut source = SourceDefinition::ssh("laptop", "bad host");
+        source.paths = vec![
+            "~/.codex/sessions".to_string(),
+            " ~/.claude/projects".to_string(),
+            "~/.gemini/tmp".to_string(),
+        ];
+
+        let report = engine.sync_source(&source).unwrap();
+        let remote_paths = report
+            .path_results
+            .iter()
+            .map(|result| result.remote_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            remote_paths,
+            vec!["~/.codex/sessions", " ~/.claude/projects", "~/.gemini/tmp"]
+        );
+        assert!(
+            report.path_results[1]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("paths[1] cannot have leading")),
+            "expected invalid path error in original slot: {:?}",
+            report.path_results
         );
     }
 
