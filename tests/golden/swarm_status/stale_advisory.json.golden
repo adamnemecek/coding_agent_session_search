@@ -1,0 +1,57 @@
+{
+  "schema_version": "cass.swarm.status.v1",
+  "status": "ok",
+  "_meta": {
+    "request_id": "fixture-stale",
+    "generated_at_ms": 0,
+    "elapsed_ms": 1,
+    "repo": "[FIXTURE_REPO]",
+    "project_key": "[FIXTURE_REPO]",
+    "hostname": "fixture-host",
+    "partial": false,
+    "warnings": []
+  },
+  "providers": [
+    {"name": "beads", "source": "fixture:beads", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
+    {"name": "agent_mail", "source": "fixture:agent_mail", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
+    {"name": "git", "source": "fixture:git", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
+    {"name": "process", "source": "fixture:processes", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
+    {"name": "cass_health", "source": "fixture:cass_health", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null},
+    {"name": "cass_status", "source": "fixture:cass_status", "status": "ok", "freshness_ms": 0, "elapsed_ms": 0, "error_kind": null, "warning": null}
+  ],
+  "summary": {
+    "ready_count": 0,
+    "in_progress_count": 1,
+    "blocked_count": 0,
+    "active_agent_count": 0,
+    "active_reservation_count": 0,
+    "dirty_worktree": false,
+    "build_pressure": "none",
+    "stale_candidate_count": 1,
+    "proof_gap_count": 0,
+    "recommended_action": "inspect-stale"
+  },
+  "beads": {
+    "ready": [],
+    "in_progress": [
+      {"id": "cass-stale-1", "title": "Old stalled verification pass", "status": "in_progress", "priority": 1, "issue_type": "test", "labels": ["swarm", "testing"], "updated_at": "2026-05-08T12:00:00Z", "age_seconds": 14400, "owners": ["OldAgent"], "safe_to_claim": false, "claim_blockers": ["in-progress", "manual-review"], "recommended_action": "manual-review"}
+    ],
+    "blocked": [],
+    "stale_candidates": [
+      {"id": "cass-stale-1", "title": "Old stalled verification pass", "status": "in_progress", "priority": 1, "issue_type": "test", "labels": ["swarm", "testing"], "updated_at": "2026-05-08T12:00:00Z", "age_seconds": 14400, "owners": ["OldAgent"], "safe_to_claim": false, "claim_blockers": ["in-progress", "manual-review"], "recommended_action": "manual-review", "stale_state": "likely_stale", "evidence": [{"kind": "quiet-bead", "source": "beads.updated_at", "age_seconds": 14400}, {"kind": "no-active-reservation", "source": "agent_mail.reservations"}], "confidence": "medium"}
+    ],
+    "graph": {"node_count": 7, "edge_count": 3, "has_cycles": false, "source": "fixture:bv"}
+  },
+  "agents": [
+    {"name": "OldAgent", "program": "codex-cli", "model": "gpt-5", "task_description": "stale fixture", "last_active_ts": "2026-05-08T12:05:00Z", "active": false, "current_threads": []}
+  ],
+  "reservations": [],
+  "build_pressure": {"status": "none", "active_rch_jobs": 0, "active_cargo_jobs": 0, "load_average_1m": 0.7, "cpu_count": 64, "recommended_action": "safe-to-run-focused-rch-test"},
+  "git": {"branch": "main", "upstream": "origin/main", "ahead": 0, "behind": 0, "dirty": false, "dirty_paths": [], "recent_commits": [], "legacy_branch_mirror_required": false},
+  "cass": {"health_status": "healthy", "healthy": true, "initialized": true, "recommended_action": null, "search_ready": true, "semantic_fallback_mode": "lexical", "active_rebuild": false},
+  "evidence": {"recent_threads": [], "recent_proofs": [], "proof_gaps": [], "redaction_applied": false},
+  "recommendations": [
+    {"kind": "inspect-stale", "confidence": "medium", "summary": "One in-progress bead looks stale, but status is advisory only.", "commands": ["br show cass-stale-1 --json"], "requires_human_confirmation": true, "evidence_refs": ["beads.stale_candidates[0]"]}
+  ],
+  "privacy": {"raw_session_content_included": false, "mail_body_snippets_included": false, "redaction_policy": "strict", "redaction_applied": false, "sensitive_paths_scrubbed": 0}
+}

@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "contract": "cass.swarm.status.v1",
+  "golden_update_workflow": {
+    "command_shape": "UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-swarm-status-golden-target cargo test --test swarm_status_contract",
+    "review_command": "git diff -- tests/fixtures/swarm_status tests/golden/swarm_status tests/swarm_status_contract.rs",
+    "review_required": true,
+    "uses_live_services": false
+  },
+  "scenarios": [
+    {
+      "fixture_id": "healthy",
+      "input_path": "tests/fixtures/swarm_status/healthy.inputs.json",
+      "input_sha256": "d84efe048e1cfa486e1b81f52763b7d8df95270b94faf41a0b9858523935b35f",
+      "golden_path": "tests/golden/swarm_status/healthy.json.golden",
+      "golden_sha256": "fb869889a3418b109e8dbdd23cf35fbe2fe04a3f543e6a9385ce3507081bbb47",
+      "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status",
+      "stdout_capture_path": "tests/golden/swarm_status/healthy.json.golden",
+      "stderr_capture": "",
+      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "assertion_summary": "healthy ready-work fixture covers the success path"
+    },
+    {
+      "fixture_id": "busy",
+      "input_path": "tests/fixtures/swarm_status/busy.inputs.json",
+      "input_sha256": "1746a57527aca66f0b12103b9ad70059428458606a070d86b344d63b6a6e9cb3",
+      "golden_path": "tests/golden/swarm_status/busy.json.golden",
+      "golden_sha256": "b3a4a1179d7008bd62629ec7fa07090fe2c409e9bc3be27e034f28c56866c3a4",
+      "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status",
+      "stdout_capture_path": "tests/golden/swarm_status/busy.json.golden",
+      "stderr_capture": "",
+      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "assertion_summary": "busy fixture covers active agents, reservations, dirty paths, and light build pressure"
+    },
+    {
+      "fixture_id": "stale_advisory",
+      "input_path": "tests/fixtures/swarm_status/stale_advisory.inputs.json",
+      "input_sha256": "0e811fed35728f2a613606c7187e4e214b3632b9451235e5a67a46b9b18734ec",
+      "golden_path": "tests/golden/swarm_status/stale_advisory.json.golden",
+      "golden_sha256": "9089568b52d7b247235461f583f16506d9c5ace74dade795172d08b7429c94f7",
+      "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status",
+      "stdout_capture_path": "tests/golden/swarm_status/stale_advisory.json.golden",
+      "stderr_capture": "",
+      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "assertion_summary": "stale fixture covers advisory stale detection without automatic takeover"
+    },
+    {
+      "fixture_id": "reservation_conflict",
+      "input_path": "tests/fixtures/swarm_status/reservation_conflict.inputs.json",
+      "input_sha256": "17edb29456e92a43dc5cf044e03a3d68f14c2fee1e2b40488c3c668a51147ef1",
+      "golden_path": "tests/golden/swarm_status/reservation_conflict.json.golden",
+      "golden_sha256": "a5f72f0dac13eefd0bee34211c355de065e739050ec4a2b946fcf16ea6c18b3a",
+      "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status",
+      "stdout_capture_path": "tests/golden/swarm_status/reservation_conflict.json.golden",
+      "stderr_capture": "",
+      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "assertion_summary": "reservation fixture covers conflicting leases and dirty peer work"
+    },
+    {
+      "fixture_id": "build_pressure",
+      "input_path": "tests/fixtures/swarm_status/build_pressure.inputs.json",
+      "input_sha256": "c820eb51d776414e417ca5ed63df57e0869f0dba5a2b45042a34ba5e5b6d5f30",
+      "golden_path": "tests/golden/swarm_status/build_pressure.json.golden",
+      "golden_sha256": "4f9eab85e4f489a7d8dcd7444be2f9fca98f7231916359e6d3756d0dfafecb44",
+      "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status",
+      "stdout_capture_path": "tests/golden/swarm_status/build_pressure.json.golden",
+      "stderr_capture": "",
+      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "assertion_summary": "build-pressure fixture covers rch pressure and accidental local cargo detection"
+    },
+    {
+      "fixture_id": "no_ready_work",
+      "input_path": "tests/fixtures/swarm_status/no_ready_work.inputs.json",
+      "input_sha256": "75c017777a4dc1209ac6bced37693d4375e9d647da8dbe6bd26d117061cf168c",
+      "golden_path": "tests/golden/swarm_status/no_ready_work.json.golden",
+      "golden_sha256": "dfebbe37dd173f8bc64d8fb0310e03aee1f3f524519464e3cb84ceac9ac30cea",
+      "command_shape": "cass swarm status --json --fixture-dir tests/fixtures/swarm_status",
+      "stdout_capture_path": "tests/golden/swarm_status/no_ready_work.json.golden",
+      "stderr_capture": "",
+      "redaction_report": {"raw_session_content_included": false, "mail_body_snippets_included": false},
+      "assertion_summary": "no-ready fixture covers explicit queue-dry recommendations"
+    }
+  ]
+}

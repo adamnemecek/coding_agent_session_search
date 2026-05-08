@@ -1,0 +1,65 @@
+{
+  "fixture_id": "stale_advisory",
+  "description": "An old in-progress bead with no reservation, no recent mail, and no dirty worktree paths.",
+  "sources": {
+    "beads": {
+      "ready": [],
+      "in_progress": [
+        {
+          "id": "cass-stale-1",
+          "title": "Old stalled verification pass",
+          "status": "in_progress",
+          "priority": 1,
+          "issue_type": "test",
+          "labels": ["testing", "swarm"],
+          "updated_at": "2026-05-08T12:00:00Z"
+        }
+      ],
+      "blocked": [],
+      "graph": {
+        "node_count": 7,
+        "edge_count": 3,
+        "has_cycles": false
+      }
+    },
+    "agent_mail": {
+      "agents": [
+        {
+          "name": "OldAgent",
+          "program": "codex-cli",
+          "model": "gpt-5",
+          "task_description": "stale fixture",
+          "last_active_ts": "2026-05-08T12:05:00Z"
+        }
+      ],
+      "messages": [],
+      "reservations": []
+    },
+    "git": {
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 0,
+      "behind": 0,
+      "dirty": false,
+      "dirty_paths": [],
+      "recent_commits": []
+    },
+    "processes": {
+      "active_rch_jobs": 0,
+      "active_cargo_jobs": 0,
+      "load_average_1m": 0.7,
+      "cpu_count": 64
+    },
+    "cass_health": {
+      "status": "healthy",
+      "healthy": true,
+      "initialized": true,
+      "recommended_action": null
+    },
+    "cass_status": {
+      "search_ready": true,
+      "semantic_fallback_mode": "lexical",
+      "active_rebuild": false
+    }
+  }
+}
