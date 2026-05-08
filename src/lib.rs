@@ -11583,6 +11583,50 @@ mod pack_field_mask_tests {
     }
 
     #[test]
+    fn pack_field_mask_projection_is_order_and_duplicate_invariant() {
+        let canonical = fields(&[
+            "query.text",
+            "realized.search_mode",
+            "pack.answer_outline",
+            "evidence[].citation",
+            "evidence[].excerpt",
+            "omitted.count",
+            "privacy.redaction_applied",
+        ]);
+        let permuted = fields(&[
+            "privacy.redaction_applied",
+            "evidence[].excerpt",
+            "query.text",
+            "omitted.count",
+            "pack.answer_outline",
+            "evidence[].citation",
+            "realized.search_mode",
+        ]);
+        let duplicated = fields(&[
+            "query.text",
+            "evidence[].citation",
+            "query.text",
+            "realized.search_mode",
+            "pack.answer_outline",
+            "evidence[].excerpt",
+            "omitted.count",
+            "privacy.redaction_applied",
+            "evidence[].citation",
+        ]);
+
+        let expected = filter_pack_fields(sample_pack_value(), Some(&canonical)).unwrap();
+
+        assert_eq!(
+            filter_pack_fields(sample_pack_value(), Some(&permuted)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            filter_pack_fields(sample_pack_value(), Some(&duplicated)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn pack_mixed_valid_and_unknown_masks_warn_without_failing() {
         let fields = fields(&["query.text", "no_such_field"]);
         let filtered = filter_pack_fields(sample_pack_value(), Some(&fields)).unwrap();
