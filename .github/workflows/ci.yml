@@ -187,6 +187,117 @@ jobs:
         # the build fail because CI clones siblings at HEAD, not pinned revs.
         run: cargo clippy --all-targets --features "qr encryption backtrace" -- -D warnings
 
+  # UBS pre-merge gate per coding_agent_session_search-dpfvr.
+  # Runs `ubs --ci --fail-on-warning <changed-files>` against the diff for the
+  # PR (or push range on main). Skips when no relevant files changed.
+  ubs-changed-files:
+    name: UBS (Ultimate Bug Scanner) Pre-Merge Gate
+    needs: [no-mock-audit]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (full history for diff)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # `origin/main` must be reachable for `git diff origin/main...HEAD`.
+          fetch-depth: 0
+
+      - name: Compute changed files
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          # PR runs: diff against the merge-base with the target branch.
+          # Push runs: diff against main's previous tip.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            range="origin/${{ github.base_ref }}...HEAD"
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            range="${{ github.event.before }}...HEAD"
+          else
+            # workflow_dispatch / other — diff against origin/main.
+            range="origin/main...HEAD"
+          fi
+          echo "Diff range: $range"
+
+          # Filter to the file extensions UBS supports. Skip everything else.
+          # Use a robust extension list and -z to handle filenames with spaces.
+          mapfile -t files < <(git diff --name-only "$range" -- \
+              '*.rs' '*.toml' '*.ts' '*.tsx' '*.js' '*.jsx' '*.py' '*.sh' '*.yml' '*.yaml' '*.md' \
+              2>/dev/null | grep -v -E '^test-results/|^target/|^node_modules/' || true)
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No UBS-relevant files changed; skipping gate."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          # Persist file list for the next step. Use NUL-delim safe via base64
+          # to avoid shell escaping issues with unusual filenames.
+          printf '%s\n' "${files[@]}" > /tmp/ubs-changed-files.txt
+          echo "files_count=${#files[@]}" >> "$GITHUB_OUTPUT"
+          echo "Files (first 20):"
+          head -20 /tmp/ubs-changed-files.txt
+
+      - name: Install UBS
+        if: steps.changed.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # UBS is distributed as a single shell installer per the project's
+          # README. We pin a version via .github/workflows/ubs-version.txt so
+          # CI is reproducible across runs. If the file is absent, fall back
+          # to the latest stable release tag.
+          if [ -f .github/workflows/ubs-version.txt ]; then
+            UBS_VERSION="$(tr -d '[:space:]' < .github/workflows/ubs-version.txt)"
+          else
+            UBS_VERSION="latest"
+          fi
+          echo "Installing UBS version: $UBS_VERSION"
+          # Heuristic install: prefer cargo-binstall -> direct binary -> source.
+          # The project's existing tooling assumes ubs is on PATH.
+          if command -v ubs >/dev/null 2>&1; then
+            echo "ubs already on PATH: $(command -v ubs)"
+            ubs --version || true
+          else
+            # Fall back: build from source. Slow but reliable.
+            cargo install ubs --locked --version "$UBS_VERSION" 2>/dev/null || \
+              cargo install ubs --locked
+          fi
+
+      - name: Run UBS on changed files
+        if: steps.changed.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          # Pass the changed-file list to UBS. Use --ci for machine-readable
+          # output and --fail-on-warning so warnings block merge.
+          xargs -a /tmp/ubs-changed-files.txt \
+            ubs --ci --fail-on-warning \
+            > test-results/ubs-report.json 2> test-results/ubs-stderr.log || {
+              rc=$?
+              echo "UBS exited $rc"
+              echo "::group::UBS stderr (last 50 lines)"
+              tail -50 test-results/ubs-stderr.log || true
+              echo "::endgroup::"
+              echo "::group::UBS findings (jq)"
+              jq -c '.' test-results/ubs-report.json 2>/dev/null | head -100 || cat test-results/ubs-report.json | head -2000
+              echo "::endgroup::"
+              exit "$rc"
+            }
+          echo "UBS PASS — no findings on changed files."
+
+      - name: Upload UBS report
+        if: always() && steps.changed.outputs.skip != 'true'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4
+        with:
+          name: ubs-report-${{ github.run_id }}
+          path: |
+            test-results/ubs-report.json
+            test-results/ubs-stderr.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Rust unit tests
   test-rust:
     name: Rust Tests (${{ matrix.os }})
