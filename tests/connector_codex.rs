@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-use coding_agent_search::connectors::{codex::CodexConnector, Connector, ScanContext};
+use coding_agent_search::connectors::{codex::CodexConnector, Connector, ScanContext, ScanRoot};
 use serial_test::serial;
 
 fn codex_real_fixture_home() -> PathBuf {
@@ -262,6 +262,40 @@ fn codex_connector_indexes_modern_response_items() {
             .count(),
         1,
         "agent_message and output_text duplicates should collapse to one searchable message"
+    );
+}
+
+#[test]
+#[serial]
+fn codex_connector_scans_explicit_rollout_file_root() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join(".codex/sessions/2026/05/08");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-explicit.jsonl");
+
+    let sample = r#"{"timestamp":"2026-05-08T23:09:00.000Z","type":"session_meta","payload":{"id":"explicit-id","cwd":"/data/projects/ntm","cli_version":"0.49.0"}}
+{"timestamp":"2026-05-08T23:09:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"explicit watch once bd-2mb03"}]}}
+{"timestamp":"2026-05-08T23:09:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-explicit","output":"bd-2mb03 direct file root output\n"}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_dir: dir.path().join(".codex"),
+        scan_roots: vec![ScanRoot::local(file.clone())],
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+
+    let conv = &convs[0];
+    assert_eq!(conv.source_path, file);
+    assert_eq!(conv.workspace, Some(PathBuf::from("/data/projects/ntm")));
+    assert!(
+        conv.messages
+            .iter()
+            .any(|message| message.content.contains("bd-2mb03 direct file root")),
+        "explicit file-root scans must index modern response items"
     );
 }
 
