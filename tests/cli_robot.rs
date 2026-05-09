@@ -760,6 +760,18 @@ fn view_path_assignment_attaches_to_path_positional() {
 }
 
 #[test]
+fn view_path_line_shorthand_attaches_to_line_option() {
+    let mut cmd = base_cmd();
+    cmd.args(["view", "README.md:1", "--json", "--context", "0"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");
+
+    assert_eq!(json["path"], "README.md");
+    assert_eq!(json["target_line"].as_u64(), Some(1));
+}
+
+#[test]
 fn search_format_json_alias_attaches_to_robot_format() {
     let tmp = TempDir::new().unwrap();
     let mut cmd = base_cmd();

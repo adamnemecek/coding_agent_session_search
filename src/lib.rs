@@ -2259,6 +2259,42 @@ fn rewrite_named_assignment_positional(
     None
 }
 
+fn split_path_line_assignment(arg: &str) -> Option<(String, usize)> {
+    let (path, line) = arg.rsplit_once(':')?;
+    if path.is_empty() {
+        return None;
+    }
+    let line = line.parse::<usize>().ok().filter(|line| *line > 0)?;
+    Some((path.to_string(), line))
+}
+
+fn has_line_arg(rest: &[String]) -> bool {
+    rest.iter()
+        .any(|arg| arg == "--line" || arg == "-n" || arg.starts_with("--line="))
+}
+
+fn recover_path_line_positionals(rest: &mut Vec<String>, corrections: &mut Vec<String>) {
+    let Some(command) = rest.first().cloned() else {
+        return;
+    };
+    if !matches!(command.as_str(), "expand" | "view") || has_line_arg(rest) {
+        return;
+    }
+    let Some(raw_path) = rest.get(1).cloned() else {
+        return;
+    };
+    let Some((path, line)) = split_path_line_assignment(&raw_path) else {
+        return;
+    };
+
+    rest[1] = path;
+    rest.push("--line".to_string());
+    rest.push(line.to_string());
+    corrections.push(format!(
+        "'{command} {raw_path}' → '{command} <path> --line {line}' (path:line shorthand)"
+    ));
+}
+
 fn recover_named_required_positionals(rest: &mut Vec<String>, corrections: &mut Vec<String>) {
     let Some(command) = rest.first().cloned() else {
         return;
@@ -2804,6 +2840,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     recover_structured_format_aliases(&mut rest, &mut corrections);
     recover_limit_aliases(&mut rest, &mut corrections);
     recover_named_required_positionals(&mut rest, &mut corrections);
+    recover_path_line_positionals(&mut rest, &mut corrections);
     if rest
         .first()
         .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
