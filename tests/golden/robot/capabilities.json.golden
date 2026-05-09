@@ -3027,6 +3027,18 @@
       "canonical": "cass status --json",
       "accepted": true,
       "behavior": "A leading robot-mode flag is canonicalized to the subcommand's JSON output flag."
+    },
+    {
+      "wrong": "cass search --query auth --json",
+      "canonical": "cass search auth --json",
+      "accepted": true,
+      "behavior": "A named query option is converted to the required positional query for agent-facing commands."
+    },
+    {
+      "wrong": "cass view --path session.jsonl --line 42 --json",
+      "canonical": "cass view session.jsonl --line 42 --json",
+      "accepted": true,
+      "behavior": "A named path option is converted to the required positional path for drill-down commands."
     }
   ],
   "limits": {

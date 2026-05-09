@@ -6,6 +6,7 @@ examples:
   cass preflight --json  # accepted alias
   cass --json            # also defaults to triage for zero-context agents
   cass --json search "auth"  # leading --json is moved to the search subcommand
+  cass search --query "auth" --json  # --query is accepted and converted to positional syntax
   # Follow next_command when present; use discovery.schemas_command for typed clients.
 
 # Basic search with JSON output for agents

@@ -760,6 +760,8 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass --robot` | `cass triage --json` | Top-level robot request defaults to safe preflight |
 | `cass --json search "auth"` | `cass search "auth" --json` | Leading structured flag moved to the robot-capable subcommand |
 | `cass --robot status` | `cass status --json` | Leading robot flag canonicalized to JSON output |
+| `cass search --query "auth" --json` | `cass search "auth" --json` | Named query option converted to required positional query |
+| `cass view --path session.jsonl --line 42 --json` | `cass view session.jsonl --line 42 --json` | Named path option converted to required positional path |
 | `cass search --limt 5` | `cass search --limit 5` | Flag typos within Levenshtein distance ≤2 corrected |
 
 The CLI applies multiple normalization layers:
@@ -769,7 +771,8 @@ The CLI applies multiple normalization layers:
 4. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
 5. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
 6. **Leading structured flag recovery**: `--json`/`--robot` before a robot-capable subcommand is moved onto that subcommand
-7. **Global flag hoisting**: Position-independent flag handling
+7. **Named positional recovery**: `--query` for search/pack and `--path`/`--source-path`/`--file`/`--session` for drill-down/export commands become the required positional argument
+8. **Global flag hoisting**: Position-independent flag handling
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 

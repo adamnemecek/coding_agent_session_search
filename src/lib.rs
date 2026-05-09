@@ -2214,6 +2214,60 @@ fn move_leading_structured_flag_to_subcommand(rest: &mut Vec<String>) -> bool {
     true
 }
 
+fn take_named_value(rest: &mut Vec<String>, names: &[&str]) -> Option<(String, String)> {
+    for index in 1..rest.len() {
+        let arg = rest[index].clone();
+        for name in names {
+            if arg == *name {
+                let value = rest.get(index + 1)?;
+                if value.starts_with('-') {
+                    return None;
+                }
+                let value = value.clone();
+                rest.drain(index..=index + 1);
+                return Some(((*name).to_string(), value));
+            }
+
+            let prefix = format!("{name}=");
+            if let Some(value) = arg.strip_prefix(&prefix)
+                && !value.is_empty()
+            {
+                rest.remove(index);
+                return Some(((*name).to_string(), value.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn recover_named_required_positionals(rest: &mut Vec<String>, corrections: &mut Vec<String>) {
+    let Some(command) = rest.first().cloned() else {
+        return;
+    };
+
+    match command.as_str() {
+        "search" | "pack" => {
+            if let Some((flag, value)) = take_named_value(rest, &["--query"]) {
+                rest.insert(1, value);
+                corrections.push(format!(
+                    "'{command} {flag} <value>' → '{command} <query>' (query is positional)"
+                ));
+            }
+        }
+        "context" | "expand" | "export" | "export-html" | "resume" | "view" => {
+            if let Some((flag, value)) =
+                take_named_value(rest, &["--path", "--source-path", "--file", "--session"])
+            {
+                rest.insert(1, value);
+                corrections.push(format!(
+                    "'{command} {flag} <value>' → '{command} <path>' (path is positional)"
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Normalize common robot-mode invocation mistakes to make the CLI more forgiving for AI agents.
 ///
 /// This function applies multiple layers of normalization to maximize acceptance of
@@ -2225,7 +2279,8 @@ fn move_leading_structured_flag_to_subcommand(rest: &mut Vec<String>) -> bool {
 /// 4. **Flag-as-subcommand**: `--robot-docs` → `robot-docs` subcommand
 /// 5. **Root structured-output default**: `--json`/`--robot` with no command → `triage --json`
 /// 6. **Leading structured-output recovery**: `--json search` → `search --json`
-/// 7. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 7. **Named positional recovery**: `search --query foo` → `search foo`
+/// 8. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -2261,6 +2316,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "data-dir",
         "verbose",
         "quiet",
+        "query",
         "color",
         "progress",
         "wrap",
@@ -2283,6 +2339,10 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "aggregate",
         "display",
         // Subcommand-specific flags
+        "path",
+        "source-path",
+        "file",
+        "session",
         "line",
         "context",
         "output",
@@ -2564,6 +2624,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             "Leading --json/--robot moved after the subcommand (structured output flag)".into(),
         );
     }
+    recover_named_required_positionals(&mut rest, &mut corrections);
     if rest
         .first()
         .is_some_and(|arg| arg.eq_ignore_ascii_case("doctor"))
@@ -11211,6 +11272,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass preflight --json  # accepted alias".to_string(),
             "  cass --json            # also defaults to triage for zero-context agents".to_string(),
             "  cass --json search \"auth\"  # leading --json is moved to the search subcommand".to_string(),
+            "  cass search --query \"auth\" --json  # --query is accepted and converted to positional syntax".to_string(),
             "  # Follow next_command when present; use discovery.schemas_command for typed clients.".to_string(),
             String::new(),
             "# Basic search with JSON output for agents".to_string(),
@@ -62449,6 +62511,18 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass status --json",
             true,
             "A leading robot-mode flag is canonicalized to the subcommand's JSON output flag.",
+        ),
+        mistake_recovery_capability(
+            "cass search --query auth --json",
+            "cass search auth --json",
+            true,
+            "A named query option is converted to the required positional query for agent-facing commands.",
+        ),
+        mistake_recovery_capability(
+            "cass view --path session.jsonl --line 42 --json",
+            "cass view session.jsonl --line 42 --json",
+            true,
+            "A named path option is converted to the required positional path for drill-down commands.",
         ),
     ]
 }
