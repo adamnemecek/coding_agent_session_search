@@ -62156,15 +62156,28 @@ fn build_workflow_capabilities() -> Vec<WorkflowCapability> {
     vec![
         workflow_capability(
             "cold-start",
-            "Discover the CLI contract from zero context.",
-            "cass capabilities --json",
+            "Discover readiness, exact next command, docs, schemas, workflows, and recoveries from zero context.",
+            "cass triage --json",
             &[
+                "cass capabilities --json",
                 "cass --robot-help --color=never",
                 "cass robot-docs guide --color=never",
                 "cass introspect --json",
             ],
-            "Parse workflows, commands, global_flags, exit_codes, env_vars, and limits.",
-            "Use capabilities first; use introspect only when you need full response schemas.",
+            "Parse status, healthy, initialized, next_command, recommended_commands[], discovery, starter_workflows[], and mistake_recoveries[].",
+            "Use triage first when you do not know whether the archive is initialized; use capabilities/introspect for static API binding.",
+        ),
+        workflow_capability(
+            "api-discovery",
+            "Discover the static CLI contract for typed clients and prompt construction.",
+            "cass capabilities --json",
+            &[
+                "cass introspect --json",
+                "cass robot-docs commands --color=never",
+                "cass robot-docs schemas --color=never",
+            ],
+            "Parse workflows, commands, global_flags, exit_codes, env_vars, limits, and response_schemas.",
+            "Capabilities is static self-description; triage is the read-only runtime preflight.",
         ),
         workflow_capability(
             "health-preflight",
@@ -62281,6 +62294,18 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             true,
             "robot-docs is already machine-readable; redundant robot/json flags are removed and the guide topic is used by default.",
         ),
+        mistake_recovery_capability(
+            "cass ready --json",
+            "cass triage --json",
+            true,
+            "ready is accepted as the one-shot agent triage alias.",
+        ),
+        mistake_recovery_capability(
+            "cass preflight --json",
+            "cass triage --json",
+            true,
+            "preflight is accepted as the one-shot agent triage alias.",
+        ),
     ]
 }
 
@@ -62317,6 +62342,7 @@ fn run_capabilities(output_format: Option<RobotFormat>) -> CliResult<()> {
             "doctor_archive_first_safety".to_string(),
             "api_version_command".to_string(),
             "introspect_command".to_string(),
+            "triage_command".to_string(),
             "export_command".to_string(),
             "expand_command".to_string(),
             "timeline_command".to_string(),
@@ -66126,6 +66152,92 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     }
                 }
             }
+        }),
+    );
+    schemas.insert(
+        "triage".to_string(),
+        json!({
+            "type": "object",
+            "description": "One-shot read-only first stop for automation agents. Summarizes readiness and returns exact next commands plus discovery pointers.",
+            "properties": {
+                "surface": { "type": "string" },
+                "schema_version": { "type": "integer" },
+                "status": { "type": "string" },
+                "healthy": { "type": "boolean" },
+                "initialized": { "type": "boolean" },
+                "explanation": { "type": ["string", "null"] },
+                "recommended_action": { "type": ["string", "null"] },
+                "recommended_commands": response_schema_recommended_commands(),
+                "next_command": { "type": ["string", "null"] },
+                "readiness": {
+                    "type": "object",
+                    "properties": {
+                        "index": response_schema_index_state(),
+                        "database": response_schema_state_database(),
+                        "pending": response_schema_pending_state(),
+                        "rebuild": response_schema_rebuild_state(),
+                        "rebuild_progress": response_schema_rebuild_progress(),
+                        "semantic": response_schema_semantic_state()
+                    }
+                },
+                "discovery": {
+                    "type": "object",
+                    "properties": {
+                        "capabilities_command": { "type": "string" },
+                        "schemas_command": { "type": "string" },
+                        "docs_command": { "type": "string" },
+                        "api_version_command": { "type": "string" }
+                    }
+                },
+                "starter_workflows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "intent": { "type": "string" },
+                            "first_command": { "type": "string" },
+                            "follow_up_commands": { "type": "array", "items": { "type": "string" } },
+                            "parse_contract": { "type": "string" },
+                            "note": { "type": "string" }
+                        }
+                    }
+                },
+                "mistake_recoveries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "wrong": { "type": "string" },
+                            "canonical": { "type": "string" },
+                            "accepted": { "type": "boolean" },
+                            "behavior": { "type": "string" }
+                        }
+                    }
+                },
+                "_meta": {
+                    "type": "object",
+                    "properties": {
+                        "timestamp": { "type": "string" },
+                        "data_dir": { "type": "string" },
+                        "db_path": { "type": "string" }
+                    }
+                }
+            },
+            "required": [
+                "surface",
+                "schema_version",
+                "status",
+                "healthy",
+                "initialized",
+                "recommended_commands",
+                "next_command",
+                "readiness",
+                "discovery",
+                "starter_workflows",
+                "mistake_recoveries",
+                "_meta"
+            ]
         }),
     );
     schemas.insert(

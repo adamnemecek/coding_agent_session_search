@@ -282,7 +282,14 @@ fn capabilities_are_self_describing_for_agents() {
     );
 
     let commands = json["commands"].as_array().expect("commands array");
-    for expected in ["search", "pack", "health", "introspect", "robot-docs"] {
+    for expected in [
+        "triage",
+        "search",
+        "pack",
+        "health",
+        "introspect",
+        "robot-docs",
+    ] {
         assert!(
             commands.iter().any(|command| command["name"] == expected),
             "capabilities should include command {expected}"
@@ -329,6 +336,15 @@ fn capabilities_are_self_describing_for_agents() {
     }
 
     let workflows = json["workflows"].as_array().expect("workflows array");
+    let cold_start = workflows
+        .iter()
+        .find(|workflow| workflow["name"] == "cold-start")
+        .expect("cold-start workflow present");
+    assert_eq!(
+        cold_start["first_command"],
+        Value::String("cass triage --json".to_string()),
+        "cold-start should make triage the first instinctive command"
+    );
     let bounded_search = workflows
         .iter()
         .find(|workflow| workflow["name"] == "bounded-search")
@@ -367,6 +383,78 @@ fn capabilities_are_self_describing_for_agents() {
             && recovery["accepted"] == true),
         "capabilities should advertise top-level typo recovery"
     );
+    assert!(
+        recoveries.iter().any(|recovery| recovery["wrong"] == "cass ready --json"
+            && recovery["canonical"] == "cass triage --json"
+            && recovery["accepted"] == true),
+        "capabilities should advertise ready as a triage alias"
+    );
+}
+
+#[test]
+fn triage_missing_db_is_success_and_actionable() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_string_lossy().to_string();
+    let mut cmd = base_cmd();
+    cmd.args(["triage", "--json", "--data-dir", &data_dir]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid triage json");
+
+    assert_eq!(json["surface"], "triage");
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["status"], "not_initialized");
+    assert_eq!(json["healthy"], false);
+    assert_eq!(json["initialized"], false);
+    assert!(
+        json["next_command"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("cass index --full --json --no-progress-events --data-dir "),
+        "triage should expose the exact next command: {json}"
+    );
+    assert_not_initialized_recommended_commands(&json, tmp.path());
+    assert_eq!(
+        json["discovery"]["capabilities_command"],
+        Value::String("cass capabilities --json".to_string())
+    );
+    assert_eq!(
+        json["discovery"]["schemas_command"],
+        Value::String("cass introspect --json".to_string())
+    );
+    assert!(
+        json["starter_workflows"].as_array().is_some_and(|workflows| {
+            workflows
+                .iter()
+                .any(|workflow| workflow["name"] == "cold-start")
+        }),
+        "triage should inline starter workflows for zero-context callers: {json}"
+    );
+    assert!(
+        json["mistake_recoveries"].as_array().is_some_and(|recoveries| {
+            recoveries
+                .iter()
+                .any(|recovery| recovery["canonical"] == "cass triage --json")
+        }),
+        "triage should inline accepted recovery aliases: {json}"
+    );
+    assert_eq!(json["readiness"]["index"]["exists"], false);
+}
+
+#[test]
+fn triage_aliases_are_accepted() {
+    for alias in ["ready", "preflight"] {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_string_lossy().to_string();
+        let mut cmd = base_cmd();
+        cmd.args([alias, "--json", "--data-dir", &data_dir]);
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: Value =
+            serde_json::from_str(stdout.trim()).expect("alias should return valid triage json");
+        assert_eq!(json["surface"], "triage", "alias {alias} should run triage");
+        assert_eq!(json["status"], "not_initialized");
+    }
 }
 
 #[test]
