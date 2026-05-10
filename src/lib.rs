@@ -3458,21 +3458,22 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 ///
 /// 1. **Single-dash long flags**: `-robot` → `--robot`, `-limit` → `--limit`
 /// 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
-/// 3. **Subcommand aliases**: `find`/`query`/`q` → `search`, `ls`/`list` → `stats`, etc.
-/// 4. **Flag-as-subcommand**: `--robot-docs` → `robot-docs` subcommand
-/// 5. **Root structured-output default**: `--json`/`--robot` with no command → `triage --json`
-/// 6. **Leading structured-output recovery**: `--json search` → `search --json`
-/// 7. **Named positional recovery**: `search --query foo` → `search foo`
-/// 8. **Multi-word query recovery**: `search foo bar --json` → `search "foo bar" --json`
-/// 9. **Structured format alias recovery**: `search foo --format json` → `search foo --robot-format json`
-/// 10. **Result-count alias recovery**: `search foo --max-results 5` → `search foo --limit 5`
-/// 11. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
-/// 12. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
-/// 13. **Bare option-pair recovery**: `search foo provider codex` → `search foo --agent codex`
-/// 14. **Leading-filter query recovery**: `search --agent codex foo bar` → `search "foo bar" --agent codex`
-/// 15. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
-/// 16. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
-/// 17. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 3. **Snake-case flag recovery**: `--max_results` → `--max-results`
+/// 4. **Subcommand aliases**: `find`/`query`/`q` → `search`, `ls`/`list` → `stats`, etc.
+/// 5. **Flag-as-subcommand**: `--robot-docs` → `robot-docs` subcommand
+/// 6. **Root structured-output default**: `--json`/`--robot` with no command → `triage --json`
+/// 7. **Leading structured-output recovery**: `--json search` → `search --json`
+/// 8. **Named positional recovery**: `search --query foo` → `search foo`
+/// 9. **Multi-word query recovery**: `search foo bar --json` → `search "foo bar" --json`
+/// 10. **Structured format alias recovery**: `search foo --format json` → `search foo --robot-format json`
+/// 11. **Result-count alias recovery**: `search foo --max-results 5` → `search foo --limit 5`
+/// 12. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
+/// 13. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
+/// 14. **Bare option-pair recovery**: `search foo provider codex` → `search foo --agent codex`
+/// 15. **Leading-filter query recovery**: `search --agent codex foo bar` → `search "foo bar" --agent codex`
+/// 16. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
+/// 17. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
+/// 18. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -3714,7 +3715,18 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             || s == "--robot-help"
     };
 
-    /// Normalize a single argument: single-dash → double-dash, case → lowercase
+    fn canonical_known_long_flag(flag: &str) -> Option<String> {
+        if flag.contains('_') {
+            let kebab = flag.replace('_', "-");
+            if KNOWN_LONG_FLAGS.contains(&kebab.as_str()) {
+                return Some(kebab);
+            }
+        }
+
+        KNOWN_LONG_FLAGS.contains(&flag).then(|| flag.to_string())
+    }
+
+    /// Normalize a single argument: single-dash → double-dash, case → lowercase, snake_case → kebab-case
     fn normalize_single_arg(arg: &str, corrections: &mut Vec<String>) -> String {
         // Skip if already valid short flag
         if VALID_SHORT_FLAGS.contains(&arg) {
@@ -3729,20 +3741,24 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
                 (&arg[1..], None)
             };
             let flag_lower = flag_part.to_lowercase();
-            if KNOWN_LONG_FLAGS.contains(&flag_lower.as_str()) {
+            if let Some(flag_canonical) = canonical_known_long_flag(&flag_lower) {
                 let corrected = if let Some(val) = value_part {
-                    format!("--{flag_lower}{val}")
+                    format!("--{flag_canonical}{val}")
                 } else {
-                    format!("--{flag_lower}")
+                    format!("--{flag_canonical}")
                 };
-                corrections.push(format!(
-                    "'{arg}' → '{corrected}' (use double-dash for long flags)"
-                ));
+                let reason = if flag_lower == flag_canonical {
+                    "use double-dash for long flags"
+                } else {
+                    "use double-dash and kebab-case for long flags"
+                };
+                corrections.push(format!("'{arg}' → '{corrected}' ({reason})"));
                 return corrected;
             }
         }
 
-        // Handle case normalization for double-dash flags: --Robot → --robot
+        // Handle case/snake_case normalization for double-dash flags:
+        // --Robot → --robot, --max_results → --max-results.
         if let Some(stripped) = arg.strip_prefix("--") {
             let (flag_part, value_part) = if let Some(idx) = stripped.find('=') {
                 (&stripped[..idx], Some(&stripped[idx..]))
@@ -3750,13 +3766,20 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
                 (stripped, None)
             };
             let flag_lower = flag_part.to_lowercase();
-            if flag_part != flag_lower && KNOWN_LONG_FLAGS.contains(&flag_lower.as_str()) {
+            if let Some(flag_canonical) = canonical_known_long_flag(&flag_lower)
+                && flag_part != flag_canonical
+            {
                 let corrected = if let Some(val) = value_part {
-                    format!("--{flag_lower}{val}")
+                    format!("--{flag_canonical}{val}")
                 } else {
-                    format!("--{flag_lower}")
+                    format!("--{flag_canonical}")
                 };
-                corrections.push(format!("'{arg}' → '{corrected}' (flags are lowercase)"));
+                let reason = if flag_lower == flag_canonical {
+                    "flags are lowercase"
+                } else {
+                    "long flags use kebab-case"
+                };
+                corrections.push(format!("'{arg}' → '{corrected}' ({reason})"));
                 return corrected;
             }
         }
@@ -65027,6 +65050,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass search auth --limit 5 --json",
             true,
             "A common result-count alias is converted to the canonical limit flag.",
+        ),
+        mistake_recovery_capability(
+            "cass search auth --max_results 5 --json",
+            "cass search auth --limit 5 --json",
+            true,
+            "Snake_case long flags are normalized to kebab-case before alias recovery runs.",
         ),
         mistake_recovery_capability(
             "cass search auth max_results=5 --json",

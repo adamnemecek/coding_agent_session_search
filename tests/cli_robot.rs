@@ -456,6 +456,13 @@ fn capabilities_are_self_describing_for_agents() {
     );
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
+            == "cass search auth --max_results 5 --json"
+            && recovery["canonical"] == "cass search auth --limit 5 --json"
+            && recovery["accepted"] == true),
+        "capabilities should advertise snake-case long flag recovery"
+    );
+    assert!(
+        recoveries.iter().any(|recovery| recovery["wrong"]
             == "cass search auth max_results=5 --json"
             && recovery["canonical"] == "cass search auth --limit 5 --json"
             && recovery["accepted"] == true),
@@ -1986,6 +1993,16 @@ fn assert_search_limit_alias_limits_to_one(alias_args: &[&str]) {
 #[test]
 fn search_max_results_alias_attaches_to_limit() {
     assert_search_limit_alias_limits_to_one(&["--max-results", "1"]);
+}
+
+#[test]
+fn search_snake_case_max_results_flag_attaches_to_limit() {
+    assert_search_limit_alias_limits_to_one(&["--max_results", "1"]);
+}
+
+#[test]
+fn search_snake_case_max_results_equals_attaches_to_limit() {
+    assert_search_limit_alias_limits_to_one(&["--max_results=1"]);
 }
 
 #[test]
