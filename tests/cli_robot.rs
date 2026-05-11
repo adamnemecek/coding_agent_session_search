@@ -416,6 +416,14 @@ fn capabilities_are_self_describing_for_agents() {
         "capabilities should advertise multi-word search query recovery"
     );
     assert!(
+        recoveries
+            .iter()
+            .any(|recovery| recovery["wrong"] == "cass answer auth --json"
+                && recovery["canonical"] == "cass pack auth --json"
+                && recovery["accepted"] == true),
+        "capabilities should advertise answer-pack alias recovery"
+    );
+    assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
             == "cass search auth provider codex limit 5 last 7d --json"
             && recovery["canonical"]
@@ -814,6 +822,42 @@ fn pack_named_query_flag_attaches_to_query_positional() {
         stderr.contains("missing-index") || stderr.contains("not been initialized"),
         "pack should reach runtime initialization handling, got: {stderr}"
     );
+}
+
+fn assert_pack_alias_runs(alias: &str) {
+    let mut cmd = base_cmd();
+    cmd.args([
+        alias,
+        "auth",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+        "--limit",
+        "1",
+        "--max-evidence",
+        "1",
+        "--max-sessions",
+        "1",
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid pack JSON");
+
+    assert_eq!(json["schema_version"].as_str(), Some("cass.pack.v1"));
+    assert_eq!(json["query"]["text"].as_str(), Some("auth"));
+    assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
+    assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
+}
+
+#[test]
+fn answer_alias_runs_pack_command() {
+    assert_pack_alias_runs("answer");
+}
+
+#[test]
+fn handoff_alias_runs_pack_command() {
+    assert_pack_alias_runs("handoff");
 }
 
 #[test]

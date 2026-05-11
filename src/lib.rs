@@ -3673,6 +3673,11 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         // Agent triage aliases
         ("ready", "triage"),
         ("preflight", "triage"),
+        // Answer-pack aliases
+        ("answer", "pack"),
+        ("evidence", "pack"),
+        ("bundle", "pack"),
+        ("handoff", "pack"),
         // Introspect aliases
         ("inspect", "introspect"),
         ("intro", "introspect"),
@@ -65041,6 +65046,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass search \"auth error\" --json",
             true,
             "Adjacent bare words after search/pack are folded into the query positional before filters are parsed.",
+        ),
+        mistake_recovery_capability(
+            "cass answer auth --json",
+            "cass pack auth --json",
+            true,
+            "Answer/handoff/bundle/evidence aliases route cited-handoff intent to the answer-pack command instead of implicit search.",
         ),
         mistake_recovery_capability(
             "cass auth error --json",

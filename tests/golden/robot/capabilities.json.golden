@@ -3042,6 +3042,12 @@
       "behavior": "Adjacent bare words after search/pack are folded into the query positional before filters are parsed."
     },
     {
+      "wrong": "cass answer auth --json",
+      "canonical": "cass pack auth --json",
+      "accepted": true,
+      "behavior": "Answer/handoff/bundle/evidence aliases route cited-handoff intent to the answer-pack command instead of implicit search."
+    },
+    {
       "wrong": "cass auth error --json",
       "canonical": "cass search \"auth error\" --json",
       "accepted": true,
