@@ -416,6 +416,13 @@ fn capabilities_are_self_describing_for_agents() {
         "capabilities should advertise query alias flag recovery"
     );
     assert!(
+        recoveries.iter().any(|recovery| recovery["wrong"]
+            == "cass html-export session.jsonl --json"
+            && recovery["canonical"] == "cass export-html session.jsonl --json"
+            && recovery["accepted"] == true),
+        "capabilities should advertise reversed HTML export alias recovery"
+    );
+    assert!(
         recoveries.iter().any(
             |recovery| recovery["wrong"] == "cass search auth error --json"
                 && recovery["canonical"] == "cass search \"auth error\" --json"
@@ -859,6 +866,31 @@ fn search_query_assignment_attaches_to_query_positional() {
         assert_eq!(json["dry_run"].as_bool(), Some(true), "{assignment}");
         assert_eq!(json["valid"].as_bool(), Some(true), "{assignment}");
         assert_eq!(json["query"].as_str(), Some(expected), "{assignment}");
+    }
+}
+
+#[test]
+fn html_export_aliases_route_to_export_html_command() {
+    for alias in ["html-export", "html_export", "exporthtml"] {
+        let mut cmd = base_cmd();
+        cmd.args([
+            alias,
+            "tests/fixtures/html_export/edge_cases/single_message.jsonl",
+            "--json",
+            "--dry-run",
+        ]);
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: Value = serde_json::from_str(stdout.trim()).expect("valid dry-run JSON");
+
+        assert_eq!(json["dry_run"].as_bool(), Some(true), "{alias}");
+        assert_eq!(json["valid"].as_bool(), Some(true), "{alias}");
+        assert_eq!(
+            json["session_path"].as_str(),
+            Some("tests/fixtures/html_export/edge_cases/single_message.jsonl"),
+            "{alias}"
+        );
+        assert_eq!(json["messages"].as_u64(), Some(1), "{alias}");
     }
 }
 

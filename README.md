@@ -765,6 +765,7 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass why auth failed --json --max-evidence 3` | `cass pack "auth failed" --json --max-evidence 3` | Question/RC prompt aliases normalized to answer pack |
 | `cass auth failed --json --max-evidence 3` | `cass pack "auth failed" --json --max-evidence 3` | Bare robot queries with pack-only flags become answer packs |
 | `cass search auth failed --json --max-evidence 3` | `cass pack "auth failed" --json --max-evidence 3` | Explicit robot search with pack-only flags becomes an answer pack |
+| `cass html-export session.jsonl --json` | `cass export-html session.jsonl --json` | Reversed HTML export aliases normalized to the archive exporter |
 | `cass search --query "auth" --json` | `cass search "auth" --json` | Named query option converted to required positional query |
 | `cass search --q "auth" --json` | `cass search "auth" --json` | Short/familiar query aliases converted to required positional query |
 | `cass search auth error --json` | `cass search "auth error" --json` | Adjacent unquoted query words folded into one search |
@@ -790,7 +791,7 @@ The CLI applies multiple normalization layers:
 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 3. **Snake-case flag recovery**: `--max_results`, `--data_dir`, and other known snake_case long flags become canonical kebab-case before alias recovery runs
 4. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
-5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`summarize` → `pack`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
+5. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `answer`/`evidence`/`bundle`/`handoff`/`why`/`explain`/`rca`/`root-cause`/`summarize` → `pack`; `html-export`/`html_export`/`exporthtml` → `export-html`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
 6. **Root robot default**: `cass --json`, `cass --robot`, or `cass --robot-format json` with no subcommand runs read-only `triage`
 7. **Leading structured flag recovery**: `--json`/`--robot` before a robot-capable subcommand is moved onto that subcommand
 8. **Named positional recovery**: `--query`/`--q`/`--text`/`--pattern` for search/pack and `--path`/`--source-path`/`--file`/`--session` for drill-down/export commands become the required positional argument

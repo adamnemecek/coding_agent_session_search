@@ -3771,6 +3771,10 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         ("rootcause", "pack"),
         ("summarize", "pack"),
         ("summarise", "pack"),
+        // HTML export aliases
+        ("html-export", "export-html"),
+        ("html_export", "export-html"),
+        ("exporthtml", "export-html"),
         // Introspect aliases
         ("inspect", "introspect"),
         ("intro", "introspect"),
@@ -65212,6 +65216,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass pack \"auth failed\" --json --max-evidence 3",
             true,
             "Question/RC prompt aliases route answer intent to pack, so pack-only evidence flags do not get misparsed as search flags.",
+        ),
+        mistake_recovery_capability(
+            "cass html-export session.jsonl --json",
+            "cass export-html session.jsonl --json",
+            true,
+            "Reversed HTML export spellings such as html-export, html_export, and exporthtml route to the self-contained HTML export command.",
         ),
         mistake_recovery_capability(
             "cass auth failed --json --max-evidence 3",
