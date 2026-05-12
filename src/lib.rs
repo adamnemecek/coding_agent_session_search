@@ -3282,33 +3282,38 @@ fn can_recover_format_alias_for_command(command: &str) -> bool {
     command != "export" && command_accepts_leading_structured_flag(command)
 }
 
-fn parse_format_alias_at(rest: &[String], index: usize) -> Option<(usize, String)> {
+fn parse_format_alias_at(rest: &[String], index: usize) -> Option<(usize, String, &'static str)> {
     let arg = rest.get(index)?;
-    if arg == "--format" {
-        let value = rest.get(index + 1)?;
-        let value = value.to_ascii_lowercase();
-        if is_robot_format_alias_value(&value) {
-            return Some((2, value));
+    for alias in ["--format", "--output", "--output-format"] {
+        if arg == alias {
+            let value = rest.get(index + 1)?;
+            let value = value.to_ascii_lowercase();
+            if is_robot_format_alias_value(&value) {
+                return Some((2, value, alias));
+            }
         }
-    }
-    if let Some(value) = arg.strip_prefix("--format=") {
-        let value = value.to_ascii_lowercase();
-        if is_robot_format_alias_value(&value) {
-            return Some((1, value));
+        if let Some(value) = arg
+            .strip_prefix(alias)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            let value = value.to_ascii_lowercase();
+            if is_robot_format_alias_value(&value) {
+                return Some((1, value, alias));
+            }
         }
     }
     None
 }
 
 fn recover_structured_format_aliases(rest: &mut Vec<String>, corrections: &mut Vec<String>) {
-    if let Some((consumed, format)) = parse_format_alias_at(rest, 0) {
+    if let Some((consumed, format, alias)) = parse_format_alias_at(rest, 0) {
         match rest.get(consumed).cloned() {
             Some(command) if can_recover_format_alias_for_command(&command) => {
                 rest.drain(0..consumed);
                 rest.push("--robot-format".to_string());
                 rest.push(format.clone());
                 corrections.push(format!(
-                    "Leading '--format {format}' moved to '{command} --robot-format {format}' (structured output format)"
+                    "Leading '{alias} {format}' moved to '{command} --robot-format {format}' (structured output format)"
                 ));
                 return;
             }
@@ -3323,7 +3328,7 @@ fn recover_structured_format_aliases(rest: &mut Vec<String>, corrections: &mut V
                     rewritten.push(format.clone());
                     *rest = rewritten;
                     corrections.push(format!(
-                        "Top-level '--format {format}' → 'triage --robot-format {format}' (read-only agent preflight)"
+                        "Top-level '{alias} {format}' → 'triage --robot-format {format}' (read-only agent preflight)"
                     ));
                     return;
                 }
@@ -3334,7 +3339,7 @@ fn recover_structured_format_aliases(rest: &mut Vec<String>, corrections: &mut V
                 rest.push("--robot-format".to_string());
                 rest.push(format.clone());
                 corrections.push(format!(
-                    "Top-level '--format {format}' → 'triage --robot-format {format}' (read-only agent preflight)"
+                    "Top-level '{alias} {format}' → 'triage --robot-format {format}' (read-only agent preflight)"
                 ));
                 return;
             }
@@ -3350,13 +3355,13 @@ fn recover_structured_format_aliases(rest: &mut Vec<String>, corrections: &mut V
     }
 
     for index in 1..rest.len() {
-        if let Some((consumed, format)) = parse_format_alias_at(rest, index) {
+        if let Some((consumed, format, alias)) = parse_format_alias_at(rest, index) {
             rest.splice(
                 index..index + consumed,
                 ["--robot-format".to_string(), format.clone()],
             );
             corrections.push(format!(
-                "'{command} --format {format}' → '{command} --robot-format {format}' (structured output format)"
+                "'{command} {alias} {format}' → '{command} --robot-format {format}' (structured output format)"
             ));
             return;
         }
@@ -3626,7 +3631,7 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 7. **Leading structured-output recovery**: `--json search` → `search --json`
 /// 8. **Named positional recovery**: `search --query foo` → `search foo`
 /// 9. **Multi-word query recovery**: `search foo bar --json` → `search "foo bar" --json`
-/// 10. **Structured format alias recovery**: `search foo --format json` → `search foo --robot-format json`
+/// 10. **Structured format alias recovery**: `search foo --format json`/`--output json` → `search foo --robot-format json`
 /// 11. **Result-count alias recovery**: `search foo --max-results 5` → `search foo --limit 5`
 /// 12. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
 /// 13. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
@@ -3737,6 +3742,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "line",
         "context",
         "output",
+        "output-format",
         "format",
         "encrypt",
         "theme",
@@ -12763,7 +12769,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         RobotTopic::Guide => vec![
             "guide:".to_string(),
             "  Robot-mode handbook: docs/ROBOT_MODE.md (automation quickstart)".to_string(),
-            "  Output: --robot/--json; formats via --robot-format json|jsonl|compact|toon".to_string(),
+            "  Output: --robot/--json; formats via --robot-format json|jsonl|compact|toon (--format/--output aliases accepted)".to_string(),
             "  Logging: INFO auto-suppressed in robot mode; add -v to re-enable".to_string(),
             "  Search contract: SQLite is source of truth; lexical is the required self-healing fast path; semantic is opportunistic enrichment.".to_string(),
             "  Pack contract: `cass pack \"query\" --robot` returns extractive, cited handoff evidence selected from search results; it does not call an external model or mutate source logs.".to_string(),
@@ -12810,6 +12816,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass --json search \"auth\"  # leading --json is moved to the search subcommand".to_string(),
             "  cass search --query \"auth\" --json  # --query is accepted and converted to positional syntax".to_string(),
             "  cass search \"auth\" --format json  # --format json is accepted as --robot-format json".to_string(),
+            "  cass search \"auth\" --output json  # --output json also becomes --robot-format json".to_string(),
             "  cass search \"auth\" --max-results 5 --json  # result-count aliases become --limit".to_string(),
             "  # Follow next_command when present; use discovery.schemas_command for typed clients.".to_string(),
             String::new(),
@@ -65386,7 +65393,13 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass search auth --format json",
             "cass search auth --robot-format json",
             true,
-            "A familiar structured-output spelling is converted to cass's robot-format flag on robot-capable commands.",
+            "Familiar structured-output spellings are converted to cass's robot-format flag on robot-capable commands.",
+        ),
+        mistake_recovery_capability(
+            "cass search auth --output json",
+            "cass search auth --robot-format json",
+            true,
+            "Output-format aliases such as --output json and --output-format json are converted to cass's robot-format flag on robot-capable commands.",
         ),
         mistake_recovery_capability(
             "cass --format json status",

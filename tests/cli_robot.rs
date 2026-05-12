@@ -544,6 +544,14 @@ fn capabilities_are_self_describing_for_agents() {
         "capabilities should advertise snake-case long flag recovery"
     );
     assert!(
+        recoveries.iter().any(
+            |recovery| recovery["wrong"] == "cass search auth --output json"
+                && recovery["canonical"] == "cass search auth --robot-format json"
+                && recovery["accepted"] == true
+        ),
+        "capabilities should advertise output format alias recovery"
+    );
+    assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
             == "cass search auth max_results=5 --json"
             && recovery["canonical"] == "cass search auth --limit 5 --json"
@@ -1229,6 +1237,36 @@ fn search_format_json_alias_attaches_to_robot_format() {
 }
 
 #[test]
+fn search_output_json_aliases_attach_to_robot_format() {
+    for format_args in [
+        vec!["--output", "json"],
+        vec!["--output=json"],
+        vec!["--output-format=json"],
+        vec!["--output_format", "json"],
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let mut args = vec!["search", "foo"];
+        args.extend(format_args);
+        args.extend(["--data-dir", data_dir]);
+
+        let mut cmd = base_cmd();
+        cmd.args(args);
+        let output = cmd.assert().failure().get_output().clone();
+
+        assert_eq!(output.status.code(), Some(3));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last_line = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("stderr should contain JSON error");
+        let json: Value = serde_json::from_str(last_line).expect("valid JSON error");
+        assert_eq!(json["error"]["kind"], "missing-index");
+    }
+}
+
+#[test]
 fn status_format_json_alias_outputs_status_json() {
     let tmp = TempDir::new().unwrap();
     let mut cmd = base_cmd();
@@ -1244,6 +1282,30 @@ fn status_format_json_alias_outputs_status_json() {
 
     assert_eq!(json["status"], "not_initialized");
     assert_eq!(json["initialized"], false);
+}
+
+#[test]
+fn status_output_json_aliases_output_status_json() {
+    for format_args in [
+        vec!["status", "--output", "json"],
+        vec!["status", "--output=json"],
+        vec!["status", "--output-format=json"],
+        vec!["--output", "json", "status"],
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let mut args = format_args;
+        args.extend(["--data-dir", data_dir]);
+
+        let mut cmd = base_cmd();
+        cmd.args(args);
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: Value = serde_json::from_str(stdout.trim()).expect("valid status JSON");
+
+        assert_eq!(json["status"], "not_initialized");
+        assert_eq!(json["initialized"], false);
+    }
 }
 
 #[test]
@@ -1281,9 +1343,36 @@ fn root_format_json_defaults_to_triage() {
 }
 
 #[test]
+fn root_output_json_defaults_to_triage() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_string_lossy().to_string();
+    let mut cmd = base_cmd();
+    cmd.args(["--output", "json", "--data-dir", &data_dir]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid triage JSON");
+
+    assert_eq!(json["surface"], "triage");
+    assert_eq!(json["status"], "not_initialized");
+    assert_not_initialized_recommended_commands(&json, tmp.path());
+}
+
+#[test]
 fn capabilities_format_json_alias_outputs_capabilities_json() {
     let mut cmd = base_cmd();
     cmd.args(["capabilities", "--format", "json"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid capabilities JSON");
+
+    assert_eq!(json["contract_version"], "1");
+    assert!(json["mistake_recoveries"].as_array().is_some());
+}
+
+#[test]
+fn capabilities_output_json_alias_outputs_capabilities_json() {
+    let mut cmd = base_cmd();
+    cmd.args(["capabilities", "--output", "json"]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid capabilities JSON");
@@ -1308,6 +1397,25 @@ fn export_format_json_missing_path_is_not_robot_error_wrapped() {
     assert!(
         serde_json::from_str::<Value>(last_line).is_err(),
         "export --format json is the export format enum, not robot mode"
+    );
+}
+
+#[test]
+fn export_output_json_missing_path_is_not_robot_error_wrapped() {
+    let mut cmd = base_cmd();
+    cmd.args(["export", "--output", "json"]);
+    let output = cmd.assert().failure().code(2).get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("stderr should contain a usage error");
+
+    assert_eq!(last_line, "Could not parse arguments");
+    assert!(
+        serde_json::from_str::<Value>(last_line).is_err(),
+        "export --output json is an output file path, not robot mode"
     );
 }
 

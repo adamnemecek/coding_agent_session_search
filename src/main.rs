@@ -43,6 +43,9 @@ fn raw_command_name(args: &[String]) -> Option<&str> {
                 | "--stale-threshold"
                 | "--robot-format"
                 | "--format"
+                | "--output"
+                | "--output-format"
+                | "--output_format"
         ) {
             index += 2;
             continue;
@@ -57,6 +60,9 @@ fn raw_command_name(args: &[String]) -> Option<&str> {
             || arg.starts_with("--stale-threshold=")
             || arg.starts_with("--robot-format=")
             || arg.starts_with("--format=")
+            || arg.starts_with("--output=")
+            || arg.starts_with("--output-format=")
+            || arg.starts_with("--output_format=")
         {
             index += 1;
             continue;
@@ -105,10 +111,29 @@ fn is_robot_mode_args() -> bool {
         {
             return true;
         }
+        if let Some(value) = arg
+            .strip_prefix("--output=")
+            .or_else(|| arg.strip_prefix("--output-format="))
+            .or_else(|| arg.strip_prefix("--output_format="))
+            && is_robot_format_name(value)
+            && command_name != Some("export")
+        {
+            return true;
+        }
         if arg == "--format"
             && args
                 .get(index + 1)
                 .is_some_and(|value| is_robot_format_name(value))
+            && command_name != Some("export")
+        {
+            return true;
+        }
+        if matches!(
+            arg.as_str(),
+            "--output" | "--output-format" | "--output_format"
+        ) && args
+            .get(index + 1)
+            .is_some_and(|value| is_robot_format_name(value))
             && command_name != Some("export")
         {
             return true;

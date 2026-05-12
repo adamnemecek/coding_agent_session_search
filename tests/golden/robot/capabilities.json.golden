@@ -3142,7 +3142,13 @@
       "wrong": "cass search auth --format json",
       "canonical": "cass search auth --robot-format json",
       "accepted": true,
-      "behavior": "A familiar structured-output spelling is converted to cass's robot-format flag on robot-capable commands."
+      "behavior": "Familiar structured-output spellings are converted to cass's robot-format flag on robot-capable commands."
+    },
+    {
+      "wrong": "cass search auth --output json",
+      "canonical": "cass search auth --robot-format json",
+      "accepted": true,
+      "behavior": "Output-format aliases such as --output json and --output-format json are converted to cass's robot-format flag on robot-capable commands."
     },
     {
       "wrong": "cass --format json status",
