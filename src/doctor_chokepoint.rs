@@ -418,13 +418,23 @@ fn apply_op(path: &Path, op: &Op, run_dir: &Path) -> Result<(), ChokepointError>
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            // Stash the reason alongside as a sidecar.
+            // Pass-12 fix (P2): the previous order wrote the reason sidecar
+            // BEFORE the rename. If the rename failed (e.g., source missing
+            // or permission denied), the sidecar was orphaned on disk with
+            // no matching quarantine entry — confusing for operators
+            // inspecting the quarantine dir.
+            //
+            // Correct order: rename FIRST (creates the quarantine entry),
+            // then write the reason sidecar alongside. If the rename fails,
+            // no sidecar is created. If the sidecar write fails, the
+            // quarantine entry exists without explanation — still better
+            // than orphan sidecars (operator can re-classify via `--explain`).
+            fs::rename(path, &dest)?;
             let reason_path = dest.with_extension(format!(
                 "{}.reason",
                 dest.extension().and_then(|s| s.to_str()).unwrap_or("")
             ));
             fs::write(&reason_path, reason.as_bytes())?;
-            fs::rename(path, &dest)?;
         }
         Op::AppendLine { line } => {
             // Pass-11 fix (P1): same atomicity concern as
