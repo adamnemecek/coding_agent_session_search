@@ -12706,11 +12706,19 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         // window because the swap is a sequence of two renames instead of
         // one syscall. See coding_agent_session_search#225.
         if let Err(err) = atomic_exchange_paths(index_path, staged_index_path) {
-            if err
-                .downcast_ref::<std::io::Error>()
-                .and_then(std::io::Error::raw_os_error)
-                == Some(linux_publish_swap::EINVAL)
-            {
+            // `atomic_exchange_paths` returns the io::Error wrapped via
+            // `.with_context(...)`, so the io::Error sits in the source
+            // chain rather than at the top level. Walk the chain
+            // explicitly via `err.chain()` and `Error::downcast_ref` on
+            // each link — robust regardless of how anyhow's top-level
+            // `downcast_ref` resolves chained types across versions.
+            let einval = err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    == Some(linux_publish_swap::EINVAL)
+            });
+            if einval {
                 tracing::info!(
                     index_path = %index_path.display(),
                     staged_index_path = %staged_index_path.display(),
