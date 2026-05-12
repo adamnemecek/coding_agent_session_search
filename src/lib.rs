@@ -3105,13 +3105,15 @@ fn recover_named_required_positionals(rest: &mut Vec<String>, corrections: &mut 
 
     match command.as_str() {
         "search" | "pack" => {
-            if let Some((flag, value)) = take_named_value(rest, &["--query"]) {
+            if let Some((flag, value)) =
+                take_named_value(rest, &["--query", "--q", "--text", "--pattern"])
+            {
                 rest.insert(1, value);
                 corrections.push(format!(
                     "'{command} {flag} <value>' → '{command} <query>' (query is positional)"
                 ));
             } else if let Some((name, _value)) =
-                rewrite_named_assignment_positional(rest, &["query", "q"])
+                rewrite_named_assignment_positional(rest, &["query", "q", "text", "pattern"])
             {
                 corrections.push(format!(
                     "'{command} {name}=<value>' → '{command} <value>' (query is positional)"
@@ -3616,6 +3618,9 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "verbose",
         "quiet",
         "query",
+        "q",
+        "text",
+        "pattern",
         "color",
         "progress",
         "wrap",
@@ -65183,6 +65188,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass search auth --json",
             true,
             "A named query option is converted to the required positional query for agent-facing commands.",
+        ),
+        mistake_recovery_capability(
+            "cass search --q auth --json",
+            "cass search auth --json",
+            true,
+            "Short and familiar query aliases such as --q, --text, and --pattern are converted to the required positional query.",
         ),
         mistake_recovery_capability(
             "cass search auth error --json",

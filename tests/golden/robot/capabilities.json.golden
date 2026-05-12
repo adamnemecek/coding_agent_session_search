@@ -3037,6 +3037,12 @@
       "behavior": "A named query option is converted to the required positional query for agent-facing commands."
     },
     {
+      "wrong": "cass search --q auth --json",
+      "canonical": "cass search auth --json",
+      "accepted": true,
+      "behavior": "Short and familiar query aliases such as --q, --text, and --pattern are converted to the required positional query."
+    },
+    {
       "wrong": "cass search auth error --json",
       "canonical": "cass search \"auth error\" --json",
       "accepted": true,

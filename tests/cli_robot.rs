@@ -409,6 +409,14 @@ fn capabilities_are_self_describing_for_agents() {
     );
     assert!(
         recoveries.iter().any(
+            |recovery| recovery["wrong"] == "cass search --q auth --json"
+                && recovery["canonical"] == "cass search auth --json"
+                && recovery["accepted"] == true
+        ),
+        "capabilities should advertise query alias flag recovery"
+    );
+    assert!(
+        recoveries.iter().any(
             |recovery| recovery["wrong"] == "cass search auth error --json"
                 && recovery["canonical"] == "cass search \"auth error\" --json"
                 && recovery["accepted"] == true
@@ -795,24 +803,63 @@ fn search_named_query_flag_attaches_to_query_positional() {
 }
 
 #[test]
-fn search_query_assignment_attaches_to_query_positional() {
-    let tmp = TempDir::new().unwrap();
-    let mut cmd = base_cmd();
-    cmd.args([
-        "search",
-        "query=dry run sentinel",
-        "--json",
-        "--dry-run",
-        "--data-dir",
-        tmp.path().to_str().unwrap(),
-    ]);
-    let output = cmd.assert().success().get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value = serde_json::from_str(stdout.trim()).expect("valid dry-run JSON");
+fn search_named_query_alias_flags_attach_to_query_positional() {
+    for (flag, query) in [
+        ("--q", "quick auth sentinel"),
+        ("--text", "text auth sentinel"),
+        ("--pattern", "pattern auth sentinel"),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let mut cmd = base_cmd();
+        cmd.args([
+            "search",
+            flag,
+            query,
+            "--json",
+            "--dry-run",
+            "--data-dir",
+            tmp.path().to_str().unwrap(),
+        ]);
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: Value = serde_json::from_str(stdout.trim()).expect("valid dry-run JSON");
 
-    assert_eq!(json["dry_run"].as_bool(), Some(true));
-    assert_eq!(json["valid"].as_bool(), Some(true));
-    assert_eq!(json["query"].as_str(), Some("dry run sentinel"));
+        assert_eq!(json["dry_run"].as_bool(), Some(true), "flag {flag}");
+        assert_eq!(json["valid"].as_bool(), Some(true), "flag {flag}");
+        assert_eq!(json["query"].as_str(), Some(query), "flag {flag}");
+    }
+}
+
+#[test]
+fn search_query_assignment_attaches_to_query_positional() {
+    for assignment in [
+        "query=dry run sentinel",
+        "q=short dry run sentinel",
+        "text=text dry run sentinel",
+        "pattern=pattern dry run sentinel",
+    ] {
+        let expected = assignment
+            .split_once('=')
+            .map(|(_, value)| value)
+            .expect("assignment value");
+        let tmp = TempDir::new().unwrap();
+        let mut cmd = base_cmd();
+        cmd.args([
+            "search",
+            assignment,
+            "--json",
+            "--dry-run",
+            "--data-dir",
+            tmp.path().to_str().unwrap(),
+        ]);
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: Value = serde_json::from_str(stdout.trim()).expect("valid dry-run JSON");
+
+        assert_eq!(json["dry_run"].as_bool(), Some(true), "{assignment}");
+        assert_eq!(json["valid"].as_bool(), Some(true), "{assignment}");
+        assert_eq!(json["query"].as_str(), Some(expected), "{assignment}");
+    }
 }
 
 #[test]
