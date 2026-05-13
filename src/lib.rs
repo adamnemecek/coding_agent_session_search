@@ -7,7 +7,7 @@ pub mod connectors;
 pub mod crash_replay;
 #[cfg(unix)]
 pub mod daemon;
-pub(crate) mod doctor;
+pub mod doctor;
 pub(crate) mod doctor_chokepoint;
 pub(crate) mod doctor_robot_docs;
 pub(crate) mod doctor_runs;
@@ -24,7 +24,7 @@ pub mod pages;
 pub mod perf_evidence;
 pub mod policy_registry;
 pub mod query_cost_planner;
-pub(crate) mod raw_mirror;
+pub mod raw_mirror;
 pub mod search;
 pub mod sources;
 pub mod storage;
@@ -6915,7 +6915,7 @@ async fn execute_cli(
                             force_rebuild,
                             allow_repeated_repair,
                         )?;
-                        doctor::execute_doctor_command(request, wrap)?;
+                        doctor::execute_doctor_command_with_wrap(request, wrap)?;
                     }
                 }
                 Commands::Context {

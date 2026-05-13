@@ -22,7 +22,7 @@ static BLOB_CAPTURE_CACHE: OnceLock<Mutex<HashMap<RawMirrorBlobCacheKey, RawMirr
 static MANIFEST_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
-pub(crate) struct RawMirrorCaptureInput<'a> {
+pub struct RawMirrorCaptureInput<'a> {
     pub data_dir: &'a Path,
     pub provider: &'a str,
     pub source_id: &'a str,
@@ -33,7 +33,7 @@ pub(crate) struct RawMirrorCaptureInput<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct RawMirrorCaptureRecord {
+pub struct RawMirrorCaptureRecord {
     pub manifest_id: String,
     pub manifest_relative_path: String,
     pub blob_relative_path: String,
@@ -45,7 +45,7 @@ pub(crate) struct RawMirrorCaptureRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct RawMirrorDbLink {
+pub struct RawMirrorDbLink {
     pub conversation_id: Option<i64>,
     pub message_count: Option<usize>,
     pub source_path: Option<String>,
@@ -53,7 +53,7 @@ pub(crate) struct RawMirrorDbLink {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct RawMirrorStorageSummary {
+pub struct RawMirrorStorageSummary {
     pub initialized: bool,
     pub root_path: String,
     pub total_storage_bytes: u64,
@@ -70,7 +70,7 @@ pub(crate) struct RawMirrorStorageSummary {
     pub newest_source_mtime_ms: Option<i64>,
 }
 
-pub(crate) fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
+pub fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
     let root = raw_mirror_root(data_dir);
     let mut summary = RawMirrorStorageSummary {
         root_path: root.display().to_string(),
@@ -166,7 +166,7 @@ pub(crate) fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RawMirrorPruneOptions {
+pub struct RawMirrorPruneOptions {
     pub older_than_ms: Option<i64>,
     pub max_size_bytes: Option<u64>,
     pub keep_tags: Vec<String>,
@@ -175,7 +175,7 @@ pub(crate) struct RawMirrorPruneOptions {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct RawMirrorPruneReport {
+pub struct RawMirrorPruneReport {
     pub initialized: bool,
     pub root_path: String,
     pub mode: String,
@@ -197,7 +197,7 @@ pub(crate) struct RawMirrorPruneReport {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct RawMirrorPruneEntry {
+pub struct RawMirrorPruneEntry {
     pub kind: String,
     pub path: String,
     pub blob_blake3: Option<String>,
@@ -220,10 +220,7 @@ struct RawMirrorPruneManifest {
     db_links: Vec<RawMirrorDbLink>,
 }
 
-pub(crate) fn prune(
-    data_dir: &Path,
-    options: RawMirrorPruneOptions,
-) -> Result<RawMirrorPruneReport> {
+pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirrorPruneReport> {
     let root = raw_mirror_root(data_dir);
     let mut report = RawMirrorPruneReport {
         initialized: false,
@@ -794,9 +791,7 @@ struct RawMirrorManifestFile {
     manifest_blake3: Option<String>,
 }
 
-pub(crate) fn capture_source_file(
-    input: RawMirrorCaptureInput<'_>,
-) -> Result<RawMirrorCaptureRecord> {
+pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirrorCaptureRecord> {
     let source_metadata = fs::symlink_metadata(input.source_path)
         .with_context(|| format!("stat raw mirror source {}", input.source_path.display()))?;
     if source_metadata.file_type().is_symlink() {
@@ -932,7 +927,7 @@ pub(crate) fn capture_source_file(
     })
 }
 
-pub(crate) fn merge_manifest_db_links(
+pub fn merge_manifest_db_links(
     data_dir: &Path,
     manifest_relative_path: &str,
     links: &[RawMirrorDbLink],

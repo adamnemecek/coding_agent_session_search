@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use crate::{CliError, CliResult, RobotFormat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DoctorCommandSurface {
+pub enum DoctorCommandSurface {
     LegacyDoctor,
     Check,
     Repair,
@@ -38,7 +38,7 @@ const DOCTOR_COMMAND_SURFACES: &[DoctorCommandSurface] = &[
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DoctorExecutionMode {
+pub enum DoctorExecutionMode {
     ReadOnlyCheck,
     RepairDryRun,
     FingerprintApply,
@@ -52,14 +52,14 @@ pub(crate) enum DoctorExecutionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DoctorBackupCommand {
+pub enum DoctorBackupCommand {
     List,
     Verify,
     Restore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DoctorCommandRequest {
+pub struct DoctorCommandRequest {
     pub surface: DoctorCommandSurface,
     pub mode: DoctorExecutionMode,
     pub data_dir: Option<PathBuf>,
@@ -80,7 +80,7 @@ pub(crate) struct DoctorCommandRequest {
 }
 
 impl DoctorCommandSurface {
-    pub(crate) fn stable_name(self) -> &'static str {
+    pub fn stable_name(self) -> &'static str {
         match self {
             Self::LegacyDoctor => "legacy-doctor",
             Self::Check => "check",
@@ -96,7 +96,7 @@ impl DoctorCommandSurface {
         }
     }
 
-    pub(crate) fn mutates_by_default(self) -> bool {
+    pub fn mutates_by_default(self) -> bool {
         matches!(
             self,
             Self::Repair
@@ -109,7 +109,7 @@ impl DoctorCommandSurface {
 }
 
 impl DoctorExecutionMode {
-    pub(crate) fn stable_name(self) -> &'static str {
+    pub fn stable_name(self) -> &'static str {
         match self {
             Self::ReadOnlyCheck => "read-only-check",
             Self::RepairDryRun => "repair-dry-run",
@@ -124,7 +124,7 @@ impl DoctorExecutionMode {
         }
     }
 
-    pub(crate) fn permits_mutation(self) -> bool {
+    pub fn permits_mutation(self) -> bool {
         matches!(
             self,
             Self::FingerprintApply
@@ -135,7 +135,7 @@ impl DoctorExecutionMode {
         )
     }
 
-    pub(crate) fn requires_plan_fingerprint(self) -> bool {
+    pub fn requires_plan_fingerprint(self) -> bool {
         matches!(
             self,
             Self::FingerprintApply
@@ -188,7 +188,7 @@ impl DoctorCommandRequest {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_cli_flags_with_backups(
+    pub fn from_cli_flags_with_backups(
         data_dir: Option<PathBuf>,
         db_path: Option<PathBuf>,
         output_format: Option<RobotFormat>,
@@ -327,7 +327,7 @@ impl DoctorCommandRequest {
         )
     }
 
-    pub(crate) fn validate(&self) -> CliResult<()> {
+    pub fn validate(&self) -> CliResult<()> {
         debug_assert!(DOCTOR_COMMAND_SURFACES.contains(&self.surface));
         debug_assert!(!self.mode.stable_name().is_empty());
         let explicit_surface_count = usize::from(self.surface == DoctorCommandSurface::Check)
@@ -753,7 +753,11 @@ impl DoctorCommandRequest {
     }
 }
 
-pub(crate) fn execute_doctor_command(
+pub fn execute_doctor_command(request: DoctorCommandRequest) -> CliResult<()> {
+    execute_doctor_command_with_wrap(request, crate::WrapConfig::new(None, false))
+}
+
+pub(crate) fn execute_doctor_command_with_wrap(
     request: DoctorCommandRequest,
     wrap: crate::WrapConfig,
 ) -> CliResult<()> {
@@ -803,7 +807,7 @@ pub(crate) fn execute_doctor_command(
 }
 
 impl DoctorBackupCommand {
-    pub(crate) fn stable_name(self) -> &'static str {
+    pub fn stable_name(self) -> &'static str {
         match self {
             Self::List => "list",
             Self::Verify => "verify",
@@ -1528,7 +1532,7 @@ mod tests {
             "Commands::Doctor should build the typed doctor request before execution"
         );
         assert!(
-            lib_source.contains("doctor::execute_doctor_command(request, wrap)?"),
+            lib_source.contains("doctor::execute_doctor_command_with_wrap(request, wrap)?"),
             "Commands::Doctor should execute through the doctor module boundary"
         );
         assert!(

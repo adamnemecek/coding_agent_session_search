@@ -1,5 +1,12 @@
 use clap::Parser;
-use coding_agent_search::{Cli, Commands, RobotFormat};
+use coding_agent_search::{
+    Cli, Commands, RobotFormat,
+    doctor::{DoctorBackupCommand, DoctorCommandRequest, DoctorCommandSurface},
+    raw_mirror::{
+        RawMirrorCaptureInput, RawMirrorDbLink, RawMirrorPruneOptions, capture_source_file,
+        merge_manifest_db_links, prune, storage_summary,
+    },
+};
 
 fn parse(args: &[&str]) -> Result<Cli, String> {
     Cli::try_parse_from(args).map_err(|err| format!("parse cass CLI for {args:?}: {err}"))
@@ -219,6 +226,83 @@ fn index_refresh_force_alias_stays_available_for_repair_scripts() -> Result<(), 
             )),
         }
     })
+}
+
+#[test]
+fn raw_mirror_and_doctor_modules_are_public_embedding_surfaces() -> Result<(), String> {
+    let data_dir = tempfile::tempdir().map_err(|err| format!("temp data dir: {err}"))?;
+    let source_path = data_dir.path().join("session.jsonl");
+    std::fs::write(&source_path, b"{\"role\":\"user\",\"content\":\"hello\"}\n")
+        .map_err(|err| format!("write source fixture: {err}"))?;
+
+    let db_link = RawMirrorDbLink {
+        conversation_id: Some(7),
+        message_count: Some(1),
+        source_path: Some(source_path.display().to_string()),
+        started_at_ms: Some(123),
+    };
+    let captured = capture_source_file(RawMirrorCaptureInput {
+        data_dir: data_dir.path(),
+        provider: "contract-test",
+        source_id: "session-1",
+        origin_kind: "local",
+        origin_host: None,
+        source_path: &source_path,
+        db_links: std::slice::from_ref(&db_link),
+    })
+    .map_err(|err| format!("capture raw mirror source: {err}"))?;
+    merge_manifest_db_links(
+        data_dir.path(),
+        &captured.manifest_relative_path,
+        &[db_link],
+    )
+    .map_err(|err| format!("merge raw mirror db links: {err}"))?;
+
+    let summary = storage_summary(data_dir.path());
+    assert_eq!(summary.manifest_count, 1);
+    assert_eq!(summary.unique_blob_count, 1);
+
+    let prune_report = prune(
+        data_dir.path(),
+        RawMirrorPruneOptions {
+            older_than_ms: Some(i64::MAX),
+            max_size_bytes: None,
+            keep_tags: Vec::new(),
+            safety_hold_down_ms: 0,
+            apply: false,
+        },
+    )
+    .map_err(|err| format!("dry-run raw mirror prune: {err}"))?;
+    assert_eq!(prune_report.mode, "dry-run");
+
+    let doctor_request = DoctorCommandRequest::from_cli_flags_with_backups(
+        Some(data_dir.path().to_path_buf()),
+        None,
+        Some(RobotFormat::Json),
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        None,
+        false,
+        false,
+        false,
+    )
+    .map_err(|err| format!("build public doctor check request: {err}"))?;
+    assert_eq!(doctor_request.surface, DoctorCommandSurface::Check);
+    assert_eq!(DoctorBackupCommand::List.stable_name(), "list");
+    let _execute: fn(DoctorCommandRequest) -> coding_agent_search::CliResult<()> =
+        coding_agent_search::doctor::execute_doctor_command;
+
+    Ok(())
 }
 
 #[test]
