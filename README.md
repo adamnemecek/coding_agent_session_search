@@ -22,8 +22,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_ses
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.ps1 | iex
-install.ps1 -EasyMode -Verify
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.ps1"))) -EasyMode -Verify
 ```
 
 Installs the latest release by default. Pass `--version <tag>` / `-Version <tag>` to pin a specific version.
@@ -2785,7 +2784,7 @@ curl -fsSL https://...install.sh | bash -s -- --easy-mode --verify
 Windows (PowerShell):
 
 ```powershell
-irm https://...install.ps1 | iex
+& ([scriptblock]::Create((irm "https://...install.ps1"))) -EasyMode -Verify
 ```
 
 The update process:

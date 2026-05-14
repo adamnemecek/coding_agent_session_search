@@ -1023,7 +1023,7 @@ Or:  agent-search tui
 * Equivalent PowerShell command:
 
 ```powershell
-irm https://raw.githubusercontent.com/<you>/coding-agent-search/main/install.ps1 | iex
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/<you>/coding-agent-search/main/install.ps1"))) -EasyMode
 ```
 
 * Steps:
