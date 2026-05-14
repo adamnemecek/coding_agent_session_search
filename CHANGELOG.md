@@ -13,6 +13,21 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+## [v0.4.6] -- 2026-05-14
+
+**Windows release-build fix for the v0.4.5 publication attempt.**
+
+The `v0.4.5` tag remains immutable, but local fallback release builds uncovered
+that CASS's direct vendored OpenSSL dependency was Unix release packaging glue,
+not application logic. Keeping it active on Windows forced MSVC cross-builds
+through OpenSSL's `VC-WIN64A` source build and blocked a real PE artifact.
+
+### Fixed
+
+- **Windows MSVC release builds**: scope the direct vendored OpenSSL dependency
+  to non-Windows targets while preserving static OpenSSL linking for Unix
+  release binaries.
+
 ## [v0.4.5] -- 2026-05-13
 
 **Release-integrity fix for the v0.4.4 publication attempt.**

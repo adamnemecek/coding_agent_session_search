@@ -456,12 +456,14 @@ pub(crate) trait HealthReader: Send + Sync {
 }
 
 pub(crate) struct ProcHealthReader {
+    #[cfg(target_os = "linux")]
     ncpu: usize,
 }
 
 impl ProcHealthReader {
     pub fn new() -> Self {
         Self {
+            #[cfg(target_os = "linux")]
             ncpu: available_parallelism(),
         }
     }

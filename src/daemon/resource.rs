@@ -5,10 +5,14 @@
 //! - Applying nice values (CPU priority)
 //! - Applying ionice (I/O priority)
 
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
 // Inline POSIX constants and FFI for sysconf / setpriority — avoids a direct `libc` dependency.
 #[cfg(target_os = "linux")]
@@ -26,6 +30,7 @@ mod posix {
 #[derive(Debug, Default)]
 pub struct ResourceMonitor {
     /// Cached PID for /proc lookups.
+    #[cfg(target_os = "linux")]
     pid: u32,
 }
 
@@ -33,6 +38,7 @@ impl ResourceMonitor {
     /// Create a new resource monitor.
     pub fn new() -> Self {
         Self {
+            #[cfg(target_os = "linux")]
             pid: std::process::id(),
         }
     }

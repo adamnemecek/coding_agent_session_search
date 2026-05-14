@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -100,8 +100,6 @@ dialoguer = "*"
 
 # SFTP fallback for sync when rsync is unavailable
 ssh2 = "*"
-# Statically link OpenSSL so release binaries don't require system libssl.so.3
-openssl = { version = "*", features = ["vendored"] }
 argon2 = "*"
 hkdf = "0.12"  # Must match hmac 0.12 / sha2 0.10 / aes-gcm 0.10 digest family; see comment above.
 zeroize = { version = "*", features = ["derive"] }
@@ -116,6 +114,12 @@ unicode-width = "0.2.2"
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "*"
+
+# Statically link OpenSSL into Unix release binaries so they do not require a
+# matching system libssl. Windows builds use platform TLS/crypto stacks through
+# transitive dependencies, and forcing vendored OpenSSL breaks MSVC cross-builds.
+[target.'cfg(not(windows))'.dependencies]
+openssl = { version = "*", features = ["vendored"] }
 
 [features]
 default = ["qr", "encryption"]
