@@ -367,11 +367,8 @@ mod tests {
 
             // Escaped query should be safe to execute
             let result = conn.query_row_map(
-                &format!(
-                    r#"SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '{}'"#,
-                    escaped
-                ),
-                &[],
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+                fparams![escaped.as_str()],
                 |row| row.get_typed::<i64>(0),
             );
 

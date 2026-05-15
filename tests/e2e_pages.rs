@@ -46,6 +46,7 @@ use util::e2e_log::PhaseTracker;
 // Test Constants
 // =============================================================================
 
+// ubs:ignore — test-only credential for TempDir-backed encrypted bundle fixtures.
 const TEST_PASSWORD: &str = "test-password-123!";
 const TEST_RECOVERY_SECRET: &[u8] = b"recovery-secret-32bytes-padding!";
 const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB chunks
@@ -1006,7 +1007,7 @@ fn test_pages_wizard_pty_respects_db_override_and_writes_bundle_root() {
         "did not observe pages wizard startup output"
     );
 
-    let strong_password = "S3cure-Horse-Battery-Staple-2026!";
+    let strong_password = TEST_PASSWORD;
     wait_for_prompt(&captured, "Which agents would you like to include?");
     send_line_and_wait(&mut *writer, &captured, "", "accepting all agents");
     wait_for_prompt(&captured, "Include all workspaces?");

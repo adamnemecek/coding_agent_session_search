@@ -441,47 +441,57 @@ fn seed_large_health_latency_db(data_dir: &Path) {
     {
         let chunk_end =
             (chunk_start + LARGE_HEALTH_DB_INSERT_CHUNK - 1).min(LARGE_HEALTH_DB_CONVERSATIONS);
-        let mut conversation_values = Vec::new();
-        let mut message_values = Vec::new();
-
         for conversation_id in chunk_start..=chunk_end {
             let started_at = 1_700_000_000_000_i64 + conversation_id;
-            conversation_values.push(format!(
-                "({conversation_id}, 1, 'local', 'health-latency-{conversation_id}', \
-                 'Health latency {conversation_id}', \
-                 '/tmp/cass-health-latency/session-{conversation_id}.jsonl', \
-                 {started_at}, {}, 12, '{{}}')",
-                started_at + 1
-            ));
+            let external_id = format!("health-latency-{conversation_id}");
+            let title = format!("Health latency {conversation_id}");
+            let source_path = format!("/tmp/cass-health-latency/session-{conversation_id}.jsonl");
+            conn.execute_compat(
+                "INSERT INTO conversations(
+                    id, agent_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json
+                 ) VALUES (?1, 1, 'local', ?2, ?3, ?4, ?5, ?6, 12, '{}')",
+                fparams![
+                    conversation_id,
+                    external_id.as_str(),
+                    title.as_str(),
+                    source_path.as_str(),
+                    started_at,
+                    started_at + 1,
+                ],
+            )
+            .expect("seed latency fixture conversation");
 
             let first_message_id = conversation_id * 2 - 1;
-            message_values.push(format!(
-                "({first_message_id}, {conversation_id}, 0, 'user', 'user', \
-                 {started_at}, 'large health latency user {conversation_id} {payload}', '{{}}')"
-            ));
-            message_values.push(format!(
-                "({}, {conversation_id}, 1, 'assistant', 'agent', {}, \
-                 'large health latency assistant {conversation_id} {payload}', '{{}}')",
-                first_message_id + 1,
-                started_at + 1
-            ));
-        }
+            let user_content = format!("large health latency user {conversation_id} {payload}");
+            conn.execute_compat(
+                "INSERT INTO messages(
+                    id, conversation_id, idx, role, author, created_at, content, extra_json
+                 ) VALUES (?1, ?2, 0, 'user', 'user', ?3, ?4, '{}')",
+                fparams![
+                    first_message_id,
+                    conversation_id,
+                    started_at,
+                    user_content.as_str(),
+                ],
+            )
+            .expect("seed latency fixture user message");
 
-        conn.execute(&format!(
-            "INSERT INTO conversations(
-                id, agent_id, source_id, external_id, title, source_path,
-                started_at, ended_at, approx_tokens, metadata_json
-             ) VALUES {}",
-            conversation_values.join(",")
-        ))
-        .expect("seed latency fixture conversations");
-        conn.execute(&format!(
-            "INSERT INTO messages(
-                id, conversation_id, idx, role, author, created_at, content, extra_json
-             ) VALUES {}",
-            message_values.join(",")
-        ))
-        .expect("seed latency fixture messages");
+            let assistant_content =
+                format!("large health latency assistant {conversation_id} {payload}");
+            conn.execute_compat(
+                "INSERT INTO messages(
+                    id, conversation_id, idx, role, author, created_at, content, extra_json
+                 ) VALUES (?1, ?2, 1, 'assistant', 'agent', ?3, ?4, '{}')",
+                fparams![
+                    first_message_id + 1,
+                    conversation_id,
+                    started_at + 1,
+                    assistant_content.as_str(),
+                ],
+            )
+            .expect("seed latency fixture assistant message");
+        }
     }
 
     conn.execute("COMMIT").expect("commit latency fixture seed");

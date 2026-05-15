@@ -12,8 +12,8 @@ use coding_agent_search::evidence_bundle::{
     EvidenceBundleChunk, EvidenceBundleChunkRole, EvidenceBundleKind, EvidenceBundleManifest,
 };
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::{ConnectionExt, RowExt};
+use frankensqlite::{Connection as FrankenConnection, params as fparams};
 use predicates::prelude::*;
 use predicates::str::contains;
 use serde_json::{Value, json};
@@ -475,21 +475,25 @@ fn seed_analytics_remote_source_tokens_fixture(temp_home: &TempDir) {
         .map(|(_, id)| id)
         .expect("workspace-b id");
 
-    conn.execute(&format!(
-        "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE workspace_id = {workspace_b_id}"
-    ))
+    conn.execute_compat(
+        "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE workspace_id = ?1",
+        fparams![workspace_b_id],
+    )
     .unwrap();
-    conn.execute(&format!(
-        "UPDATE message_metrics SET source_id = '   ' WHERE workspace_id = {workspace_b_id}"
-    ))
+    conn.execute_compat(
+        "UPDATE message_metrics SET source_id = '   ' WHERE workspace_id = ?1",
+        fparams![workspace_b_id],
+    )
     .unwrap();
-    conn.execute(&format!(
-        "UPDATE usage_hourly SET source_id = '   ' WHERE workspace_id = {workspace_b_id}"
-    ))
+    conn.execute_compat(
+        "UPDATE usage_hourly SET source_id = '   ' WHERE workspace_id = ?1",
+        fparams![workspace_b_id],
+    )
     .unwrap();
-    conn.execute(&format!(
-        "UPDATE usage_daily SET source_id = '   ' WHERE workspace_id = {workspace_b_id}"
-    ))
+    conn.execute_compat(
+        "UPDATE usage_daily SET source_id = '   ' WHERE workspace_id = ?1",
+        fparams![workspace_b_id],
+    )
     .unwrap();
 }
 
@@ -515,33 +519,37 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
         .map(|(_, id)| id)
         .expect("workspace-b id");
 
-    conn.execute(&format!(
-        "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE workspace_id = {workspace_b_id}"
-    ))
+    conn.execute_compat(
+        "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE workspace_id = ?1",
+        fparams![workspace_b_id],
+    )
     .unwrap();
-    conn.execute(&format!(
+    conn.execute_compat(
         "UPDATE message_metrics
          SET source_id = '   ', tool_call_count = 7, content_tokens_est = 90,
              api_input_tokens = 30, api_output_tokens = 70,
              api_cache_read_tokens = 0, api_cache_creation_tokens = 0, api_thinking_tokens = 0
-         WHERE workspace_id = {workspace_b_id}"
-    ))
+         WHERE workspace_id = ?1",
+        fparams![workspace_b_id],
+    )
     .unwrap();
-    conn.execute(&format!(
+    conn.execute_compat(
         "UPDATE usage_hourly
          SET source_id = '   ', tool_call_count = 7, message_count = 1,
              api_tokens_total = 100, content_tokens_est_total = 90,
              content_tokens_est_assistant = 90, assistant_message_count = 1
-         WHERE workspace_id = {workspace_b_id}"
-    ))
+         WHERE workspace_id = ?1",
+        fparams![workspace_b_id],
+    )
     .unwrap();
-    conn.execute(&format!(
+    conn.execute_compat(
         "UPDATE usage_daily
          SET source_id = '   ', tool_call_count = 7, message_count = 1,
              api_tokens_total = 100, content_tokens_est_total = 90,
              content_tokens_est_assistant = 90, assistant_message_count = 1
-         WHERE workspace_id = {workspace_b_id}"
-    ))
+         WHERE workspace_id = ?1",
+        fparams![workspace_b_id],
+    )
     .unwrap();
 }
 

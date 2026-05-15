@@ -8,7 +8,8 @@
 use coding_agent_search::storage::sqlite::{
     ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
 };
-use frankensqlite::compat::{RowExt, TransactionExt};
+use frankensqlite::compat::{ConnectionExt, RowExt, TransactionExt};
+use frankensqlite::params as fparams;
 use frankensqlite::{Connection, FrankenError};
 use rand::RngExt;
 use std::sync::Arc;
@@ -134,9 +135,10 @@ fn stress_parallel_connector_writes() {
                     let mut guard = m.concurrent_writer().expect("acquire writer");
                     with_retry(50, || {
                         let mut tx = guard.storage().raw().transaction()?;
-                        tx.execute(&format!(
-                            "INSERT INTO items (thread_id, seq, val) VALUES ({thread_id}, {seq}, '{val}')"
-                        ))?;
+                        tx.execute_compat(
+                            "INSERT INTO items (thread_id, seq, val) VALUES (?1, ?2, ?3)",
+                            fparams![thread_id, seq, val.as_str()],
+                        )?;
                         tx.commit().map_err(|e| {
                             conflicts.fetch_add(1, Ordering::Relaxed);
                             anyhow::Error::new(e)
@@ -221,9 +223,10 @@ fn stress_write_heavy_contention() {
                             let seq = batch * rows_per_batch + row_in_batch;
                             // Generate a unique ID per thread and seq to avoid auto-increment collisions
                             let unique_id = (thread_id * 100000) + seq;
-                            tx.execute(&format!(
-                                "INSERT INTO items (id, thread_id, seq, val) VALUES ({unique_id}, {thread_id}, {seq}, 'contention')"
-                            ))?;
+                            tx.execute_compat(
+                                "INSERT INTO items (id, thread_id, seq, val) VALUES (?1, ?2, ?3, 'contention')",
+                                fparams![unique_id, thread_id, seq],
+                            )?;
                         }
                         tx.commit().map_err(anyhow::Error::new)?;
                         drop(tx); // Release borrow on guard before mutable access
@@ -318,9 +321,10 @@ fn stress_read_write_mix() {
                 while start.elapsed() < duration {
                     let result = with_retry(30, || {
                         let mut tx = conn.transaction()?;
-                        tx.execute(&format!(
-                            "INSERT INTO items (thread_id, seq, val) VALUES ({thread_id}, {seq}, 'rw-mix')"
-                        ))?;
+                        tx.execute_compat(
+                            "INSERT INTO items (thread_id, seq, val) VALUES (?1, ?2, 'rw-mix')",
+                            fparams![thread_id, seq],
+                        )?;
                         tx.commit().map_err(anyhow::Error::new)?;
                         Ok(())
                     });
@@ -389,12 +393,13 @@ fn stress_read_write_mix() {
 
     // Verify each thread contributed rows
     for thread_id in 0..4 {
-        let count_rows = conn
-            .query(&format!(
-                "SELECT COUNT(*) FROM items WHERE thread_id = {thread_id}"
-            ))
+        let thread_count: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM items WHERE thread_id = ?1",
+                fparams![thread_id],
+                |row| row.get_typed(0),
+            )
             .unwrap();
-        let thread_count: i64 = count_rows[0].get_typed(0).unwrap();
         assert!(
             thread_count > 0,
             "thread {thread_id} should have written at least 1 row"
@@ -469,9 +474,11 @@ fn stress_large_transaction() {
         let mut tx = conn.transaction().unwrap();
 
         for i in 0..num_rows {
-            tx.execute(&format!(
-                "INSERT INTO items (thread_id, seq, val) VALUES (0, {i}, 'large-txn-row-{i}')"
-            ))
+            let val = format!("large-txn-row-{i}");
+            tx.execute_compat(
+                "INSERT INTO items (thread_id, seq, val) VALUES (0, ?1, ?2)",
+                fparams![i, val.as_str()],
+            )
             .unwrap();
         }
 
@@ -535,9 +542,10 @@ fn stress_retry_convergence_conflicting_writes() {
                         let current: i64 = rows[0].get_typed(0).unwrap();
                         let new_val = current + 1;
 
-                        if let Err(e) =
-                            tx.execute(&format!("UPDATE counter SET val = {new_val} WHERE id = 1"))
-                        {
+                        if let Err(e) = tx.execute_compat(
+                            "UPDATE counter SET val = ?1 WHERE id = 1",
+                            fparams![new_val],
+                        ) {
                             // Execute failed — likely conflict
                             let _ = conn.execute("ROLLBACK");
                             attempt += 1;
@@ -644,9 +652,11 @@ fn stress_connection_manager_parallel_writers() {
                     let mut guard = m.concurrent_writer().expect("acquire writer");
                     with_retry(50, || {
                         let mut tx = guard.storage().raw().transaction()?;
-                        tx.execute(&format!(
-                            "INSERT INTO cm_stress (tid, val) VALUES ({tid}, 'cm-{tid}-{seq}')"
-                        ))?;
+                        let val = format!("cm-{tid}-{seq}");
+                        tx.execute_compat(
+                            "INSERT INTO cm_stress (tid, val) VALUES (?1, ?2)",
+                            fparams![tid, val.as_str()],
+                        )?;
                         tx.commit().map_err(anyhow::Error::new)?;
                         Ok(())
                     })
