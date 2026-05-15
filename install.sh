@@ -108,14 +108,17 @@ archive_member_allowed() {
   member="${1#./}"
 
   case "$member" in
-    cass|cass.exe|coding-agent-search|coding-agent-search.exe) return 0 ;;
+    cass|coding-agent-search) return 0 ;;
+    cass.exe|coding-agent-search.exe)
+      [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
   esac
 
   if [ -n "$TARGET" ]; then
     case "$member" in
       "cass-${TARGET}"|"cass-${TARGET}/") return 0 ;;
-      "cass-${TARGET}/cass"|"cass-${TARGET}/cass.exe") return 0 ;;
-      "cass-${TARGET}/coding-agent-search"|"cass-${TARGET}/coding-agent-search.exe") return 0 ;;
+      "cass-${TARGET}/cass"|"cass-${TARGET}/coding-agent-search") return 0 ;;
+      "cass-${TARGET}/cass.exe"|"cass-${TARGET}/coding-agent-search.exe")
+        [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
     esac
   fi
 
@@ -127,13 +130,16 @@ archive_member_is_installable_binary() {
   member="${1#./}"
 
   case "$member" in
-    cass|cass.exe|coding-agent-search|coding-agent-search.exe) return 0 ;;
+    cass|coding-agent-search) return 0 ;;
+    cass.exe|coding-agent-search.exe)
+      [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
   esac
 
   if [ -n "$TARGET" ]; then
     case "$member" in
-      "cass-${TARGET}/cass"|"cass-${TARGET}/cass.exe") return 0 ;;
-      "cass-${TARGET}/coding-agent-search"|"cass-${TARGET}/coding-agent-search.exe") return 0 ;;
+      "cass-${TARGET}/cass"|"cass-${TARGET}/coding-agent-search") return 0 ;;
+      "cass-${TARGET}/cass.exe"|"cass-${TARGET}/coding-agent-search.exe")
+        [ "${INSTALL_BASENAME:-cass}" = "cass.exe" ] && return 0 ;;
     esac
   fi
 
