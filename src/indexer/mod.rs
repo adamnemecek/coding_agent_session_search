@@ -86,6 +86,7 @@ type BatchClassificationMap =
 
 const LEXICAL_REBUILD_PACKET_VERSION: u32 = CONVERSATION_PACKET_VERSION;
 const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -9699,6 +9700,22 @@ pub fn run_index(
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
 
+    if opts.full
+        && !opened_fresh_for_full
+        && let Some(reason) = full_rebuild_existing_storage_integrity_problem(&storage)?
+    {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            reason = %reason,
+            "full rebuild detected an unhealthy current-schema canonical db; backing it up and starting from a fresh archive"
+        );
+        storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
+        canonical_storage_rebuilt = true;
+        opened_fresh_for_full = true;
+        persist::apply_index_writer_busy_timeout(&storage);
+        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+    }
+
     if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage, &index_path)? {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
@@ -11408,6 +11425,53 @@ fn migration_error_is_retryable_open_contention(err: &MigrationError) -> bool {
         }
         MigrationError::RebuildRequired { .. } | MigrationError::Io(_) => false,
     }
+}
+
+fn full_rebuild_existing_storage_integrity_problem(
+    storage: &FrankenStorage,
+) -> Result<Option<String>> {
+    let quick_check = match storage.raw().query_row_map(
+        "PRAGMA quick_check(1)",
+        &[] as &[ParamValue],
+        |row| row.get_typed::<String>(0),
+    ) {
+        Ok(status) => status,
+        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+            return Err(anyhow::anyhow!(
+                "full rebuild archive integrity preflight hit transient storage contention: {err}"
+            ));
+        }
+        Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
+    };
+
+    if !quick_check.trim().eq_ignore_ascii_case("ok") {
+        return Ok(Some(format!("quick_check reported {quick_check:?}")));
+    }
+
+    for (table, sql) in [
+        ("conversations", "SELECT COUNT(*) FROM conversations"),
+        ("messages", "SELECT COUNT(*) FROM messages"),
+        ("sources", "SELECT COUNT(*) FROM sources"),
+    ] {
+        match storage
+            .raw()
+            .query_row_map(sql, &[] as &[ParamValue], |row| row.get_typed::<i64>(0))
+        {
+            Ok(_) => {}
+            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+                return Err(anyhow::anyhow!(
+                    "full rebuild archive integrity canary for {table} hit transient storage contention: {err}"
+                ));
+            }
+            Err(err) => {
+                return Ok(Some(format!(
+                    "canonical table canary failed for {table}: {err}"
+                )));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -17203,7 +17267,28 @@ fn capture_connector_sources_before_parse(
 ) {
     match connector.discover_source_files(ctx) {
         Ok(sources) if !sources.is_empty() => {
+            let primary_source_count = sources
+                .iter()
+                .filter(|source| {
+                    source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
+                })
+                .count();
+            let defer_primary_sources =
+                primary_source_count > PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT;
+            if defer_primary_sources {
+                tracing::info!(
+                    provider,
+                    primary_source_count,
+                    limit = PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT,
+                    "deferring large primary source raw-mirror capture to per-conversation streaming path"
+                );
+            }
             for source in sources {
+                if defer_primary_sources
+                    && source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
+                {
+                    continue;
+                }
                 capture_discovered_source_file_before_parse(data_dir, provider, &source);
             }
         }
@@ -17222,6 +17307,19 @@ fn capture_connector_sources_before_parse(
                 capture_scan_sources_before_parse(data_dir, provider, root, since_ts);
             }
         }
+    }
+}
+
+fn should_skip_raw_mirror_capture_for_logical_source(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            !file_type.is_file() && !file_type.is_symlink()
+        }
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
     }
 }
 
@@ -17422,6 +17520,15 @@ fn capture_scan_root_file_before_parse(data_dir: &Path, provider: &str, root: &S
 }
 
 fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation) {
+    if should_skip_raw_mirror_capture_for_logical_source(&conv.source_path) {
+        tracing::debug!(
+            agent = %conv.agent_slug,
+            source_path = %conv.source_path.display(),
+            "skipping raw-mirror capture for logical non-file parsed conversation source"
+        );
+        return;
+    }
+
     let (source_id, origin_kind, origin_host) = raw_mirror_origin_from_metadata(&conv.metadata);
     let db_link = raw_mirror_db_link_for_conversation(conv);
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
@@ -21833,6 +21940,58 @@ mod tests {
     }
 
     #[test]
+    fn raw_mirror_preparse_defers_large_primary_source_sets_but_keeps_sidecars() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+
+        let root = ScanRoot::local(provider_root.clone());
+        let mut sources = Vec::new();
+        for i in 0..=PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT {
+            let source_path = provider_root.join(format!("session-{i}.jsonl"));
+            std::fs::write(&source_path, format!("primary session bytes {i}\n"))
+                .expect("primary source");
+            sources.push(discovered_test_source(
+                &root,
+                source_path,
+                crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            ));
+        }
+
+        let sidecar = provider_root.join("metadata.json");
+        std::fs::write(&sidecar, b"{\"metadata\":true}\n").expect("sidecar source");
+        sources.push(discovered_test_source(
+            &root,
+            sidecar.clone(),
+            crate::connectors::DiscoveredSourceRole::MetadataSidecar,
+        ));
+
+        let connector = FailingDiscoveryConnector { sources };
+        let ctx =
+            crate::connectors::ScanContext::with_roots(temp.path().to_path_buf(), vec![root], None);
+
+        capture_connector_sources_before_parse(&connector, &ctx, &data_dir, "synthetic", &[], None);
+
+        let manifests = raw_mirror_manifest_values(&data_dir);
+        assert_eq!(
+            manifests.len(),
+            1,
+            "large primary session-log sets should stream raw-mirror capture per parsed conversation instead of blocking preparse"
+        );
+        assert_eq!(manifests[0]["provider"].as_str(), Some("synthetic"));
+        let sidecar_display = sidecar.display().to_string();
+        assert_eq!(
+            manifests[0]["original_path"].as_str(),
+            Some(sidecar_display.as_str())
+        );
+        assert_eq!(
+            manifests[0]["verification"]["status"].as_str(),
+            Some("captured")
+        );
+    }
+
+    #[test]
     fn raw_mirror_capture_deduplicates_duplicate_discovered_sources_and_keeps_multi_file_set() {
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -21894,6 +22053,76 @@ mod tests {
         assert_eq!(
             std::fs::read(&sidecar).expect("sidecar remains"),
             b"{\"metadata\":true}\n"
+        );
+    }
+
+    #[test]
+    fn raw_mirror_capture_skips_logical_non_file_conversation_sources() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let db_path = temp.path().join("opencode.db");
+        std::fs::write(&db_path, b"not a real sqlite fixture for this test")
+            .expect("logical db source");
+
+        let mut conv = NormalizedConversation {
+            agent_slug: "opencode".to_string(),
+            external_id: Some("ses_2b0314216ffeBBw5c7WZ41fFMl".to_string()),
+            title: Some("OpenCode logical DB row".to_string()),
+            workspace: None,
+            source_path: db_path.join("ses_2b0314216ffeBBw5c7WZ41fFMl"),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_000_100),
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(1_733_000_000_000),
+                content: "hello".to_string(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+
+        attach_raw_mirror_capture(&data_dir, &mut conv);
+
+        assert!(
+            conv.metadata
+                .get("cass")
+                .and_then(|cass| cass.get("raw_mirror"))
+                .is_none(),
+            "logical DB-backed conversation paths must not receive file raw-mirror metadata"
+        );
+        assert!(
+            raw_mirror_manifest_values(&data_dir).is_empty(),
+            "logical non-file conversation paths must not publish failed raw-mirror manifests"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("db source remains"),
+            b"not a real sqlite fixture for this test"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_mirror_logical_source_skip_preserves_symlink_validation_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let real_source = temp.path().join("real.jsonl");
+        let symlink_source = temp.path().join("link.jsonl");
+        std::fs::write(&real_source, b"real source bytes\n").expect("real source");
+        std::os::unix::fs::symlink(&real_source, &symlink_source).expect("source symlink");
+
+        assert!(
+            !should_skip_raw_mirror_capture_for_logical_source(&symlink_source),
+            "symlink source paths should still reach raw-mirror's validator"
+        );
+
+        let db_path = temp.path().join("opencode.db");
+        std::fs::write(&db_path, b"not a directory").expect("db source");
+        assert!(
+            should_skip_raw_mirror_capture_for_logical_source(&db_path.join("session-row-id")),
+            "logical DB row paths should be treated as non-file source identifiers"
         );
     }
 
@@ -28477,6 +28706,39 @@ mod tests {
                 "non-retryable recovery failure should keep existing recovery semantics: {err}"
             );
         }
+    }
+
+    #[test]
+    fn full_rebuild_integrity_preflight_accepts_healthy_current_schema() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("healthy-current-schema.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        assert_eq!(
+            full_rebuild_existing_storage_integrity_problem(&storage)
+                .unwrap()
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn full_rebuild_integrity_preflight_flags_missing_core_tables() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("broken-current-schema.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage
+            .raw()
+            .execute("DROP TABLE messages")
+            .expect("drop messages to simulate current-schema archive damage");
+
+        let problem = full_rebuild_existing_storage_integrity_problem(&storage)
+            .unwrap()
+            .expect("missing core table should trigger fresh full-rebuild archive");
+        assert!(
+            problem.contains("messages"),
+            "diagnostic should identify the failing canary table: {problem}"
+        );
     }
 
     #[test]
