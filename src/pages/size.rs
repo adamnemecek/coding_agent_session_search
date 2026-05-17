@@ -80,8 +80,13 @@ impl SizeEstimate {
                 conditions.push("1=0".to_string());
             } else {
                 let placeholders: Vec<_> = agents.iter().map(|_| "?").collect();
+                // Use a non-correlated subquery via IN instead of a correlated
+                // EXISTS. frankensqlite's current planner doesn't match the
+                // correlated `a.id = c.agent_id` join condition consistently;
+                // the non-correlated form is what the rest of the codebase
+                // uses (see src/pages/summary.rs::get_date_histogram).
                 conditions.push(format!(
-                    "EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug IN ({}))",
+                    "c.agent_id IN (SELECT a.id FROM agents a WHERE a.slug IN ({}))",
                     placeholders.join(", ")
                 ));
                 for agent in agents {
@@ -108,11 +113,17 @@ impl SizeEstimate {
 
         let params_slice = &param_values;
 
-        // Query conversation count
+        // Query conversation count. We read the COUNT(*) cell as Option<i64>
+        // because frankensqlite can return NULL from `COUNT(*)` when the
+        // WHERE clause excludes all rows (e.g., the empty-agent-filter "1=0"
+        // path) — standard SQLite returns 0, fsqlite currently returns NULL.
+        // The Option<i64>.unwrap_or(0) shim absorbs the difference without a
+        // type-mismatch panic.
         let conv_sql = format!("SELECT COUNT(*) FROM conversations c{}", where_clause);
         let conversation_count: u64 = conn
             .query_row_map(&conv_sql, params_slice, |row: &Row| {
-                row.get_typed::<i64>(0).map(|v| v.max(0) as u64)
+                row.get_typed::<Option<i64>>(0)
+                    .map(|opt| opt.unwrap_or(0).max(0) as u64)
             })
             .with_context(|| {
                 format!("Failed to count conversations for size estimate: {conv_sql}")

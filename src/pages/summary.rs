@@ -661,6 +661,10 @@ impl<'a> SummaryGenerator<'a> {
         );
 
         // Count distinct conversations per day using a subquery approach.
+        // The subquery is explicitly aliased as `day_pairs` so frankensqlite's
+        // query planner can resolve the outer GROUP BY without falling back to
+        // an internal default-alias path (which currently surfaces as
+        // "column not found: subquery.conversation_id").
         let conv_query = format!(
             "SELECT day_epoch, COUNT(*)
              FROM (
@@ -668,7 +672,7 @@ impl<'a> SummaryGenerator<'a> {
                 FROM messages
                 WHERE created_at IS NOT NULL
                   AND conversation_id IN (SELECT c.id FROM conversations c WHERE 1=1{})
-             )
+             ) AS day_pairs
              GROUP BY day_epoch",
             where_clause
         );
