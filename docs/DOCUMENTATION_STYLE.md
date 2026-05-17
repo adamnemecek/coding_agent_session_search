@@ -29,7 +29,7 @@ Brief description (1-2 sentences).
 ## Installation
 
 ```bash
-cargo install cass
+cargo install coding-agent-search
 ```
 
 ## Quick Start
