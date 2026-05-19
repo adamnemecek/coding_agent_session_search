@@ -7512,7 +7512,12 @@ fn swarm_fixture_privacy_probe(path: &Path) -> CliResult<Option<serde_json::Valu
         .cloned())
 }
 
-fn render_swarm_status_live_partial() -> serde_json::Value {
+/// Produce a swarm-status payload reflecting the current "no live providers
+/// are wired yet" reality. Pure-function, allocation-only — no I/O — so it
+/// is safe to call from the TUI surface-entry path. Used by the TUI's
+/// `CassMsg::SwarmEntered` handler to seed the cockpit on first entry
+/// when no cached snapshot has been supplied yet.
+pub fn render_swarm_status_live_partial() -> serde_json::Value {
     use crate::swarm_status::{
         REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmSourceCollection, SwarmSourceSnapshot,
     };
@@ -73949,13 +73954,24 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
 
     // Index run lock file — if heartbeating, tells the reporter another
     // process may actually be holding the writer.
-    let lock_path = data_dir.join("index_run.lock");
+    let lock_path = data_dir.join("index-run.lock");
     if lock_path.exists() {
         let mut lock = serde_json::Map::new();
         lock.insert(
             "path".into(),
             serde_json::json!(lock_path.display().to_string()),
         );
+        if let Ok(meta) = std::fs::metadata(&lock_path) {
+            lock.insert("size_bytes".into(), serde_json::json!(meta.len()));
+            if let Ok(modified) = meta.modified()
+                && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                lock.insert(
+                    "modified_ms".into(),
+                    serde_json::json!(duration.as_millis() as u64),
+                );
+            }
+        }
         if let Ok(contents) = std::fs::read_to_string(&lock_path) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
                 lock.insert("content".into(), parsed);
@@ -73967,6 +73983,126 @@ fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
     }
 
     serde_json::Value::Object(out)
+}
+
+const INDEX_STALL_HINT: &str = concat!(
+    "Indexer made no forward progress for the configured stall window. ",
+    "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
+    "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
+    "and attach to issue #244. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable."
+);
+
+fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
+    let stall_threshold_secs = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(120);
+    if stall_threshold_secs == 0 {
+        None
+    } else {
+        let min = progress_interval.saturating_add(Duration::from_secs(1));
+        Some(Duration::from_secs(stall_threshold_secs).max(min))
+    }
+}
+
+struct IndexStallWatchdog {
+    data_dir: PathBuf,
+    threshold: Option<Duration>,
+    last_phase: usize,
+    last_current: usize,
+    last_progress_advance: std::time::Instant,
+    stall_reported_for_phase: Option<usize>,
+}
+
+impl IndexStallWatchdog {
+    fn new(data_dir: PathBuf, progress_interval: Duration) -> Self {
+        Self {
+            data_dir,
+            threshold: index_stall_threshold(progress_interval),
+            last_phase: usize::MAX,
+            last_current: 0,
+            last_progress_advance: std::time::Instant::now(),
+            stall_reported_for_phase: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        index_progress: &indexer::IndexingProgress,
+        elapsed_ms: u128,
+    ) -> Option<serde_json::Value> {
+        let phase_code = index_progress
+            .phase
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let current = index_progress
+            .current
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        if phase_code != self.last_phase {
+            self.last_phase = phase_code;
+            self.last_current = current;
+            self.last_progress_advance = std::time::Instant::now();
+            self.stall_reported_for_phase = None;
+            return None;
+        }
+
+        if current != self.last_current {
+            self.last_progress_advance = std::time::Instant::now();
+            self.last_current = current;
+            return None;
+        }
+
+        let threshold = self.threshold?;
+        if phase_code == 0 || self.stall_reported_for_phase == Some(phase_code) {
+            return None;
+        }
+        if self.last_progress_advance.elapsed() < threshold {
+            return None;
+        }
+
+        let stall_elapsed_ms = self.last_progress_advance.elapsed().as_millis();
+        let mut payload = index_progress.snapshot_json(elapsed_ms);
+        if let serde_json::Value::Object(ref mut m) = payload {
+            m.insert("event".into(), serde_json::json!("stall_detected"));
+            m.insert(
+                "ts_ms".into(),
+                serde_json::json!(chrono::Utc::now().timestamp_millis()),
+            );
+            m.insert(
+                "stall_elapsed_ms".into(),
+                serde_json::json!(stall_elapsed_ms as u64),
+            );
+            m.insert(
+                "stall_threshold_secs".into(),
+                serde_json::json!(threshold.as_secs()),
+            );
+            m.insert(
+                "diagnostics".into(),
+                collect_stall_diagnostics(&self.data_dir),
+            );
+            m.insert("hint".into(), serde_json::json!(INDEX_STALL_HINT));
+        }
+        self.stall_reported_for_phase = Some(phase_code);
+        Some(payload)
+    }
+}
+
+fn index_stall_warning_lines(payload: &serde_json::Value) -> (String, String) {
+    let phase = payload
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let elapsed_secs = payload
+        .get("stall_elapsed_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default()
+        / 1000;
+    let summary = format!(
+        "Warning: cass index made no {phase} progress for {elapsed_secs}s; stall diagnostics follow."
+    );
+    let diagnostics = serde_json::to_string(payload)
+        .unwrap_or_else(|err| format!(r#"{{"event":"stall_detected","serialize_error":"{err}"}}"#));
+    (summary, diagnostics)
 }
 
 #[cfg(test)]
@@ -74000,11 +74136,8 @@ mod stall_diagnostics_tests {
             r#"{"completed": true, "committed_conversation_id": 42}"#,
         )
         .expect("write checkpoint");
-        std::fs::write(
-            tmp.path().join("index_run.lock"),
-            r#"{"pid": 12345, "mode": "index"}"#,
-        )
-        .expect("write lock");
+        std::fs::write(tmp.path().join("index-run.lock"), "pid=12345\nmode=index\n")
+            .expect("write lock");
         // Synthetic Tantivy-like segment so we exercise the segment counter.
         std::fs::write(index_dir.join("abcd.idx"), b"x").expect("write segment");
 
@@ -74024,7 +74157,14 @@ mod stall_diagnostics_tests {
             "parsed checkpoint JSON should round-trip"
         );
         let lock = obj["index_run_lock"].as_object().expect("lock object");
-        assert_eq!(lock["content"]["pid"], serde_json::json!(12345));
+        assert_eq!(lock["size_bytes"], serde_json::json!(21));
+        assert!(lock.contains_key("modified_ms"));
+        assert!(
+            lock["content_raw"]
+                .as_str()
+                .expect("content_raw string")
+                .contains("pid=12345")
+        );
     }
 
     #[test]
@@ -74317,6 +74457,7 @@ fn run_index_with_data(
         let mut last_current = usize::MAX;
         let mut last_agents = usize::MAX;
         let mut last_update = std::time::Instant::now();
+        let mut stall_watchdog = IndexStallWatchdog::new(data_dir.clone(), progress_interval);
 
         loop {
             // Check if indexer finished
@@ -74401,6 +74542,14 @@ fn run_index_with_data(
                 last_update = now;
             }
 
+            if let Some(payload) =
+                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
+            {
+                let (summary, diagnostics) = index_stall_warning_lines(&payload);
+                pb.println(summary);
+                pb.println(diagnostics);
+            }
+
             std::thread::sleep(Duration::from_millis(50));
         }
 
@@ -74418,6 +74567,7 @@ fn run_index_with_data(
         let mut last_agents = 0;
         let mut last_current = 0;
         let mut last_scan_current = 0;
+        let mut stall_watchdog = IndexStallWatchdog::new(data_dir.clone(), progress_interval);
 
         loop {
             if index_handle.is_finished() {
@@ -74465,6 +74615,14 @@ fn run_index_with_data(
                 last_current = current;
             }
 
+            if let Some(payload) =
+                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
+            {
+                let (summary, diagnostics) = index_stall_warning_lines(&payload);
+                eprintln!("{summary}");
+                eprintln!("{diagnostics}");
+            }
+
             std::thread::sleep(Duration::from_millis(200));
         }
     } else if emit_progress_events {
@@ -74477,29 +74635,7 @@ fn run_index_with_data(
         let mut last_emit = std::time::Instant::now()
             .checked_sub(progress_interval)
             .unwrap_or_else(std::time::Instant::now);
-
-        // Stall-detection watchdog (issue #196). Latches a one-shot
-        // `stall_detected` event on stderr when `current` hasn't advanced for
-        // `stall_threshold` during an active (non-idle) phase. The watchdog is
-        // observability-only: it never cancels the run or touches shared
-        // indexer state. Threshold is tunable via
-        // `CASS_INDEX_STALL_DETECT_SECS` (0 disables; default 120s). We clamp
-        // below at `progress_interval` so the emitter has a chance to publish
-        // at least one progress event before the stall fires.
-        let stall_threshold_secs = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(120);
-        let stall_threshold = if stall_threshold_secs == 0 {
-            None
-        } else {
-            let min = progress_interval.saturating_add(Duration::from_secs(1));
-            Some(Duration::from_secs(stall_threshold_secs).max(min))
-        };
-        let mut last_current: usize = 0;
-        let mut last_progress_advance = std::time::Instant::now();
-        let mut stall_reported_for_phase: Option<usize> = None;
-        let stall_diagnostics_data_dir = data_dir.clone();
+        let mut stall_watchdog = IndexStallWatchdog::new(data_dir.clone(), progress_interval);
 
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
@@ -74509,7 +74645,6 @@ fn run_index_with_data(
             }
 
             let phase_code = index_progress.phase.load(Ordering::Relaxed);
-            let current = index_progress.current.load(Ordering::Relaxed);
             let elapsed_ms = start.elapsed().as_millis();
 
             // Always emit on phase transitions, independent of the interval, so
@@ -74526,11 +74661,6 @@ fn run_index_with_data(
                 emit_event(payload);
                 last_phase = phase_code;
                 last_emit = std::time::Instant::now();
-                // Phase change is forward progress for the watchdog's purpose,
-                // even if `current` is reset to 0 in the new phase.
-                last_progress_advance = std::time::Instant::now();
-                last_current = current;
-                stall_reported_for_phase = None;
             } else if last_emit.elapsed() >= progress_interval {
                 let mut payload = index_progress.snapshot_json(elapsed_ms);
                 if let serde_json::Value::Object(ref mut m) = payload {
@@ -74544,52 +74674,8 @@ fn run_index_with_data(
                 last_emit = std::time::Instant::now();
             }
 
-            if current != last_current {
-                last_progress_advance = std::time::Instant::now();
-                last_current = current;
-            }
-
-            // Only arm the watchdog in active phases (scanning=1 or
-            // indexing=2). phase_code == 0 is preparing/idle and staying at
-            // current=0 there is expected. Latch once per phase so we don't
-            // spam stderr on long stalls.
-            if let Some(threshold) = stall_threshold
-                && phase_code != 0
-                && stall_reported_for_phase != Some(phase_code)
-                && last_progress_advance.elapsed() >= threshold
-            {
-                let stall_elapsed_ms = last_progress_advance.elapsed().as_millis();
-                let mut payload = index_progress.snapshot_json(elapsed_ms);
-                if let serde_json::Value::Object(ref mut m) = payload {
-                    m.insert("event".into(), serde_json::json!("stall_detected"));
-                    m.insert(
-                        "ts_ms".into(),
-                        serde_json::json!(chrono::Utc::now().timestamp_millis()),
-                    );
-                    m.insert(
-                        "stall_elapsed_ms".into(),
-                        serde_json::json!(stall_elapsed_ms as u64),
-                    );
-                    m.insert(
-                        "stall_threshold_secs".into(),
-                        serde_json::json!(threshold.as_secs()),
-                    );
-                    m.insert(
-                        "diagnostics".into(),
-                        collect_stall_diagnostics(&stall_diagnostics_data_dir),
-                    );
-                    m.insert(
-                        "hint".into(),
-                        serde_json::json!(concat!(
-                            "Indexer made no forward progress for the configured stall window. ",
-                            "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
-                            "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
-                            "and attach to issue #196. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable."
-                        )),
-                    );
-                }
+            if let Some(payload) = stall_watchdog.observe(&index_progress, elapsed_ms) {
                 emit_event(payload);
-                stall_reported_for_phase = Some(phase_code);
             }
 
             std::thread::sleep(Duration::from_millis(100));
@@ -74597,7 +74683,15 @@ fn run_index_with_data(
     } else {
         // No progress display (json mode with events disabled, or plain=none):
         // just wait for completion.
+        let mut stall_watchdog = IndexStallWatchdog::new(data_dir.clone(), progress_interval);
         while !index_handle.is_finished() {
+            if let Some(payload) =
+                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
+            {
+                let (summary, diagnostics) = index_stall_warning_lines(&payload);
+                eprintln!("{summary}");
+                eprintln!("{diagnostics}");
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }

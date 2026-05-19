@@ -446,3 +446,249 @@ fn swarm_surface_renders_build_pressure_and_proof_gaps() {
     assert!(text.contains("agent-mail unavailable"));
     assert!(text.contains("redaction applied"));
 }
+
+#[test]
+fn swarm_entered_msg_seeds_snapshot_from_live_partial_aggregator() {
+    let _guard = tui_flow_guard();
+    let mut app = CassApp::default();
+    pin_dark_theme(&mut app);
+    assert!(
+        app.swarm_cockpit.snapshot.is_none(),
+        "fresh app must start with no cached swarm snapshot"
+    );
+
+    let cmd = app.update(CassMsg::SwarmEntered);
+    drain_cmd_messages(&mut app, cmd);
+
+    assert_eq!(app.surface, AppSurface::Swarm);
+    let snapshot = app
+        .swarm_cockpit
+        .snapshot
+        .as_ref()
+        .expect("SwarmEntered must seed the cockpit via render_swarm_status_live_partial");
+    // The live-partial aggregator marks every required provider as
+    // unavailable until live wiring lands. The render must reflect that
+    // truthfully (no fabricated counts) — see bead acceptance criteria for
+    // coding_agent_session_search-oh96l.6 ("It should reuse the read-only
+    // aggregator and refresh only on explicit command or bounded background
+    // interval").
+    assert_eq!(snapshot.status, "partial");
+    let text = render_app_text(&app, 110, 24);
+    assert!(text.contains("ready:0"));
+    assert!(text.contains("Safety"));
+
+    // Re-entering must NOT re-seed (the surface is read-only and idempotent
+    // — repeated taps of Alt+W shouldn't churn state).
+    let original = app.swarm_cockpit.clone();
+    let cmd = app.update(CassMsg::SwarmEntered);
+    drain_cmd_messages(&mut app, cmd);
+    assert_eq!(app.swarm_cockpit, original, "re-entering must not re-seed");
+}
+
+// ── Swarm cockpit: empty queue + evidence-gap state coverage ──────────────
+// Closes coding_agent_session_search-oh96l.6 acceptance criteria for the
+// five required states (empty queue, active swarm, stale advisory, build
+// pressure, evidence gap). Active/stale/build are pinned above; the two
+// tests below add empty-queue and evidence-gap. The safety tests at the
+// bottom of this section assert no raw session content leaks and no
+// destructive verbs appear when rendering against any checked-in golden.
+
+#[test]
+fn swarm_surface_renders_empty_queue_with_no_ready_action() {
+    let _guard = tui_flow_guard();
+    let mut app = CassApp::default();
+    pin_dark_theme(&mut app);
+    install_swarm_payload(
+        &mut app,
+        serde_json::json!({
+            "status": "ok",
+            "summary": {
+                "ready_count": 0,
+                "in_progress_count": 0,
+                "blocked_count": 0,
+                "active_agent_count": 0,
+                "active_reservation_count": 0,
+                "stale_candidate_count": 0,
+                "stale_state_counts": {"active": 0, "recently_quiet": 0, "likely_stale": 0, "conflicting_evidence": 0, "manual_review_required": 0},
+                "proof_gap_count": 0,
+                "build_pressure": "none",
+                "recommended_action": "no-ready-work"
+            },
+            "evidence": {"proof_gaps": [], "redaction_applied": false},
+            "privacy": {"redaction_applied": false},
+            "providers": []
+        }),
+    );
+
+    let text = render_app_text(&app, 110, 24);
+
+    assert!(text.contains("ready:0"), "empty-queue header must show zero ready beads");
+    assert!(text.contains("agents:0"));
+    assert!(text.contains("reservations:0"));
+    assert!(text.contains("in-progress 0"));
+    assert!(text.contains("blocked 0"));
+    assert!(text.contains("no-ready-work"), "footer/header must surface the no-ready-work recommendation");
+    assert!(text.contains("Safety"), "safety line must remain present in every state");
+}
+
+#[test]
+fn swarm_surface_renders_evidence_gap_summary_state() {
+    let _guard = tui_flow_guard();
+    let mut app = CassApp::default();
+    pin_dark_theme(&mut app);
+    install_swarm_payload(
+        &mut app,
+        serde_json::json!({
+            "status": "ok",
+            "summary": {
+                "ready_count": 2,
+                "in_progress_count": 1,
+                "blocked_count": 0,
+                "active_agent_count": 1,
+                "active_reservation_count": 0,
+                "stale_candidate_count": 0,
+                "stale_state_counts": {"active": 1, "recently_quiet": 0, "likely_stale": 0, "conflicting_evidence": 0, "manual_review_required": 0},
+                "proof_gap_count": 3,
+                "build_pressure": "none",
+                "recommended_action": "close-evidence-gaps"
+            },
+            "evidence": {
+                "proof_gaps": [
+                    {"kind": "missing-rch-proof"},
+                    {"kind": "stale-baseline"},
+                    {"kind": "missing-commit-link"}
+                ],
+                "redaction_applied": false
+            },
+            "privacy": {"redaction_applied": false},
+            "providers": []
+        }),
+    );
+
+    let text = render_app_text(&app, 120, 24);
+
+    assert!(text.contains("gaps:3"), "evidence-gap header must report the gap count");
+    assert!(text.contains("missing-rch-proof"), "first evidence-gap kind must appear");
+    assert!(text.contains("stale-baseline"), "second evidence-gap kind must appear");
+    assert!(text.contains("close-evidence-gaps"), "recommended action must surface the gap remediation");
+    assert!(text.contains("Safety"), "safety line must remain present");
+}
+
+// Build a swarm payload from a checked-in golden so the safety tests run
+// against the exact JSON shape `render_swarm_status_payload` produces. The
+// goldens live under `tests/golden/swarm_status/` and are regenerated via
+// `UPDATE_GOLDENS=1 ... cargo test --test swarm_status_contract`.
+fn load_swarm_golden(scenario: &str) -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/swarm_status")
+        .join(format!("{scenario}.json.golden"));
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|err| panic!("missing swarm golden {}: {err}", path.display()));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|err| panic!("invalid swarm golden {}: {err}", path.display()))
+}
+
+#[test]
+fn swarm_surface_renders_real_fixture_goldens_without_leaking_raw_session_content() {
+    let _guard = tui_flow_guard();
+    // Markers that would indicate the cockpit had pulled raw session content
+    // into its render path. None of these should ever appear in cockpit
+    // output: the cockpit must only show counts, kinds, recommendations,
+    // and provider warnings — never message bodies, file paths, or
+    // workspace paths from the underlying fixture data.
+    let session_content_leak_markers: &[&str] = &[
+        "/Users/",
+        "/home/",
+        ".jsonl",
+        "session_id",
+        "external_id",
+        "tool_use",
+        "fn authenticate",
+        "BEGIN PRIVATE KEY",
+        "Authorization: Bearer",
+        "secret",
+        "password",
+    ];
+    for scenario in [
+        "healthy",
+        "busy",
+        "stale_advisory",
+        "build_pressure",
+        "no_ready_work",
+        "privacy_guardrails",
+        "reservation_conflict",
+        "unrelated_reservation",
+    ] {
+        let mut app = CassApp::default();
+        pin_dark_theme(&mut app);
+        let payload = load_swarm_golden(scenario);
+        install_swarm_payload(&mut app, payload);
+        let text = render_app_text(&app, 140, 30);
+        for marker in session_content_leak_markers {
+            assert!(
+                !text.contains(marker),
+                "scenario {scenario}: cockpit render leaked raw session marker {marker:?}; \
+                 the cockpit must only render counts and gap kinds. \
+                 Offending render:\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn swarm_surface_render_never_emits_destructive_or_recovery_verbs() {
+    let _guard = tui_flow_guard();
+    // The cockpit is a READ-ONLY surface. Even when a fixture reports a
+    // recommended action, the cockpit's rendered text must never present
+    // language that suggests it has performed (or could perform from this
+    // surface) a destructive or recovery operation. Operators must use
+    // dedicated commands (`cass doctor cleanup`, `br close`, `release_*`)
+    // for those — never trust a render to imply it.
+    let destructive_markers: &[&str] = &[
+        "rm -rf",
+        "DROP TABLE",
+        "DELETE FROM",
+        "force_release",
+        "force-release",
+        " destroy ",
+        " purge ",
+        " wipe ",
+        " deletes ",
+        " deleted ",
+        " removing ",
+        " removed ",
+    ];
+    for scenario in [
+        "healthy",
+        "busy",
+        "stale_advisory",
+        "build_pressure",
+        "no_ready_work",
+        "privacy_guardrails",
+        "reservation_conflict",
+        "unrelated_reservation",
+    ] {
+        let mut app = CassApp::default();
+        pin_dark_theme(&mut app);
+        let payload = load_swarm_golden(scenario);
+        install_swarm_payload(&mut app, payload);
+        let text = render_app_text(&app, 140, 30);
+        // Match case-insensitively against the lowercased render so that a
+        // future marker like "Destroy" doesn't slip through.
+        let haystack = text.to_lowercase();
+        for marker in destructive_markers {
+            assert!(
+                !haystack.contains(&marker.to_lowercase()),
+                "scenario {scenario}: cockpit render contained destructive/recovery verb \
+                 {marker:?}. The cockpit is read-only — it must never imply mutation. \
+                 Offending render:\n{text}"
+            );
+        }
+        // Spot-check the static safety line is still there so a future
+        // refactor can't quietly drop it.
+        assert!(
+            text.contains("Safety"),
+            "scenario {scenario}: safety reassurance line missing"
+        );
+    }
+}
