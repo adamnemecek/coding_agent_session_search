@@ -78,7 +78,7 @@ pub struct QuarantineRecord {
 /// In-memory view of the quarantine state file. Use [`QuarantineState::load`]
 /// to read, [`QuarantineState::record_attempt`] / [`QuarantineState::clear`]
 /// to mutate, and [`QuarantineState::save`] to atomically persist.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuarantineState {
     /// Storage version of the file format itself (not the schema_version
     /// inside the keys). Bumped when the on-disk shape changes.
@@ -90,6 +90,15 @@ pub struct QuarantineState {
 
 fn default_storage_version() -> u32 {
     1
+}
+
+impl Default for QuarantineState {
+    fn default() -> Self {
+        Self {
+            storage_version: default_storage_version(),
+            entries: BTreeMap::new(),
+        }
+    }
 }
 
 impl QuarantineState {
@@ -141,7 +150,12 @@ impl QuarantineState {
     /// already exists, the existing record is **updated in place**
     /// (`last_attempt_at`, `attempt_count`, `last_reason`) rather than
     /// appended — this is the dedup contract from #243.
-    pub fn record_attempt(&mut self, key: &QuarantineKey, reason: impl Into<String>, now: DateTime<Utc>) {
+    pub fn record_attempt(
+        &mut self,
+        key: &QuarantineKey,
+        reason: impl Into<String>,
+        now: DateTime<Utc>,
+    ) {
         let reason = reason.into();
         let storage_key = key.storage_key();
         if let Some(record) = self.entries.get_mut(&storage_key) {
@@ -202,6 +216,7 @@ mod tests {
     #[test]
     fn record_attempt_dedups_by_conversation_and_schema_version() {
         let mut state = QuarantineState::default();
+        assert_eq!(state.storage_version, 1);
         let key = QuarantineKey::new("conv-a", 3);
         state.record_attempt(&key, "streaming-oom: 4.2 GB", ts(1_700_000_000));
         state.record_attempt(&key, "streaming-oom: 4.3 GB", ts(1_700_001_000));
@@ -212,8 +227,16 @@ mod tests {
             .entries
             .get(&key.storage_key())
             .expect("entry present");
-        assert_eq!(record.first_attempt_at, ts(1_700_000_000), "first attempt preserved");
-        assert_eq!(record.last_attempt_at, ts(1_700_002_000), "last attempt advances");
+        assert_eq!(
+            record.first_attempt_at,
+            ts(1_700_000_000),
+            "first attempt preserved"
+        );
+        assert_eq!(
+            record.last_attempt_at,
+            ts(1_700_002_000),
+            "last attempt advances"
+        );
         assert_eq!(record.attempt_count, 3);
         assert_eq!(record.last_reason, "streaming-oom: 4.1 GB");
     }
@@ -278,7 +301,10 @@ mod tests {
         let tmp_path = dir
             .path()
             .join(format!("{}.tmp", QuarantineState::FILENAME));
-        assert!(!tmp_path.exists(), "tmp file must be renamed away on success");
+        assert!(
+            !tmp_path.exists(),
+            "tmp file must be renamed away on success"
+        );
         assert!(QuarantineState::path(dir.path()).exists());
     }
 

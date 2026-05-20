@@ -1,11 +1,13 @@
 pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
+pub mod quarantine;
 pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
 
+use self::quarantine::{QuarantineKey, QuarantineState};
 use self::refresh_ledger::{
     EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger,
     RefreshLedgerEvidence, RefreshPhase,
@@ -16638,7 +16640,50 @@ fn record_poison_conversation(
     }
     file.sync_all()
         .with_context(|| format!("syncing ingest quarantine record {}", path.display()))?;
+    record_structured_poison_quarantine_state(
+        data_dir,
+        &conversation_id,
+        schema_version_at_quarantine,
+        reason,
+        error,
+        now_ms,
+    );
     Ok(())
+}
+
+fn record_structured_poison_quarantine_state(
+    data_dir: &Path,
+    conversation_id: &str,
+    schema_version_at_quarantine: i64,
+    reason: &str,
+    error: &anyhow::Error,
+    now_ms: i64,
+) {
+    let Ok(schema_version) = u32::try_from(schema_version_at_quarantine) else {
+        tracing::warn!(
+            schema_version_at_quarantine,
+            "skipping structured ingest quarantine state update because schema version is out of range"
+        );
+        return;
+    };
+    let Some(now) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms) else {
+        tracing::warn!(
+            now_ms,
+            "skipping structured ingest quarantine state update because timestamp is invalid"
+        );
+        return;
+    };
+
+    let mut state = QuarantineState::load(data_dir);
+    let key = QuarantineKey::new(conversation_id, schema_version);
+    state.record_attempt(&key, format!("{reason}: {error}"), now);
+    if let Err(err) = state.save(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %err,
+            "failed to persist structured ingest quarantine state"
+        );
+    }
 }
 
 fn poison_conversation_id(conv: &NormalizedConversation) -> String {
@@ -16736,6 +16781,21 @@ pub fn conversation_ingest_quarantine_summary(
     let mut keys = BTreeSet::<(String, i64)>::new();
     let mut quarantine_files = Vec::new();
     let mut newest_last_attempt_at_ms: Option<i64> = None;
+
+    let state_path = QuarantineState::path(data_dir);
+    if state_path.exists() {
+        quarantine_files.push(state_path.display().to_string());
+        let state = QuarantineState::load(data_dir);
+        for (key, record) in state.iter() {
+            keys.insert((key.conversation_id, i64::from(key.schema_version)));
+            let last_attempt_at_ms = record.last_attempt_at.timestamp_millis();
+            newest_last_attempt_at_ms = Some(
+                newest_last_attempt_at_ms.map_or(last_attempt_at_ms, |current| {
+                    current.max(last_attempt_at_ms)
+                }),
+            );
+        }
+    }
 
     for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
         let path = quarantine_dir.join(file_name);
@@ -29265,6 +29325,14 @@ mod tests {
                 serde_json::json!(expected_attempts)
             );
             assert_eq!(record["external_id"], serde_json::json!("poison-single"));
+
+            let structured_state = QuarantineState::load(&data_dir);
+            assert_eq!(structured_state.len(), 1);
+            let structured_attempt_count = structured_state
+                .iter()
+                .next()
+                .map(|(_, record)| record.attempt_count);
+            assert_eq!(structured_attempt_count, Some(expected_attempts));
 
             let summary = conversation_ingest_quarantine_summary(&data_dir);
             assert_eq!(summary.quarantined_conversations, 1);
