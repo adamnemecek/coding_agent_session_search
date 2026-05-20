@@ -126,9 +126,9 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "frankensearch",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Bumped from a982f33a to pick up the cass-compatible prefix-field
-        // tokenizer split in 831b3b13.
-        expected_rev: "831b3b13",
+        // Bumped from 831b3b13 to pick up bounded cass content-prefix
+        // indexing plus the self-contained Git dependency packaging fix.
+        expected_rev: "128d134ad2cde552d36ad837ff83ff974448f214",
         expected_version: "0.3.0",
         expected_features: &["ann", "fastembed-reranker", "hash", "lexical"],
         expected_default_features: Some(false),
