@@ -7417,6 +7417,43 @@ fn lexical_rebuild_default_shard_budget(
         .clamp(min_budget, max_budget)
 }
 
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_FLOOR: usize = 16 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING: usize = 128 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION: u64 = 2_048;
+
+fn lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(
+    available_memory_bytes: Option<u64>,
+) -> usize {
+    let Some(available_memory_bytes) = available_memory_bytes else {
+        return LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_DEFAULT;
+    };
+    let scaled =
+        available_memory_bytes / LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_MEMORY_FRACTION;
+    let scaled =
+        usize::try_from(scaled).unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING);
+    scaled.clamp(
+        LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_FLOOR,
+        LEXICAL_REBUILD_STAGED_SHARD_MESSAGE_BYTES_CEILING,
+    )
+}
+
+fn lexical_rebuild_staged_shard_max_message_bytes(
+    settings: &LexicalRebuildPipelineSettingsSnapshot,
+) -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(
+                responsiveness::available_memory_bytes(),
+            )
+        })
+        .min(settings.steady_commit_every_message_bytes.max(1))
+        .max(1)
+}
+
 fn lexical_rebuild_default_shard_planner_budgets_for_totals(
     settings: &LexicalRebuildPipelineSettingsSnapshot,
     total_conversations: usize,
@@ -7425,6 +7462,11 @@ fn lexical_rebuild_default_shard_planner_budgets_for_totals(
 ) -> LexicalShardPlannerBudgets {
     let target_shards =
         lexical_rebuild_target_shard_count(settings.workers, settings.tantivy_writer_threads);
+    let max_message_bytes_per_shard = lexical_rebuild_staged_shard_max_message_bytes(settings);
+    let min_message_bytes_per_shard = settings
+        .startup_commit_every_message_bytes
+        .min(max_message_bytes_per_shard)
+        .max(1);
     LexicalShardPlannerBudgets {
         max_conversations_per_shard: lexical_rebuild_default_shard_budget(
             total_conversations,
@@ -7441,8 +7483,8 @@ fn lexical_rebuild_default_shard_planner_budgets_for_totals(
         max_message_bytes_per_shard: lexical_rebuild_default_shard_budget(
             total_message_bytes,
             target_shards,
-            settings.startup_commit_every_message_bytes,
-            settings.steady_commit_every_message_bytes,
+            min_message_bytes_per_shard,
+            max_message_bytes_per_shard,
         ),
     }
 }
@@ -7557,8 +7599,34 @@ struct LexicalRebuildShardBuilderSettings {
     writer_parallelism_budget: usize,
 }
 
+const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR: u64 = 2;
+const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR: u64 = 3;
+
+fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+    workers: usize,
+    available_memory_bytes: Option<u64>,
+) -> usize {
+    let cpu_ceiling = workers.clamp(1, 8);
+    let Some(available_memory_bytes) = available_memory_bytes else {
+        return cpu_ceiling;
+    };
+    let memory_budget = available_memory_bytes
+        .saturating_mul(LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR)
+        / LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR.max(1);
+    let memory_ceiling = usize::try_from(
+        memory_budget / LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES.max(1),
+    )
+    .unwrap_or(usize::MAX)
+    .clamp(1, 8);
+    cpu_ceiling.min(memory_ceiling).max(1)
+}
+
 fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(workers: usize) -> usize {
-    workers.clamp(1, 8)
+    lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+        workers,
+        responsiveness::available_memory_bytes(),
+    )
 }
 
 fn lexical_rebuild_staged_shard_builder_parallelism() -> usize {
@@ -12401,6 +12469,37 @@ fn release_completed_lexical_rebuild_pages(
     }
 }
 
+struct StreamingByteReservation<'a> {
+    flow_limiter: &'a StreamingByteLimiter,
+    reserved_bytes: usize,
+}
+
+impl<'a> StreamingByteReservation<'a> {
+    fn new(flow_limiter: &'a StreamingByteLimiter, reserved_bytes: usize) -> Self {
+        Self {
+            flow_limiter,
+            reserved_bytes,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.reserved_bytes = 0;
+    }
+
+    fn release_now(&mut self) {
+        if self.reserved_bytes > 0 {
+            self.flow_limiter.release(self.reserved_bytes);
+            self.disarm();
+        }
+    }
+}
+
+impl Drop for StreamingByteReservation<'_> {
+    fn drop(&mut self) {
+        self.release_now();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_lexical_rebuild_page_work(
     storage: &mut FrankenStorage,
@@ -12417,6 +12516,24 @@ fn prepare_lexical_rebuild_page_work(
         .iter()
         .filter_map(|conv| conv.id)
         .collect::<Vec<_>>();
+
+    let (reserved_bytes, budget_wait_duration, waited_for_budget) =
+        acquire_ordered_lexical_rebuild_page_budget(
+            reservation_order,
+            flow_limiter,
+            sequence,
+            work.pipeline_budget.batch_fetch_message_bytes_limit,
+        )
+        .with_context(|| {
+            format!(
+                "acquiring lexical rebuild pipeline byte budget for ordered page sequence {}",
+                sequence
+            )
+        })?;
+    if waited_for_budget {
+        producer_telemetry.record_budget_wait(budget_wait_duration);
+    }
+    let mut reservation = StreamingByteReservation::new(flow_limiter, reserved_bytes);
 
     let message_fetch_started = Instant::now();
     let grouped_messages = match storage.fetch_messages_for_lexical_rebuild_batch(
@@ -12480,23 +12597,12 @@ fn prepare_lexical_rebuild_page_work(
         .iter()
         .map(|packet| packet.message_count)
         .sum::<usize>();
-    let (reserved_bytes, budget_wait_duration, waited_for_budget) =
-        acquire_ordered_lexical_rebuild_page_budget(
-            reservation_order,
-            flow_limiter,
-            sequence,
-            page_message_bytes,
-        )
-        .with_context(|| {
-            format!(
-                "acquiring lexical rebuild pipeline byte budget for ordered page sequence {}",
-                sequence
-            )
-        })?;
-    if waited_for_budget {
-        producer_telemetry.record_budget_wait(budget_wait_duration);
+    if prepared_packets.is_empty() {
+        reservation.release_now();
+    } else {
+        assign_lexical_rebuild_flow_reservation_bytes(&mut prepared_packets, reserved_bytes);
+        reservation.disarm();
     }
-    assign_lexical_rebuild_flow_reservation_bytes(&mut prepared_packets, reserved_bytes);
     let configured_page_size = usize::try_from(work.configured_page_size.max(1))
         .unwrap_or(usize::MAX)
         .max(1);
@@ -26487,22 +26593,106 @@ mod tests {
 
     #[test]
     fn lexical_rebuild_default_staged_shard_builder_parallelism_uses_bounded_builder_farm() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
         assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(1),
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+                1, None,
+            ),
             1
         );
         assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(4),
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+                4, None,
+            ),
             4
         );
         assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(8),
-            8
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+                8,
+                Some(128 * GIB),
+            ),
+            2,
+            "128 GiB hosts should not default to an 8-shard Tantivy build storm"
         );
         assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(32),
+            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
+                32,
+                Some(512 * GIB),
+            ),
             8
         );
+    }
+
+    #[test]
+    fn lexical_rebuild_default_staged_shard_max_message_bytes_scales_with_available_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(None),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
+                32 * GIB
+            )),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
+                128 * GIB
+            )),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            lexical_rebuild_default_staged_shard_max_message_bytes_for_available_memory(Some(
+                512 * GIB
+            )),
+            128 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_shard_planner_respects_staged_shard_byte_cap() {
+        let _cap = set_env(
+            "CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES",
+            "65536",
+        );
+        let settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 12,
+            available_parallelism: 12,
+            reserved_cores: 2,
+            tantivy_writer_threads: 8,
+            staged_shard_builders: 8,
+            staged_merge_workers: 3,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 3,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 1024,
+            startup_batch_fetch_conversations: 256,
+            steady_commit_every_conversations: 1024,
+            startup_commit_every_conversations: 256,
+            steady_commit_every_messages: 2048,
+            startup_commit_every_messages: 512,
+            steady_commit_every_message_bytes: 512 * 1024 * 1024,
+            startup_commit_every_message_bytes: 128 * 1024 * 1024,
+            pipeline_channel_size: 2,
+            page_prep_workers: 6,
+            pipeline_max_message_bytes_in_flight: 4 * 1024 * 1024,
+        };
+
+        let budgets = lexical_rebuild_default_shard_planner_budgets_for_totals(
+            &settings,
+            10_000,
+            1_000_000,
+            4usize * 1024 * 1024 * 1024,
+        );
+
+        assert_eq!(budgets.max_message_bytes_per_shard, 65_536);
     }
 
     #[test]
@@ -27570,9 +27760,10 @@ mod tests {
             match msg {
                 LexicalRebuildPipelineMessage::Done => break,
                 LexicalRebuildPipelineMessage::Batch(batch) => {
-                    for packet in &batch.packets {
-                        flow_limiter.release(packet.message_bytes);
-                    }
+                    release_lexical_rebuild_prepared_page_reservation(
+                        &batch,
+                        flow_limiter.as_ref(),
+                    );
                 }
                 LexicalRebuildPipelineMessage::Error(err) => panic!("producer error: {err}"),
             }
@@ -27709,6 +27900,25 @@ mod tests {
             producer_telemetry.clone(),
         );
 
+        let saturation_deadline = Instant::now() + Duration::from_secs(5);
+        while rx.len() == 0 && Instant::now() < saturation_deadline {
+            assert!(
+                !handle.is_finished(),
+                "producer finished before bounded handoff queue filled"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            rx.len(),
+            1,
+            "slow consumer should leave the bounded handoff queue saturated"
+        );
+        assert!(
+            !handle.is_finished(),
+            "producer should still be running while the handoff queue is saturated"
+        );
+
+        thread::sleep(Duration::from_millis(50));
         let first_batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
             LexicalRebuildPipelineMessage::Batch(batch) => batch,
             other => panic!("expected first burst batch, got {other:?}"),
@@ -27716,24 +27926,26 @@ mod tests {
         assert_eq!(first_batch.packets.len(), 1);
 
         let mut held_batches = vec![first_batch];
-        for observed_pause_round in 0..3 {
-            thread::sleep(Duration::from_millis(50));
-            assert_eq!(
-                rx.len(),
-                1,
-                "slow-consumer round {observed_pause_round} should leave the bounded handoff queue saturated"
-            );
-            assert!(
-                !handle.is_finished(),
-                "producer should still be blocked on bounded handoff in round {observed_pause_round}"
-            );
-            let queued_batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                LexicalRebuildPipelineMessage::Batch(batch) => batch,
-                other => panic!(
-                    "expected queued burst batch in round {observed_pause_round}, got {other:?}"
-                ),
-            };
-            held_batches.push(queued_batch);
+        let telemetry_deadline = Instant::now() + Duration::from_secs(5);
+        while producer_telemetry.snapshot().handoff_wait_count == 0
+            && Instant::now() < telemetry_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let telemetry = producer_telemetry.snapshot();
+        assert!(
+            telemetry.handoff_wait_count > 0,
+            "producer should record bounded handoff pressure under a sustained slow-consumer burst"
+        );
+        assert!(
+            telemetry.handoff_wait_ms > 0,
+            "bounded handoff stalls should accrue measurable wait time"
+        );
+
+        while let Ok(LexicalRebuildPipelineMessage::Batch(batch)) =
+            rx.recv_timeout(Duration::from_millis(10))
+        {
+            held_batches.push(batch);
         }
 
         for batch in &held_batches {
@@ -27756,15 +27968,6 @@ mod tests {
         }
         handle.join().unwrap();
 
-        let telemetry = producer_telemetry.snapshot();
-        assert!(
-            telemetry.handoff_wait_count > 0,
-            "producer should record bounded handoff pressure under a sustained slow-consumer burst"
-        );
-        assert!(
-            telemetry.handoff_wait_ms > 0,
-            "bounded handoff stalls should accrue measurable wait time"
-        );
         assert_eq!(
             flow_limiter.bytes_in_flight(),
             0,

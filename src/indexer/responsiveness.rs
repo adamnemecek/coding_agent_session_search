@@ -1352,7 +1352,7 @@ fn default_max_inflight_bytes_for_available(available_bytes: Option<u64>) -> usi
     budget.clamp(DEFAULT_MAX_INFLIGHT_BYTES, ceiling)
 }
 
-fn available_memory_bytes() -> Option<u64> {
+pub(crate) fn available_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
