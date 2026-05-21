@@ -7299,6 +7299,13 @@ struct IncrementalCanonicalLexicalRepairContext {
     canonical_messages: usize,
     tantivy_requires_rebuild: bool,
     observed_tantivy_docs: Option<usize>,
+    /// True when a completed lexical-rebuild checkpoint records this exact
+    /// canonical data (matching storage fingerprint). Under the atomic-swap
+    /// publish invariant the live index IS that valid generation, so a sparse
+    /// live-doc reading after an interrupted/OOM-killed rebuild is stale and a
+    /// from-scratch full rebuild would only loop (issue #248,
+    /// coding_agent_session_search-raoug).
+    published_index_validated_for_current_data: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7350,6 +7357,19 @@ fn choose_incremental_canonical_lexical_repair_plan(
 
     let observed_tantivy_docs = context.observed_tantivy_docs?;
     if observed_tantivy_docs < context.canonical_messages {
+        // #248 (coding_agent_session_search-raoug): if a completed rebuild
+        // checkpoint already covers exactly this canonical data (matching storage
+        // fingerprint), the live index IS that valid published generation under
+        // the atomic-swap invariant. A sparse live-doc reading here is stale
+        // (e.g. a later rebuild was OOM-killed mid-merge), and a from-scratch
+        // `deferred_authoritative_db_rebuild` would just loop on every restart.
+        // Trust the checkpoint and skip the redundant full rebuild. (A genuinely
+        // missing/unopenable index is handled above via `tantivy_requires_rebuild`
+        // and is unaffected; changed data shifts the fingerprint and falls through
+        // to a rebuild.)
+        if context.published_index_validated_for_current_data {
+            return None;
+        }
         return Some(IncrementalCanonicalLexicalRepairPlan {
             canonical_messages: context.canonical_messages,
             observed_tantivy_docs: Some(observed_tantivy_docs),
@@ -8562,6 +8582,42 @@ pub(crate) fn load_active_lexical_rebuild_pipeline_runtime(
 
 pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<String> {
     lexical_rebuild_storage_fingerprint(db_path)
+}
+
+/// True iff a *completed* lexical-rebuild checkpoint exists for `db_path` whose
+/// recorded storage fingerprint matches the current canonical DB. Used to
+/// recognize an already-published, still-valid lexical generation and skip a
+/// redundant from-scratch rebuild that would otherwise loop on every restart
+/// after an OOM-killed shard merge (issue #248,
+/// coding_agent_session_search-raoug). Conservative by construction: any missing
+/// checkpoint, incomplete rebuild, path-identity mismatch, changed data
+/// (different fingerprint), or read error returns `false`, preserving the
+/// existing rebuild behavior.
+fn published_lexical_index_validated_for_current_data(index_path: &Path, db_path: &Path) -> bool {
+    let checkpoint = match load_lexical_rebuild_checkpoint(index_path) {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "could not load lexical rebuild checkpoint while validating published index"
+            );
+            return false;
+        }
+    };
+    if !checkpoint.completed || !crate::stored_path_identity_matches(&checkpoint.db_path, db_path) {
+        return false;
+    }
+    match lexical_storage_fingerprint_for_db(db_path) {
+        Ok(current_fingerprint) => current_fingerprint == checkpoint.storage_fingerprint,
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "could not compute current storage fingerprint while validating published index"
+            );
+            false
+        }
+    }
 }
 
 fn persist_completed_lexical_rebuild_checkpoint_from_observations(
@@ -11419,6 +11475,12 @@ pub fn run_index(
             canonical_messages: 0,
             tantivy_requires_rebuild,
             observed_tantivy_docs,
+            // #248: recognize an already-published, still-valid lexical generation
+            // (completed checkpoint + matching storage fingerprint) so a sparse
+            // live-doc reading after an OOM-killed shard merge does not trigger a
+            // looping from-scratch full rebuild (coding_agent_session_search-raoug).
+            published_index_validated_for_current_data:
+                published_lexical_index_validated_for_current_data(&index_path, &opts.db_path),
         };
         let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0
             && should_evaluate_incremental_canonical_lexical_repair(&repair_context)
@@ -18941,7 +19003,15 @@ fn finalize_watch_reindex_result(
             indexed
         }
         Err(error) => {
-            tracing::warn!(error = %error, context, "watch reindex failed");
+            // ERROR (not WARN) with the full chain so watch-cycle failures are
+            // visible: a failed cycle leaves the per-connector since_ts watermark
+            // un-advanced, so the next cycle re-scans the same backlog and fails
+            // again — the crash-loop symptom in issue #250
+            // (coding_agent_session_search-u7r1z).
+            tracing::error!(
+                context,
+                "watch reindex failed; since_ts not advanced this cycle: {error:#}"
+            );
             reset_progress_to_idle(progress);
             set_progress_last_error(progress, Some(format!("{context}: {error}")));
             detector.record_scan(0);
@@ -18963,7 +19033,15 @@ fn finalize_watch_once_reindex_result(
             Ok(indexed)
         }
         Err(error) => {
-            tracing::warn!(error = %error, context, "watch reindex failed");
+            // ERROR (not WARN) with the full chain so watch-cycle failures are
+            // visible: a failed cycle leaves the per-connector since_ts watermark
+            // un-advanced, so the next cycle re-scans the same backlog and fails
+            // again — the crash-loop symptom in issue #250
+            // (coding_agent_session_search-u7r1z).
+            tracing::error!(
+                context,
+                "watch reindex failed; since_ts not advanced this cycle: {error:#}"
+            );
             reset_progress_to_idle(progress);
             set_progress_last_error(progress, Some(format!("{context}: {error}")));
             detector.record_scan(0);
@@ -22356,6 +22434,7 @@ pub mod persist {
                 canonical_messages: 0,
                 tantivy_requires_rebuild: true,
                 observed_tantivy_docs: None,
+                published_index_validated_for_current_data: false,
             };
 
             assert!(crate::indexer::should_evaluate_incremental_canonical_lexical_repair(&base));
@@ -22415,6 +22494,7 @@ pub mod persist {
                         canonical_messages: 42,
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
+                        published_index_validated_for_current_data: false,
                     },
                 ),
                 Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
@@ -22438,6 +22518,7 @@ pub mod persist {
                         canonical_messages: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
+                        published_index_validated_for_current_data: false,
                     },
                 ),
                 Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
@@ -22504,9 +22585,57 @@ pub mod persist {
                         canonical_messages: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(42),
+                        published_index_validated_for_current_data: false,
                     },
                 ),
                 None
+            );
+        }
+
+        #[test]
+        fn incremental_canonical_lexical_repair_plan_skips_rebuild_when_published_index_validated()
+        {
+            // #248 (coding_agent_session_search-raoug): a sparse live-doc reading
+            // must NOT trigger a from-scratch rebuild when a completed checkpoint
+            // already validated the published index for exactly this data. The
+            // sparse reading is stale (e.g. a later rebuild was OOM-killed mid
+            // merge) and a full rebuild would loop on every restart.
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        canonical_messages: 42,
+                        tantivy_requires_rebuild: false,
+                        observed_tantivy_docs: Some(3),
+                        published_index_validated_for_current_data: true,
+                    },
+                ),
+                None,
+                "a validated published generation must suppress the sparse-triggered full rebuild"
+            );
+
+            // The validation flag must NOT mask a genuinely missing/unopenable
+            // index: `tantivy_requires_rebuild` still forces a rebuild plan.
+            assert!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        canonical_messages: 42,
+                        tantivy_requires_rebuild: true,
+                        observed_tantivy_docs: None,
+                        published_index_validated_for_current_data: true,
+                    },
+                )
+                .is_some(),
+                "a missing/invalid tantivy index must still rebuild even when the validation flag is set"
             );
         }
 
@@ -28463,6 +28592,141 @@ mod tests {
                 .iter()
                 .all(|shard| shard.message_count == LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT),
             "id-only plans must leave doc-count validation to observed rebuild accounting"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_shard_plan_with_sparse_tail_metadata_uses_conservative_id_only_plan() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("sparse-tail-canonical.db");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
+        conn.execute_compat(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                source_path TEXT NOT NULL,
+                last_message_idx INTEGER
+            )",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                author TEXT,
+                created_at INTEGER,
+                content TEXT NOT NULL,
+                UNIQUE(conversation_id, idx)
+            )",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx)",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
+            )",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        for conversation_id in 1..=130 {
+            if conversation_id == 1 {
+                conn.execute_compat(
+                    "INSERT INTO conversations(id, source_path, last_message_idx)
+                     VALUES (?1, ?2, 0)",
+                    &[
+                        ParamValue::from(i64::from(conversation_id)),
+                        ParamValue::from(format!("/tmp/sparse-tail-{conversation_id}.jsonl")),
+                    ],
+                )
+                .unwrap();
+            } else {
+                conn.execute_compat(
+                    "INSERT INTO conversations(id, source_path, last_message_idx)
+                     VALUES (?1, ?2, NULL)",
+                    &[
+                        ParamValue::from(i64::from(conversation_id)),
+                        ParamValue::from(format!("/tmp/sparse-tail-{conversation_id}.jsonl")),
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, content)
+                 VALUES (?1, 0, 'user', ?2)",
+                &[
+                    ParamValue::from(i64::from(conversation_id)),
+                    ParamValue::from(format!("message {conversation_id}")),
+                ],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "INSERT INTO conversation_tail_state(conversation_id, last_message_idx)
+                 VALUES (?1, 0)",
+                &[ParamValue::from(i64::from(conversation_id + 1_000))],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        assert!(
+            !storage
+                .lexical_rebuild_has_tail_footprint_metadata()
+                .unwrap(),
+            "one populated conversation tail plus stale tail-state rows must not send a large legacy DB through full footprint aggregation"
+        );
+        let settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 8,
+            available_parallelism: 8,
+            reserved_cores: 0,
+            tantivy_writer_threads: 8,
+            staged_shard_builders: 2,
+            staged_merge_workers: 1,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 1,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 512,
+            startup_batch_fetch_conversations: 512,
+            steady_commit_every_conversations: 512,
+            startup_commit_every_conversations: 512,
+            steady_commit_every_messages: 10_000,
+            startup_commit_every_messages: 10_000,
+            steady_commit_every_message_bytes: 64 * 1024 * 1024,
+            startup_commit_every_message_bytes: 64 * 1024 * 1024,
+            pipeline_channel_size: 2,
+            page_prep_workers: 1,
+            pipeline_max_message_bytes_in_flight: 256 * 1024,
+        };
+
+        let plan = plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &settings, 130)
+            .unwrap();
+
+        assert_eq!(
+            plan.shards
+                .iter()
+                .map(|shard| shard.conversation_count)
+                .collect::<Vec<_>>(),
+            vec![64, 64, 2]
+        );
+        assert!(
+            plan.shards
+                .iter()
+                .all(|shard| shard.message_count == LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT),
+            "sparse tail metadata should use the same validation-safe id-only plan as absent metadata"
         );
     }
 

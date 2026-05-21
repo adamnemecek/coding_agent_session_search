@@ -74871,6 +74871,19 @@ fn run_index_with_data(
     let elapsed_ms = start.elapsed().as_millis();
 
     if let Err(err) = &res {
+        // Surface every index failure at ERROR level so `cass index --watch`
+        // (which runs without --json) can no longer exit with code 9 silently,
+        // leaving the operator with no explanation in the watch log (issue #250,
+        // coding_agent_session_search-u7r1z). stdout stays data-only; this
+        // diagnostic line goes to stderr via tracing.
+        tracing::error!(
+            code = err.code,
+            kind = %err.kind,
+            retryable = err.retryable,
+            "cass index failed (exit {}): {}",
+            err.code,
+            err.message
+        );
         if let Some(fmt) = structured_format {
             let mut payload = cli_error_json_payload(err, elapsed_ms);
             if let Some(active_index) = &active_index_error {
@@ -74888,8 +74901,6 @@ fn run_index_with_data(
                 emit_event(event);
             }
             output_structured_value(payload, fmt)?;
-        } else {
-            tracing::debug!(?err, "index command failed");
         }
     } else if let Some(fmt) = structured_format {
         // Derive result counts from the indexer's own progress tracking rather
