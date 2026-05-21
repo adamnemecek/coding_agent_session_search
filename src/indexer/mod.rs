@@ -8078,6 +8078,17 @@ fn lexical_rebuild_pending_shard_build_max_message_bytes(
         .max(1)
 }
 
+fn lexical_rebuild_pending_shard_build_max_jobs(
+    settings: &LexicalRebuildPipelineSettingsSnapshot,
+) -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| settings.staged_shard_builders.max(1).saturating_mul(32))
+        .clamp(1, 256)
+}
+
 fn lexical_rebuild_default_shard_planner_budgets_for_totals(
     settings: &LexicalRebuildPipelineSettingsSnapshot,
     total_conversations: usize,
@@ -8157,8 +8168,7 @@ fn plan_lexical_rebuild_shards_from_conversation_ids_with_settings(
     };
     let max_conversations_per_shard = settings
         .steady_commit_every_conversations
-        .max(1)
-        .min(LEXICAL_REBUILD_ID_ONLY_MAX_CONVERSATIONS_PER_SHARD)
+        .clamp(1, LEXICAL_REBUILD_ID_ONLY_MAX_CONVERSATIONS_PER_SHARD)
         .min(max_conversations_by_average_bytes.max(1))
         .max(1);
     let max_messages_per_shard = average_messages_per_conversation
@@ -15103,6 +15113,8 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     let mut pending_shard_build_message_bytes = 0usize;
     let pending_shard_build_max_message_bytes =
         lexical_rebuild_pending_shard_build_max_message_bytes(&pipeline_settings);
+    let pending_shard_build_max_jobs =
+        lexical_rebuild_pending_shard_build_max_jobs(&pipeline_settings);
     let mut merge_coordinator = LexicalRebuildShardMergeCoordinator::new(eager_merge_stage_root);
     let staged_merge_controller = LexicalRebuildStagedMergeController::new(
         shard_merge_settings.workers,
@@ -15341,11 +15353,13 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             } else {
                 &never_merge_result_rx
             };
-            let pipeline_backlog_paused =
-                pending_shard_build_message_bytes >= pending_shard_build_max_message_bytes;
+            let pipeline_backlog_paused = pending_shard_build_message_bytes
+                >= pending_shard_build_max_message_bytes
+                || pending_shard_build_jobs.len() >= pending_shard_build_max_jobs;
             if pipeline_backlog_paused && !pipeline_backlog_pause_logged {
                 tracing::info!(
                     pending_shard_build_jobs = pending_shard_build_jobs.len(),
+                    pending_shard_build_max_jobs,
                     pending_shard_build_message_bytes,
                     pending_shard_build_max_message_bytes,
                     active_shard_build_jobs,
@@ -15355,6 +15369,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             } else if !pipeline_backlog_paused && pipeline_backlog_pause_logged {
                 tracing::info!(
                     pending_shard_build_jobs = pending_shard_build_jobs.len(),
+                    pending_shard_build_max_jobs,
                     pending_shard_build_message_bytes,
                     pending_shard_build_max_message_bytes,
                     active_shard_build_jobs,
@@ -15707,7 +15722,9 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         }
 
         drop(shard_work_tx);
-        while received_shard_results < enqueued_shards || merge_coordinator.pending_merge_jobs() > 0
+        while !pending_shard_build_jobs.is_empty()
+            || received_shard_results < enqueued_shards
+            || merge_coordinator.pending_merge_jobs() > 0
         {
             let active_shard_result_rx = if shard_result_channel_open {
                 &shard_result_rx
@@ -15848,6 +15865,24 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         &mut last_progress_persist,
                         progress_heartbeat_interval,
                         perf_profile.as_mut(),
+                    )?;
+                }
+                default(Duration::from_millis(250)) => {
+                    refresh_runtime(
+                        &mut latest_pipeline_runtime,
+                        &mut responsiveness_controller,
+                        &mut current_batch_conversation_limit,
+                        current_shard_packets.len(),
+                        current_shard_message_bytes,
+                    );
+                    refresh_staged_parallelism_and_dispatch(
+                        &mut latest_pipeline_runtime,
+                        &mut merge_coordinator,
+                        &mut pending_shard_build_jobs,
+                        &mut pending_shard_build_message_bytes,
+                        &mut active_shard_build_jobs,
+                        &mut enqueued_shards,
+                        true,
                     )?;
                 }
             }
@@ -27762,6 +27797,45 @@ mod tests {
         );
 
         assert_eq!(budgets.max_message_bytes_per_shard, 65_536);
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_pending_shard_build_job_cap_scales_with_builders_and_env() {
+        let _invalid_override = set_env("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_JOBS", "0");
+        let mut settings = LexicalRebuildPipelineSettingsSnapshot {
+            workers: 8,
+            available_parallelism: 8,
+            reserved_cores: 2,
+            tantivy_writer_threads: 8,
+            staged_shard_builders: 2,
+            staged_merge_workers: 1,
+            controller_mode: "steady".into(),
+            controller_restore_clear_samples: 3,
+            controller_restore_hold_ms: 0,
+            controller_loadavg_high_watermark_1m_milli: None,
+            controller_loadavg_low_watermark_1m_milli: None,
+            page_size: LEXICAL_REBUILD_PAGE_SIZE,
+            steady_batch_fetch_conversations: 1024,
+            startup_batch_fetch_conversations: 256,
+            steady_commit_every_conversations: 1024,
+            startup_commit_every_conversations: 256,
+            steady_commit_every_messages: 2048,
+            startup_commit_every_messages: 512,
+            steady_commit_every_message_bytes: 512 * 1024 * 1024,
+            startup_commit_every_message_bytes: 128 * 1024 * 1024,
+            pipeline_channel_size: 2,
+            page_prep_workers: 6,
+            pipeline_max_message_bytes_in_flight: 4 * 1024 * 1024,
+        };
+
+        assert_eq!(lexical_rebuild_pending_shard_build_max_jobs(&settings), 64);
+        settings.staged_shard_builders = 16;
+        assert_eq!(lexical_rebuild_pending_shard_build_max_jobs(&settings), 256);
+        drop(_invalid_override);
+
+        let _explicit_override = set_env("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_JOBS", "17");
+        assert_eq!(lexical_rebuild_pending_shard_build_max_jobs(&settings), 17);
     }
 
     #[test]
