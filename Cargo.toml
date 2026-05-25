@@ -186,6 +186,16 @@ inherits = "release"
 debug = true
 strip = false
 
+# Dedicated profile for benchmark runs that need to land in .bench-history/
+# pass-over-pass ratchets per the gauntlet keep-gate rules. Inherits release
+# (opt-level=3, lto, panic=abort) and adds line-tables + frame pointers so
+# samply/flamegraph attribution works without rebuilding.
+# Usage: RUSTFLAGS="-C force-frame-pointers=yes" cargo bench --profile release-perf
+[profile.release-perf]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+
 # The dependency graph is pinned to the asupersync 0.3.x line. Keep
 # frankensqlite, frankensearch, and franken-agent-detection revs aligned
 # so Cargo.lock does not reintroduce a parallel asupersync 0.2.x stack.

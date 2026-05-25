@@ -135,7 +135,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 ### Release Profile
 
-The release build optimizes for binary size (this is a CLI tool):
+The release build optimizes for speed with LTO + single-codegen-unit + stripped binary:
 
 ```toml
 [profile.release]
@@ -143,7 +143,7 @@ lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 strip = true        # Remove debug symbols
 panic = "abort"     # Abort on panic (smaller binary)
-opt-level = "z"     # Optimize for size
+opt-level = 3       # Maximum optimization for speed
 ```
 
 A profiling profile is also available:
@@ -153,6 +153,17 @@ A profiling profile is also available:
 inherits = "release"
 debug = true        # Keep debug symbols for flamegraphs
 strip = false
+```
+
+A bench profile is used for `.bench-history/` pass-over-pass ratchet runs (per
+the gauntlet keep-gate rules; never run benches against `--release` directly):
+
+```toml
+[profile.release-perf]
+inherits = "release"
+debug = "line-tables-only"  # frame-pointer attribution without rebuild
+strip = false
+# Pair with: RUSTFLAGS="-C force-frame-pointers=yes" cargo bench --profile release-perf
 ```
 
 ---
