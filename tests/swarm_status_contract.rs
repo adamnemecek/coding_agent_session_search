@@ -12,11 +12,14 @@
 //! git diff -- tests/fixtures/swarm_status tests/golden/swarm_status tests/swarm_status_contract.rs
 //! ```
 
-use serde_json::Value;
+use assert_cmd::Command;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tempfile::TempDir;
 
 const FIXTURE_ROOT: &str = "tests/fixtures/swarm_status";
 const MANIFEST_PATH: &str = "tests/fixtures/swarm_status/manifest.json";
@@ -339,8 +342,325 @@ fn swarm_status_scenario_invariants_are_pinned() {
     }
 }
 
+#[test]
+fn swarm_evidence_cli_links_committed_bead_to_proof_and_mail() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "evidence-linked",
+        json!({
+            "beads": {
+                "closed": [{
+                    "id": "cass-proof-1",
+                    "title": "Proof-backed closeout",
+                    "status": "closed",
+                    "close_reason": "Verified by rch",
+                    "commit_id": "abc123"
+                }]
+            },
+            "agent_mail": {
+                "messages": [{
+                    "thread_id": "cass-proof-1",
+                    "subject": "Closeout proof",
+                    "from": "FixtureAgent",
+                    "created_ts": "2026-05-08T16:00:00Z"
+                }],
+                "reservations": [{
+                    "reason": "cass-proof-1",
+                    "holder": "FixtureAgent",
+                    "path_pattern": "src/lib.rs",
+                    "exclusive": true,
+                    "expires_ts": "2026-05-08T17:00:00Z"
+                }]
+            },
+            "git": {
+                "dirty": false,
+                "dirty_paths": [],
+                "recent_commits": [{
+                    "hash": "abc123",
+                    "subject": "feat: finish cass-proof-1",
+                    "authored_ts": "2026-05-08T15:55:00Z",
+                    "changed_paths": ["src/lib.rs", "tests/cli_robot.rs"]
+                }]
+            },
+            "evidence": {
+                "recent_threads": [{
+                    "thread_id": "cass-proof-1",
+                    "subject": "Closeout proof",
+                    "sender": "FixtureAgent",
+                    "created_ts": "2026-05-08T16:00:00Z"
+                }],
+                "recent_proofs": [{
+                    "kind": "rch-test",
+                    "bead_id": "cass-proof-1",
+                    "commit_id": "abc123",
+                    "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test cli_robot",
+                    "status": "passed",
+                    "remote_exit_status": 0,
+                    "changed_paths": ["src/lib.rs", "tests/cli_robot.rs"],
+                    "mail_thread_refs": ["cass-proof-1"]
+                }],
+                "proof_gaps": [],
+                "redaction_applied": false
+            },
+            "processes": {},
+            "cass_health": {},
+            "cass_status": {}
+        }),
+    )?;
+    let output = run_swarm_evidence_fixture(&fixture_path, Some("cass-proof-1"));
+
+    let output = output?;
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.evidence.v1"),
+        "schema version",
+    )?;
+    require_value_eq(get_path(&output, &["status"]), json!("ok"), "status")?;
+    require_value_eq(
+        get_path(&output, &["filter", "bead_id"]),
+        json!("cass-proof-1"),
+        "bead filter",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "bead_count"]),
+        json!(1),
+        "bead count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "commit_count"]),
+        json!(1),
+        "commit count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "proof_count"]),
+        json!(1),
+        "proof count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "mail_thread_count"]),
+        json!(1),
+        "mail thread count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "reservation_count"]),
+        json!(1),
+        "reservation count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "proof_gap_count"]),
+        json!(0),
+        "proof gap count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("proof-ledger-complete"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["privacy", "raw_session_content_included"]),
+        json!(false),
+        "raw session privacy flag",
+    )?;
+    require_value_eq(
+        get_path(&output, &["privacy", "mail_body_snippets_included"]),
+        json!(false),
+        "mail snippet privacy flag",
+    )?;
+
+    let ledger = get_path(&output, &["ledger"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("ledger array missing"))?;
+    require(
+        ledger.iter().any(|row| {
+            row.get("kind").and_then(Value::as_str) == Some("bead")
+                && row.get("bead_id").and_then(Value::as_str) == Some("cass-proof-1")
+                && row.get("status").and_then(Value::as_str) == Some("closed")
+        }),
+        "missing bead ledger row",
+    )?;
+    require(
+        ledger.iter().any(|row| {
+            row.get("kind").and_then(Value::as_str) == Some("commit")
+                && row.get("commit_id").and_then(Value::as_str) == Some("abc123")
+                && row
+                    .get("bead_ids")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some("cass-proof-1")))
+        }),
+        "missing commit ledger row",
+    )?;
+    require(
+        ledger.iter().any(|row| {
+            row.get("kind").and_then(Value::as_str) == Some("proof")
+                && row.get("proof_kind").and_then(Value::as_str) == Some("rch-test")
+                && row.get("remote_exit_status").and_then(Value::as_i64) == Some(0)
+        }),
+        "missing proof ledger row",
+    )?;
+    require(
+        ledger.iter().any(|row| {
+            row.get("kind").and_then(Value::as_str) == Some("mail_thread")
+                && row.get("thread_id").and_then(Value::as_str) == Some("cass-proof-1")
+        }),
+        "missing mail thread ledger row",
+    )?;
+    require(
+        ledger.iter().any(|row| {
+            row.get("kind").and_then(Value::as_str) == Some("reservation")
+                && row.get("bead_id").and_then(Value::as_str) == Some("cass-proof-1")
+                && row.get("path_pattern").and_then(Value::as_str) == Some("src/lib.rs")
+        }),
+        "missing reservation ledger row",
+    )?;
+    assert_no_forbidden_fixture_leaks("evidence-linked", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_evidence_cli_surfaces_missing_conflicting_interrupted_and_unrelated_gaps()
+-> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "evidence-gaps",
+        json!({
+            "beads": {
+                "closed": [
+                    {"id": "cass-missing", "status": "closed"},
+                    {"id": "cass-conflict", "status": "closed"},
+                    {"id": "cass-interrupted", "status": "closed"}
+                ]
+            },
+            "agent_mail": {
+                "messages": [],
+                "reservations": []
+            },
+            "git": {
+                "dirty": true,
+                "dirty_paths": [{"path": "docs/unrelated.md"}],
+                "recent_commits": [
+                    {
+                        "hash": "aaa111",
+                        "subject": "finish cass-missing",
+                        "changed_paths": ["src/missing.rs"]
+                    },
+                    {
+                        "hash": "bbb222",
+                        "subject": "finish cass-conflict",
+                        "changed_paths": ["src/conflict.rs"]
+                    },
+                    {
+                        "hash": "ccc333",
+                        "subject": "finish cass-interrupted",
+                        "changed_paths": ["src/interrupted.rs"]
+                    }
+                ]
+            },
+            "evidence": {
+                "recent_proofs": [
+                    {
+                        "kind": "rch-test",
+                        "bead_id": "cass-conflict",
+                        "commit_id": "bbb222",
+                        "status": "failed",
+                        "remote_exit_status": 0,
+                        "changed_paths": ["src/conflict.rs"]
+                    },
+                    {
+                        "kind": "rch-test",
+                        "bead_id": "cass-interrupted",
+                        "commit_id": "ccc333",
+                        "status": "passed",
+                        "remote_exit_status": 0,
+                        "artifact_retrieval": "interrupted",
+                        "changed_paths": ["src/interrupted.rs"]
+                    }
+                ],
+                "proof_gaps": [],
+                "redaction_applied": false
+            },
+            "processes": {},
+            "cass_health": {},
+            "cass_status": {}
+        }),
+    )?;
+    let output = run_swarm_evidence_fixture(&fixture_path, None)?;
+    let gap_kinds = get_path(&output, &["proof_gaps"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("proof gaps missing"))?
+        .iter()
+        .filter_map(|gap| gap.get("kind").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.evidence.v1"),
+        "schema version",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("inspect-proof-gaps"),
+        "recommended action",
+    )?;
+    require(gap_kinds.contains("missing-proof"), "missing proof gap")?;
+    require(
+        gap_kinds.contains("missing-rch-proof"),
+        "missing rch proof gap",
+    )?;
+    require(
+        gap_kinds.contains("conflicting-proof"),
+        "missing conflicting proof gap",
+    )?;
+    require(
+        gap_kinds.contains("artifact-retrieval-interrupted-after-success"),
+        "missing interrupted retrieval gap",
+    )?;
+    require(
+        gap_kinds.contains("unrelated-dirty-file"),
+        "missing unrelated dirty file gap",
+    )?;
+    assert_no_forbidden_fixture_leaks("evidence-gaps", &output);
+    Ok(())
+}
+
 fn repo_path(relative: impl AsRef<Path>) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+fn write_swarm_evidence_fixture(
+    fixture_id: &str,
+    sources: Value,
+) -> Result<(TempDir, PathBuf), Box<dyn Error>> {
+    let tmp = TempDir::new()?;
+    let fixture_path = tmp.path().join(format!("{fixture_id}.inputs.json"));
+    let fixture = json!({
+        "fixture_id": fixture_id,
+        "description": "Temporary swarm evidence fixture for CLI contract coverage.",
+        "sources": sources
+    });
+    fs::write(&fixture_path, serde_json::to_vec_pretty(&fixture)?)?;
+    Ok((tmp, fixture_path))
+}
+
+fn run_swarm_evidence_fixture(
+    fixture_path: &Path,
+    bead: Option<&str>,
+) -> Result<Value, Box<dyn Error>> {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass")); // ubs:ignore — fixed test binary from assert_cmd.
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.args(["swarm", "evidence", "--json", "--fixture"]);
+    cmd.arg(fixture_path);
+    if let Some(bead_id) = bead {
+        cmd.args(["--bead", bead_id]);
+    }
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    require(
+        output.stderr.is_empty(),
+        format!(
+            "swarm evidence should not log to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 fn read_json(path: PathBuf) -> Value {
@@ -389,4 +709,38 @@ fn assert_no_forbidden_fixture_leaks(fixture_id: &str, value: &Value) {
             "{fixture_id} golden leaks forbidden fixture text: {needle}"
         );
     }
+}
+
+fn get_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn require_value_eq(
+    actual: Option<&Value>,
+    expected: Value,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    match actual {
+        Some(actual) if actual == &expected => Ok(()),
+        Some(actual) => Err(test_error(format!(
+            "{label} mismatch: expected {expected}, got {actual}"
+        ))),
+        None => Err(test_error(format!("{label} missing"))),
+    }
+}
+
+fn require(condition: bool, message: impl Into<String>) -> Result<(), Box<dyn Error>> {
+    if condition {
+        Ok(())
+    } else {
+        Err(test_error(message))
+    }
+}
+
+fn test_error(message: impl Into<String>) -> Box<dyn Error> {
+    Box::new(std::io::Error::other(message.into()))
 }
