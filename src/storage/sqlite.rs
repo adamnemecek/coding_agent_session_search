@@ -5132,6 +5132,9 @@ const MIGRATION_NAMES: [(i64, &str); 20] = [
 /// - If `_schema_migrations` already exists → skip (already transitioned)
 /// - If `meta` table has `schema_version > 0` → create `_schema_migrations`
 ///   and backfill entries for versions `1..=current_version`
+/// - Legacy V10-V12 databases are represented as V13 in `_schema_migrations`
+///   because frankensqlite uses one combined V13 base migration instead of
+///   replaying the old incremental V11-V13 steps.
 /// - If `meta` table missing or `schema_version = 0` with no tables → fresh DB,
 ///   let `MigrationRunner` handle it
 /// - If `schema_version = 0` but tables exist → corrupted state, log warning
@@ -5191,8 +5194,14 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
     )
     .with_context(|| "creating _schema_migrations table for transition")?;
 
+    let backfill_through_version = if (10..13).contains(&current_version) {
+        13
+    } else {
+        current_version
+    };
+
     for &(version, name) in &MIGRATION_NAMES {
-        if version > current_version {
+        if version > backfill_through_version {
             break;
         }
         conn.execute_compat(
@@ -5204,7 +5213,8 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
 
     info!(
         current_version,
-        "schema version transition complete: backfilled entries for versions 1..={current_version}"
+        backfill_through_version,
+        "schema version transition complete: backfilled legacy meta schema versions"
     );
 
     Ok(())
@@ -24255,15 +24265,17 @@ mod tests {
         let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
         transition_from_meta_version(&conn).unwrap();
 
-        // _schema_migrations should exist with entries for versions 1..=10.
+        // The frankensqlite path uses a combined V13 base migration, so a
+        // legacy V10 marker is bridged to V13 and later idempotent repair fills
+        // in any missing V11-V13 objects.
         let rows = conn
             .query("SELECT version FROM _schema_migrations ORDER BY version;")
             .unwrap();
         let versions: Vec<i64> = rows.iter().filter_map(|r| r.get_typed(0).ok()).collect();
         assert_eq!(
             versions,
-            (1..=10).collect::<Vec<i64>>(),
-            "transition should backfill versions 1..=10"
+            (1..=13).collect::<Vec<i64>>(),
+            "transition should bridge legacy V10 databases through the combined V13 base marker"
         );
     }
 
