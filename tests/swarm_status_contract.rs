@@ -1094,6 +1094,277 @@ fn swarm_evidence_cli_surfaces_missing_conflicting_interrupted_and_unrelated_gap
 }
 
 #[test]
+fn swarm_proof_debt_cli_reports_clear_complete_fixture() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "proof-debt-clear",
+        json!({
+            "beads": {
+                "closed": [{
+                    "id": "cass-proof-clear",
+                    "title": "Complete proof closeout",
+                    "status": "closed",
+                    "close_reason": "Verified by rch",
+                    "commit_id": "abc123"
+                }]
+            },
+            "agent_mail": {
+                "messages": [{
+                    "thread_id": "cass-proof-clear",
+                    "subject": "Closeout proof",
+                    "from": "FixtureAgent",
+                    "created_ts": "2026-05-08T16:00:00Z"
+                }],
+                "reservations": []
+            },
+            "git": {
+                "dirty": false,
+                "dirty_paths": [],
+                "recent_commits": [{
+                    "hash": "abc123",
+                    "subject": "feat: finish cass-proof-clear",
+                    "authored_ts": "2026-05-08T15:55:00Z",
+                    "changed_paths": ["src/lib.rs", "tests/swarm_status_contract.rs"]
+                }]
+            },
+            "evidence": {
+                "recent_threads": [{
+                    "thread_id": "cass-proof-clear",
+                    "subject": "Closeout proof",
+                    "sender": "FixtureAgent",
+                    "created_ts": "2026-05-08T16:00:00Z"
+                }],
+                "recent_proofs": [{
+                    "kind": "rch-test",
+                    "bead_id": "cass-proof-clear",
+                    "commit_id": "abc123",
+                    "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test swarm_status_contract",
+                    "status": "passed",
+                    "remote_exit_status": 0,
+                    "changed_paths": ["src/lib.rs", "tests/swarm_status_contract.rs"],
+                    "mail_thread_refs": ["cass-proof-clear"]
+                }],
+                "proof_gaps": [],
+                "redaction_applied": false
+            },
+            "processes": {},
+            "cass_health": {},
+            "cass_status": {}
+        }),
+    )?;
+    let output = run_swarm_proof_debt_fixture(&fixture_path, Some("cass-proof-clear"))?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.proof_debt.v1"),
+        "schema version",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "debt_count"]),
+        json!(0),
+        "debt count",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("proof-debt-clear"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "read_only"]),
+        json!(true),
+        "read-only contract",
+    )?;
+    require_value_eq(
+        get_path(&output, &["gate_contract", "fails_closed_by_default"]),
+        json!(false),
+        "default gate behavior",
+    )?;
+    require_value_eq(
+        get_path(&output, &["privacy", "raw_session_content_included"]),
+        json!(false),
+        "raw session privacy flag",
+    )?;
+    assert_no_forbidden_fixture_leaks("proof-debt-clear", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_proof_debt_cli_prioritizes_and_suppresses_debt() -> Result<(), Box<dyn Error>> {
+    let (_tmp, fixture_path) = write_swarm_evidence_fixture(
+        "proof-debt-mixed",
+        json!({
+            "beads": {
+                "closed": [
+                    {"id": "cass-no-proof", "status": "closed", "close_reason": "missing proof"},
+                    {"id": "cass-clippy-only", "status": "closed", "close_reason": "linted"},
+                    {"id": "cass-ignored-stress", "status": "closed", "close_reason": "stress artifact retained"},
+                    {"id": "cass-ubs", "status": "closed", "close_reason": "UBS baseline reviewed"},
+                    {"id": "cass-mail-missing", "status": "closed", "close_reason": "proof exists"}
+                ]
+            },
+            "agent_mail": {
+                "messages": [
+                    {"thread_id": "cass-no-proof", "subject": "closeout cass-no-proof", "from": "FixtureAgent"},
+                    {"thread_id": "cass-clippy-only", "subject": "closeout cass-clippy-only", "from": "FixtureAgent"},
+                    {"thread_id": "cass-ignored-stress", "subject": "closeout cass-ignored-stress", "from": "FixtureAgent"},
+                    {"thread_id": "cass-ubs", "subject": "closeout cass-ubs", "from": "FixtureAgent"}
+                ],
+                "reservations": []
+            },
+            "git": {
+                "dirty": true,
+                "dirty_paths": [{"path": "docs/unrelated.md"}],
+                "recent_commits": [
+                    {"hash": "aaa111", "subject": "finish cass-no-proof", "changed_paths": ["src/no_proof.rs"]},
+                    {"hash": "bbb222", "subject": "finish cass-clippy-only", "changed_paths": ["src/clippy.rs"]},
+                    {"hash": "ccc333", "subject": "finish cass-ignored-stress", "changed_paths": ["tests/stress.rs"]},
+                    {"hash": "ddd444", "subject": "finish cass-ubs", "changed_paths": ["src/ubs.rs"]},
+                    {"hash": "eee555", "subject": "finish cass-mail-missing", "changed_paths": ["src/mail.rs"]}
+                ]
+            },
+            "evidence": {
+                "recent_threads": [
+                    {"thread_id": "cass-no-proof", "subject": "closeout cass-no-proof", "sender": "FixtureAgent"},
+                    {"thread_id": "cass-clippy-only", "subject": "closeout cass-clippy-only", "sender": "FixtureAgent"},
+                    {"thread_id": "cass-ignored-stress", "subject": "closeout cass-ignored-stress", "sender": "FixtureAgent"},
+                    {"thread_id": "cass-ubs", "subject": "closeout cass-ubs", "sender": "FixtureAgent"}
+                ],
+                "recent_proofs": [
+                    {
+                        "kind": "rch-clippy",
+                        "bead_id": "cass-clippy-only",
+                        "commit_id": "bbb222",
+                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo clippy --all-targets -- -D warnings",
+                        "status": "passed",
+                        "remote_exit_status": 0,
+                        "changed_paths": ["src/clippy.rs"]
+                    },
+                    {
+                        "kind": "rch-stress",
+                        "bead_id": "cass-ignored-stress",
+                        "commit_id": "ccc333",
+                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test swarm_status_contract swarm_status_large_fixture_stress_artifact_10k -- --ignored",
+                        "status": "ignored",
+                        "changed_paths": ["tests/stress.rs"],
+                        "artifact_refs": ["docs/artifacts/swarm/stress-proof.json"],
+                        "suppression_reason": "stress proof is reviewed only during explicit perf sweeps"
+                    },
+                    {
+                        "kind": "ubs",
+                        "bead_id": "cass-ubs",
+                        "commit_id": "ddd444",
+                        "command_shape": "ubs src/lib.rs",
+                        "status": "passed",
+                        "remote_exit_status": 0,
+                        "changed_paths": ["src/ubs.rs"]
+                    },
+                    {
+                        "kind": "rch-test",
+                        "bead_id": "cass-mail-missing",
+                        "commit_id": "eee555",
+                        "command_shape": "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof cargo test --test swarm_status_contract",
+                        "status": "passed",
+                        "remote_exit_status": 0,
+                        "changed_paths": ["src/mail.rs"]
+                    }
+                ],
+                "proof_gaps": [{
+                    "kind": "ubs-baseline-warning",
+                    "severity": "medium",
+                    "bead_id": "cass-ubs",
+                    "summary": "UBS warning count matches the known acceptable baseline.",
+                    "suppression_reason": "known acceptable UBS baseline warning"
+                }],
+                "redaction_applied": false
+            },
+            "processes": {},
+            "cass_health": {},
+            "cass_status": {}
+        }),
+    )?;
+    let output = run_swarm_proof_debt_fixture(&fixture_path, None)?;
+    let debt_items = get_path(&output, &["debt_items"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("debt items missing"))?;
+    let kinds = debt_items
+        .iter()
+        .filter_map(|item| item.get("kind").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+
+    for expected in [
+        "missing-proof",
+        "missing-rch-proof",
+        "incomplete-proof-command-set",
+        "ignored-stress-proof",
+        "ubs-baseline-warning",
+        "unrelated-dirty-file",
+        "missing-closeout-mail",
+    ] {
+        require(
+            kinds.contains(expected),
+            format!("missing proof debt kind {expected}"),
+        )?;
+    }
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("remediate-proof-debt"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "suppressed_count"]),
+        json!(2),
+        "suppressed count",
+    )?;
+    require(
+        get_path(&output, &["summary", "blocking_debt_count"])
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count >= 3),
+        "blocking debt count should include high and medium unsuppressed debt",
+    )?;
+    require(
+        debt_items.iter().any(|item| {
+            item.get("kind").and_then(Value::as_str) == Some("ignored-stress-proof")
+                && item
+                    .get("suppression")
+                    .and_then(|suppression| suppression.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("suppressed")
+                && item
+                    .get("observed_evidence_refs")
+                    .and_then(Value::as_array)
+                    .is_some_and(|refs| {
+                        refs.iter().any(|value| {
+                            value.as_str() == Some("docs/artifacts/swarm/stress-proof.json")
+                        })
+                    })
+        }),
+        "ignored stress proof should remain artifact-backed suppressed debt",
+    )?;
+    require(
+        debt_items.iter().any(|item| {
+            item.get("kind").and_then(Value::as_str) == Some("ubs-baseline-warning")
+                && item
+                    .get("suppression")
+                    .and_then(|suppression| suppression.get("reason"))
+                    .and_then(Value::as_str)
+                    == Some("known acceptable UBS baseline warning")
+        }),
+        "UBS baseline warning should carry suppression reason",
+    )?;
+    require_value_eq(
+        get_path(&output, &["mutation_contract", "agent_mail_mutations"]),
+        json!(false),
+        "Agent Mail mutation flag",
+    )?;
+    require_value_eq(
+        get_path(&output, &["gate_contract", "explicit_gate_required"]),
+        json!(true),
+        "gate opt-in contract",
+    )?;
+    assert_no_forbidden_fixture_leaks("proof-debt-mixed", &output);
+    Ok(())
+}
+
+#[test]
 fn swarm_status_large_fixture_fast_gate_names_budget_sections() -> Result<(), Box<dyn Error>> {
     let scale = SyntheticSwarmScale {
         ready_count: 850,
@@ -1726,6 +1997,30 @@ fn run_swarm_evidence_fixture(
         output.stderr.is_empty(),
         format!(
             "swarm evidence should not log to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn run_swarm_proof_debt_fixture(
+    fixture_path: &Path,
+    bead: Option<&str>,
+) -> Result<Value, Box<dyn Error>> {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass")); // ubs:ignore - fixed test binary from assert_cmd.
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.args(["swarm", "proof-debt", "--json", "--fixture"]);
+    cmd.arg(fixture_path);
+    if let Some(bead_id) = bead {
+        cmd.args(["--bead", bead_id]);
+    }
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    require(
+        output.stderr.is_empty(),
+        format!(
+            "swarm proof-debt should not log to stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         ),
     )?;

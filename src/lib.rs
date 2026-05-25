@@ -1436,6 +1436,28 @@ pub enum SwarmCommand {
         #[arg(long)]
         bead: Option<String>,
     },
+    /// Summarize proof debt and read-only remediation suggestions.
+    ProofDebt {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
+
+        /// Restrict the proof-debt ledger to a specific bead id.
+        #[arg(long)]
+        bead: Option<String>,
+    },
 }
 
 /// Subcommands for importing external data
@@ -7503,6 +7525,20 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             &fixture_id,
             bead.as_deref(),
         ),
+        SwarmCommand::ProofDebt {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            bead,
+        } => run_swarm_proof_debt(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            bead.as_deref(),
+        ),
     }
 }
 
@@ -7730,6 +7766,63 @@ fn run_swarm_evidence(
     Ok(())
 }
 
+fn run_swarm_proof_debt(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    bead: Option<&str>,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let privacy_probe = swarm_fixture_privacy_probe(&path)?;
+        let collection = set.collect_required();
+        render_swarm_proof_debt_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
+    } else {
+        render_swarm_proof_debt_live_partial(bead)
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm proof debt: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(count) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("debt_count"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("Debt items: {count}");
+        }
+    }
+
+    Ok(())
+}
+
 fn resolve_swarm_fixture_path(
     fixture: Option<&Path>,
     fixture_dir: Option<&Path>,
@@ -7936,6 +8029,27 @@ fn render_swarm_evidence_fixture(
         bead_filter,
         false,
     )
+}
+
+fn render_swarm_proof_debt_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
+    render_swarm_proof_debt_from_evidence(render_swarm_evidence_live_partial(bead_filter))
+}
+
+fn render_swarm_proof_debt_fixture(
+    input: &crate::swarm_status::SwarmFixtureInput,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    let evidence = render_swarm_evidence_payload(
+        input.fixture_id(),
+        input.description().unwrap_or("swarm proof-debt fixture"),
+        collection,
+        privacy_probe,
+        bead_filter,
+        false,
+    );
+    render_swarm_proof_debt_from_evidence(evidence)
 }
 
 fn render_swarm_lint_payload(
@@ -10038,6 +10152,654 @@ fn swarm_evidence_recommended_action(
     } else {
         "proof-ledger-complete"
     }
+}
+
+fn render_swarm_proof_debt_from_evidence(evidence: serde_json::Value) -> serde_json::Value {
+    let debt_items = swarm_proof_debt_items(&evidence);
+    let remediation_queue = swarm_proof_debt_remediation_queue(&debt_items);
+    let partial = evidence
+        .get("_meta")
+        .and_then(|meta| meta.get("partial"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let suppressed_count = debt_items
+        .iter()
+        .filter(|item| swarm_proof_debt_is_suppressed(item))
+        .count();
+    let unsuppressed_count = debt_items.len().saturating_sub(suppressed_count);
+    let blocking_count = debt_items
+        .iter()
+        .filter(|item| {
+            !swarm_proof_debt_is_suppressed(item)
+                && item
+                    .get("severity")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|severity| matches!(severity, "high" | "medium"))
+        })
+        .count();
+    let highest_severity = debt_items
+        .iter()
+        .filter(|item| !swarm_proof_debt_is_suppressed(item))
+        .filter_map(|item| item.get("severity").and_then(serde_json::Value::as_str))
+        .min_by_key(|severity| swarm_proof_debt_severity_rank(severity))
+        .unwrap_or("none");
+
+    serde_json::json!({
+        "schema_version": "cass.swarm.proof_debt.v1",
+        "status": evidence.get("status").cloned().unwrap_or_else(|| serde_json::json!("partial")),
+        "_meta": swarm_proof_debt_meta(evidence.get("_meta")),
+        "providers": evidence.get("providers").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "filter": evidence.get("filter").cloned().unwrap_or_else(|| serde_json::json!({"bead_id": null})),
+        "summary": {
+            "debt_count": debt_items.len(),
+            "unsuppressed_debt_count": unsuppressed_count,
+            "suppressed_count": suppressed_count,
+            "blocking_debt_count": blocking_count,
+            "high_count": swarm_proof_debt_severity_count(&debt_items, "high"),
+            "medium_count": swarm_proof_debt_severity_count(&debt_items, "medium"),
+            "low_count": swarm_proof_debt_severity_count(&debt_items, "low"),
+            "info_count": swarm_proof_debt_severity_count(&debt_items, "info"),
+            "highest_severity": highest_severity,
+            "recommended_action": swarm_proof_debt_recommended_action(partial, blocking_count, unsuppressed_count, suppressed_count),
+            "mutation_performed": false,
+        },
+        "debt_items": debt_items,
+        "remediation_queue": remediation_queue,
+        "mutation_contract": {
+            "read_only": true,
+            "agent_mail_mutations": false,
+            "bead_mutations": false,
+            "reservation_mutations": false,
+            "git_mutations": false,
+            "safe_next_actions_are_suggestions": true,
+        },
+        "gate_contract": {
+            "fails_closed_by_default": false,
+            "explicit_gate_required": true,
+            "blocking_severities": ["high", "medium"],
+        },
+        "privacy": evidence.get("privacy").cloned().unwrap_or_else(|| serde_json::json!({
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
+            "redaction_applied": false,
+        })),
+    })
+}
+
+fn swarm_proof_debt_meta(meta: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut object = meta
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let request_id = object
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("proof-debt");
+    object.insert(
+        "request_id".to_string(),
+        serde_json::json!(format!("{request_id}:proof-debt")),
+    );
+    object.insert(
+        "source_schema_version".to_string(),
+        serde_json::json!("cass.swarm.evidence.v1"),
+    );
+    serde_json::Value::Object(object)
+}
+
+fn swarm_proof_debt_items(evidence: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut items = Vec::new();
+    for gap in evidence
+        .get("proof_gaps")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        items.push(swarm_proof_debt_item_from_gap(gap));
+    }
+    items.extend(swarm_proof_debt_command_items(evidence));
+    items.extend(swarm_proof_debt_closeout_mail_items(evidence));
+    items.sort_by(|left, right| {
+        swarm_proof_debt_sort_key(left).cmp(&swarm_proof_debt_sort_key(right))
+    });
+    items
+}
+
+fn swarm_proof_debt_item_from_gap(gap: &serde_json::Value) -> serde_json::Value {
+    let kind = gap
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("proof-gap");
+    let severity = gap
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| swarm_proof_debt_default_severity(kind));
+    let (subject_kind, subject_id) = swarm_proof_debt_subject(gap);
+    let suppression_reason = swarm_proof_debt_suppression_reason(gap);
+    swarm_proof_debt_item(ProofDebtItemInput {
+        kind,
+        severity,
+        subject_kind: &subject_kind,
+        subject_id: &subject_id,
+        source: gap
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("evidence.proof_gaps"),
+        summary: gap
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| swarm_proof_debt_default_summary(kind)),
+        expected_evidence: swarm_proof_debt_expected_evidence(kind),
+        observed_evidence_refs: swarm_proof_debt_observed_refs(gap),
+        freshness_state: swarm_proof_debt_freshness_state(gap),
+        confidence: "high",
+        risk: swarm_proof_debt_risk(kind, severity),
+        suppression_reason,
+    })
+}
+
+fn swarm_proof_debt_command_items(evidence: &serde_json::Value) -> Vec<serde_json::Value> {
+    swarm_proof_debt_ledger_rows(evidence, "proof")
+        .into_iter()
+        .flat_map(swarm_proof_debt_items_from_proof)
+        .collect()
+}
+
+fn swarm_proof_debt_items_from_proof(proof: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut items = Vec::new();
+    let command = proof
+        .get("command_shape")
+        .or_else(|| proof.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let lower_command = command.to_ascii_lowercase();
+    let (subject_kind, subject_id) = swarm_proof_debt_subject(proof);
+    let observed_refs = swarm_proof_debt_observed_refs(proof);
+
+    if lower_command.contains("cargo clippy")
+        && !lower_command.contains("cargo test")
+        && !lower_command.contains("cargo check")
+    {
+        items.push(swarm_proof_debt_item(ProofDebtItemInput {
+            kind: "incomplete-proof-command-set",
+            severity: "medium",
+            subject_kind: &subject_kind,
+            subject_id: &subject_id,
+            source: "evidence.recent_proofs",
+            summary: "Proof contains clippy only; expected check and focused test evidence too.",
+            expected_evidence: vec![
+                "rch cargo check proof".to_string(),
+                "focused rch cargo test proof".to_string(),
+            ],
+            observed_evidence_refs: observed_refs.clone(),
+            freshness_state: swarm_proof_debt_freshness_state(proof),
+            confidence: "high",
+            risk: "closeout may have lint proof but no compile/test proof",
+            suppression_reason: swarm_proof_debt_suppression_reason(proof),
+        }));
+    }
+
+    if proof
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        items.push(swarm_proof_debt_item(ProofDebtItemInput {
+            kind: "stale-proof",
+            severity: "medium",
+            subject_kind: &subject_kind,
+            subject_id: &subject_id,
+            source: "evidence.recent_proofs",
+            summary: "Proof is marked stale for the current subject.",
+            expected_evidence: vec!["fresh rch proof after the latest code change".to_string()],
+            observed_evidence_refs: observed_refs.clone(),
+            freshness_state: "stale".to_string(),
+            confidence: "medium",
+            risk: "closeout evidence may predate the current code state",
+            suppression_reason: swarm_proof_debt_suppression_reason(proof),
+        }));
+    }
+
+    let status = proof
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let proof_kind = proof
+        .get("proof_kind")
+        .or_else(|| proof.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let ignored = matches!(status, "ignored" | "skipped")
+        || proof
+            .get("ignored")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    let stress = proof_kind.contains("stress") || lower_command.contains("stress");
+    if ignored && stress {
+        let has_artifacts = proof
+            .get("artifact_refs")
+            .or_else(|| proof.get("artifacts"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|refs| !refs.is_empty());
+        let suppression_reason = swarm_proof_debt_suppression_reason(proof).or_else(|| {
+            has_artifacts
+                .then(|| "stress proof is intentionally ignored but artifact-backed".to_string())
+        });
+        items.push(swarm_proof_debt_item(ProofDebtItemInput {
+            kind: "ignored-stress-proof",
+            severity: if has_artifacts { "info" } else { "medium" },
+            subject_kind: &subject_kind,
+            subject_id: &subject_id,
+            source: "evidence.recent_proofs",
+            summary: if has_artifacts {
+                "Ignored stress proof has artifact references and is tracked as suppressed debt."
+            } else {
+                "Ignored stress proof is missing artifact references."
+            },
+            expected_evidence: vec![
+                "stress artifact references or explicit suppression reason".to_string(),
+            ],
+            observed_evidence_refs: observed_refs,
+            freshness_state: swarm_proof_debt_freshness_state(proof),
+            confidence: if has_artifacts { "high" } else { "medium" },
+            risk: if has_artifacts {
+                "non-blocking proof debt with retained stress artifacts"
+            } else {
+                "stress gate may have been skipped without reviewable artifacts"
+            },
+            suppression_reason,
+        }));
+    }
+
+    items
+}
+
+fn swarm_proof_debt_closeout_mail_items(evidence: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mail_threads = swarm_proof_debt_ledger_rows(evidence, "mail_thread")
+        .into_iter()
+        .filter_map(|row| {
+            row.get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+
+    swarm_proof_debt_ledger_rows(evidence, "bead")
+        .into_iter()
+        .filter(|bead| bead.get("status").and_then(serde_json::Value::as_str) == Some("closed"))
+        .filter_map(|bead| bead.get("bead_id").and_then(serde_json::Value::as_str))
+        .filter(|bead_id| !mail_threads.contains(*bead_id))
+        .map(|bead_id| {
+            swarm_proof_debt_item(ProofDebtItemInput {
+                kind: "missing-closeout-mail",
+                severity: "medium",
+                subject_kind: "bead",
+                subject_id: bead_id,
+                source: "evidence.recent_threads",
+                summary: "Closed bead has no linked Agent Mail closeout thread.",
+                expected_evidence: vec![
+                    "Agent Mail closeout thread with proof summary".to_string(),
+                ],
+                observed_evidence_refs: vec!["ledger.kind=bead".to_string()],
+                freshness_state: "unknown".to_string(),
+                confidence: "high",
+                risk: "future agents may not see closeout context or proof refs",
+                suppression_reason: None,
+            })
+        })
+        .collect()
+}
+
+fn swarm_proof_debt_ledger_rows<'a>(
+    evidence: &'a serde_json::Value,
+    kind: &str,
+) -> Vec<&'a serde_json::Value> {
+    evidence
+        .get("ledger")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| row.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
+        .collect()
+}
+
+struct ProofDebtItemInput<'a> {
+    kind: &'a str,
+    severity: &'a str,
+    subject_kind: &'a str,
+    subject_id: &'a str,
+    source: &'a str,
+    summary: &'a str,
+    expected_evidence: Vec<String>,
+    observed_evidence_refs: Vec<String>,
+    freshness_state: String,
+    confidence: &'a str,
+    risk: &'a str,
+    suppression_reason: Option<String>,
+}
+
+fn swarm_proof_debt_item(input: ProofDebtItemInput<'_>) -> serde_json::Value {
+    let subject_id = crate::pages::redact::redact_swarm_text(input.subject_id);
+    let suppressed = input.suppression_reason.is_some();
+    serde_json::json!({
+        "id": format!("proof-debt:{}:{}:{}", input.kind, input.subject_kind, subject_id),
+        "kind": input.kind,
+        "severity": input.severity,
+        "subject_kind": input.subject_kind,
+        "subject_id": subject_id,
+        "source": input.source,
+        "summary": crate::pages::redact::redact_swarm_text(input.summary),
+        "expected_evidence": input.expected_evidence,
+        "observed_evidence_refs": input.observed_evidence_refs,
+        "freshness": {
+            "state": input.freshness_state,
+        },
+        "confidence": input.confidence,
+        "risk": input.risk,
+        "suppression": {
+            "status": if suppressed { "suppressed" } else { "active" },
+            "reason": input.suppression_reason,
+        },
+        "remediation": swarm_proof_debt_remediation(input.kind, input.subject_kind, &subject_id, suppressed),
+        "redaction_status": "metadata_only",
+    })
+}
+
+fn swarm_proof_debt_subject(value: &serde_json::Value) -> (String, String) {
+    for (kind, key) in [
+        ("bead", "bead_id"),
+        ("commit", "commit_id"),
+        ("thread", "thread_id"),
+        ("path", "path"),
+        ("provider", "provider"),
+    ] {
+        if let Some(raw) = value.get(key).and_then(serde_json::Value::as_str)
+            && !raw.trim().is_empty()
+        {
+            return (kind.to_string(), raw.to_string());
+        }
+    }
+    ("subject".to_string(), "unknown".to_string())
+}
+
+fn swarm_proof_debt_default_severity(kind: &str) -> &'static str {
+    match kind {
+        "missing-proof" | "conflicting-proof" => "high",
+        "unrelated-dirty-file" | "ignored-stress-proof" => "info",
+        _ => "medium",
+    }
+}
+
+fn swarm_proof_debt_default_summary(kind: &str) -> &'static str {
+    match kind {
+        "missing-proof" => "Subject has no linked proof artifact.",
+        "missing-rch-proof" => "Subject has no linked rch proof artifact.",
+        "conflicting-proof" => "Proof status conflicts with recorded exit status.",
+        "artifact-retrieval-interrupted-after-success" => {
+            "Remote proof succeeded but local artifact retrieval was interrupted."
+        }
+        "unrelated-dirty-file" => "Dirty worktree path is unrelated to proof evidence.",
+        "ubs-baseline-warning" => "UBS warning is present and requires an allowlist decision.",
+        _ => "Proof debt was reported by the evidence source.",
+    }
+}
+
+fn swarm_proof_debt_expected_evidence(kind: &str) -> Vec<String> {
+    let expected = match kind {
+        "missing-proof" => &["rch proof artifact linked to the closed bead"][..],
+        "missing-rch-proof" => &["rch exec proof linked to the commit"],
+        "conflicting-proof" => &["consistent proof status and remote exit status"],
+        "artifact-retrieval-interrupted-after-success" => {
+            &["retrieved stdout/stderr artifacts after remote success"]
+        }
+        "unrelated-dirty-file" => &["reservation or proof link for dirty peer work"],
+        "ubs-baseline-warning" => &["UBS allowlist entry or current baseline comparison"],
+        "missing-closeout-mail" => &["Agent Mail closeout thread with proof summary"],
+        _ => &["proof artifact, freshness, and closeout metadata"],
+    };
+    expected.iter().map(|item| (*item).to_string()).collect()
+}
+
+fn swarm_proof_debt_observed_refs(value: &serde_json::Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    for key in [
+        "source",
+        "evidence_ref",
+        "artifact_ref",
+        "command_shape",
+        "path",
+    ] {
+        if let Some(raw) = value.get(key).and_then(serde_json::Value::as_str) {
+            refs.push(crate::pages::redact::redact_swarm_text(raw));
+        }
+    }
+    for key in ["artifact_refs", "artifacts", "mail_thread_refs"] {
+        refs.extend(
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(crate::pages::redact::redact_swarm_text),
+        );
+    }
+    if refs.is_empty() {
+        refs.push("metadata-only".to_string());
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn swarm_proof_debt_freshness_state(value: &serde_json::Value) -> String {
+    if value
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return "stale".to_string();
+    }
+    value
+        .get("freshness")
+        .or_else(|| value.get("freshness_state"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn swarm_proof_debt_suppression_reason(value: &serde_json::Value) -> Option<String> {
+    let explicit = value
+        .get("suppressed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || value
+            .get("known_acceptable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || value
+            .get("accepted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || value
+            .get("suppression_status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status == "suppressed");
+
+    let reason = ["suppression_reason", "accepted_reason", "allowlist_reason"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .filter(|reason| !reason.trim().is_empty())
+        .map(crate::pages::redact::redact_swarm_text);
+
+    reason.or_else(|| explicit.then(|| "suppressed by evidence policy".to_string()))
+}
+
+fn swarm_proof_debt_risk(kind: &str, severity: &str) -> &'static str {
+    match kind {
+        "missing-proof" => "closed work may not have reproducible verification evidence",
+        "missing-rch-proof" => "commit may have landed without offloaded verification",
+        "incomplete-proof-command-set" => "proof may cover linting but not compile or behavior",
+        "missing-closeout-mail" => "closeout context may be invisible to other agents",
+        "unrelated-dirty-file" => "peer work may be accidentally overwritten",
+        "ignored-stress-proof" => "stress coverage is deferred to explicit perf sweeps",
+        "ubs-baseline-warning" => "static-analysis debt must remain allowlisted and tracked",
+        _ if severity == "high" => "proof debt can invalidate closeout confidence",
+        _ => "proof debt should be reviewed before final closeout",
+    }
+}
+
+fn swarm_proof_debt_remediation(
+    kind: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    suppressed: bool,
+) -> serde_json::Value {
+    let safe_subject = swarm_work_packet_safe_arg(subject_id).unwrap_or("[SUBJECT_ID]");
+    let commands = if suppressed {
+        vec![format!(
+            "cass swarm proof-debt --json --bead {safe_subject}"
+        )]
+    } else {
+        match kind {
+            "missing-closeout-mail" => vec![format!(
+                "send Agent Mail closeout for {safe_subject} with proof refs"
+            )],
+            "unrelated-dirty-file" => vec!["git status --short".to_string()],
+            "ubs-baseline-warning" => {
+                vec!["ubs $(git diff --name-only origin/main...HEAD)".to_string()]
+            }
+            "missing-proof" | "missing-rch-proof" | "incomplete-proof-command-set"
+            | "stale-proof" => vec![
+                "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof-debt-target cargo check --all-targets".to_string(),
+                "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-proof-debt-target cargo test --test swarm_status_contract -- --nocapture".to_string(),
+            ],
+            _ => vec![format!(
+                "cass swarm evidence --json --bead {safe_subject}"
+            )],
+        }
+    };
+
+    serde_json::json!({
+        "action": if suppressed { "review-suppression" } else { swarm_proof_debt_action(kind) },
+        "commands": commands,
+        "subject_kind": subject_kind,
+        "requires_human_confirmation": matches!(kind, "missing-closeout-mail") || suppressed,
+        "mutates_state_if_run": matches!(kind, "missing-closeout-mail"),
+    })
+}
+
+fn swarm_proof_debt_action(kind: &str) -> &'static str {
+    match kind {
+        "missing-closeout-mail" => "send-closeout-mail-with-proof-summary",
+        "unrelated-dirty-file" => "inspect-peer-dirty-work",
+        "ubs-baseline-warning" => "verify-ubs-baseline-or-allowlist",
+        "missing-proof" | "missing-rch-proof" | "incomplete-proof-command-set" => {
+            "collect-rch-proof"
+        }
+        "stale-proof" => "refresh-proof",
+        _ => "inspect-proof-evidence",
+    }
+}
+
+fn swarm_proof_debt_remediation_queue(debt_items: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    debt_items
+        .iter()
+        .filter(|item| !swarm_proof_debt_is_suppressed(item))
+        .map(|item| {
+            serde_json::json!({
+                "debt_id": item.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "severity": item.get("severity").cloned().unwrap_or_else(|| serde_json::json!("info")),
+                "subject_kind": item.get("subject_kind").cloned().unwrap_or(serde_json::Value::Null),
+                "subject_id": item.get("subject_id").cloned().unwrap_or(serde_json::Value::Null),
+                "action": item
+                    .get("remediation")
+                    .and_then(|remediation| remediation.get("action"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "commands": item
+                    .get("remediation")
+                    .and_then(|remediation| remediation.get("commands"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+                "requires_human_confirmation": item
+                    .get("remediation")
+                    .and_then(|remediation| remediation.get("requires_human_confirmation"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(false)),
+            })
+        })
+        .collect()
+}
+
+fn swarm_proof_debt_recommended_action(
+    partial: bool,
+    blocking_count: usize,
+    unsuppressed_count: usize,
+    suppressed_count: usize,
+) -> &'static str {
+    if partial {
+        "inspect-unavailable-providers"
+    } else if blocking_count > 0 {
+        "remediate-proof-debt"
+    } else if unsuppressed_count > 0 {
+        "review-proof-debt"
+    } else if suppressed_count > 0 {
+        "review-suppressed-proof-debt"
+    } else {
+        "proof-debt-clear"
+    }
+}
+
+fn swarm_proof_debt_severity_count(debt_items: &[serde_json::Value], severity: &str) -> usize {
+    debt_items
+        .iter()
+        .filter(|item| {
+            item.get("severity")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|actual| actual == severity)
+        })
+        .count()
+}
+
+fn swarm_proof_debt_sort_key(item: &serde_json::Value) -> (u8, bool, String, String) {
+    let severity = item
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info");
+    let kind = item
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let subject = item
+        .get("subject_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (
+        swarm_proof_debt_severity_rank(severity),
+        swarm_proof_debt_is_suppressed(item),
+        kind,
+        subject,
+    )
+}
+
+fn swarm_proof_debt_severity_rank(severity: &str) -> u8 {
+    match severity {
+        "high" => 0,
+        "medium" | "warning" => 1,
+        "low" => 2,
+        _ => 3,
+    }
+}
+
+fn swarm_proof_debt_is_suppressed(item: &serde_json::Value) -> bool {
+    item.get("suppression")
+        .and_then(|suppression| suppression.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("suppressed")
 }
 
 fn swarm_evidence_matches_bead(value: &serde_json::Value, bead_filter: Option<&str>) -> bool {
@@ -14501,6 +15263,18 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Swarm(SwarmCommand::Status { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::WorkPacket { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::Lint { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::Evidence { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Swarm(SwarmCommand::ProofDebt { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Models(ModelsCommand::Status { json }) => {
