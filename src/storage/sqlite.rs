@@ -1547,6 +1547,7 @@ impl HistoricalSalvageOutcome {
 struct HistoricalReadConnection {
     conn: FrankenConnection,
     method: &'static str,
+    root_path: PathBuf,
     _tempdir: Option<tempfile::TempDir>,
 }
 
@@ -1764,7 +1765,7 @@ pub(crate) fn discover_historical_database_bundles(
             let modified_at_ms = file_mtime_ms(&root_path);
             let total_bytes = bundle_total_bytes(&root_path);
             let supports_direct_readonly = historical_bundle_supports_direct_readonly(&root_path);
-            let probe = probe_historical_bundle(&root_path, supports_direct_readonly);
+            let probe = probe_historical_bundle(&root_path);
             HistoricalDatabaseBundle {
                 modified_at_ms,
                 total_bytes,
@@ -1862,16 +1863,9 @@ pub(crate) fn discover_historical_database_bundles(
     bundles
 }
 
-fn probe_historical_bundle(
-    root_path: &Path,
-    supports_direct_readonly: bool,
-) -> HistoricalBundleProbe {
-    if !supports_direct_readonly {
-        return HistoricalBundleProbe::default();
-    }
-
+fn probe_historical_bundle(root_path: &Path) -> HistoricalBundleProbe {
     let Ok(conn) = open_historical_bundle_readonly(root_path) else {
-        return HistoricalBundleProbe::default();
+        return probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or_default();
     };
 
     let schema_version = read_meta_schema_version(&conn).ok().flatten();
@@ -1892,12 +1886,56 @@ fn probe_historical_bundle(
         )
         .unwrap_or(0);
 
-    HistoricalBundleProbe {
+    let probe = HistoricalBundleProbe {
         schema_version,
         fts_schema_rows,
         fts_queryable,
         max_message_id,
+    };
+
+    if probe.schema_version.is_none()
+        && probe.fts_schema_rows.is_none()
+        && probe.max_message_id == 0
+    {
+        return probe_historical_bundle_via_sqlite3_metadata(root_path).unwrap_or(probe);
     }
+
+    probe
+}
+
+fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<HistoricalBundleProbe> {
+    let bundle_uri = format!("file:{}?immutable=1", root_path.to_string_lossy());
+    let output = Command::new("sqlite3")
+        .arg("-batch")
+        .arg("-noheader")
+        .arg(&bundle_uri)
+        .arg(
+            "PRAGMA writable_schema=ON;
+             SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '');
+             SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';
+             SELECT COALESCE(MAX(id), 0) FROM messages;",
+        )
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut lines = stdout.lines();
+    let schema_version = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
+    let fts_schema_rows = lines.next().and_then(|raw| raw.trim().parse::<i64>().ok());
+    let max_message_id = lines
+        .next()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+
+    Some(HistoricalBundleProbe {
+        schema_version,
+        fts_schema_rows,
+        fts_queryable: false,
+        max_message_id,
+    })
 }
 
 fn historical_bundle_fts_queryable_via_frankensqlite(
@@ -1909,7 +1947,7 @@ fn historical_bundle_fts_queryable_via_frankensqlite(
             .map(|storage| {
                 storage
                     .raw()
-                    .query("SELECT rowid FROM fts_messages LIMIT 1")
+                    .query("SELECT COUNT(*) FROM fts_messages")
                     .is_ok()
             })
             .unwrap_or(false)
@@ -2074,6 +2112,7 @@ fn recover_historical_bundle_via_sqlite3(
     Ok(HistoricalReadConnection {
         conn,
         method: "sqlite3-recover",
+        root_path: recovered_db,
         _tempdir: Some(tempdir),
     })
 }
@@ -2087,6 +2126,7 @@ fn open_historical_bundle_for_salvage(
                 return Ok(HistoricalReadConnection {
                     conn,
                     method: "direct-readonly",
+                    root_path: bundle.root_path.clone(),
                     _tempdir: None,
                 });
             }
@@ -2235,7 +2275,7 @@ fn franken_fts_schema_rows(conn: &FrankenConnection) -> Result<i64> {
 
 #[cfg(test)]
 fn franken_fts_limit_probe(conn: &FrankenConnection) -> bool {
-    conn.query("SELECT rowid FROM fts_messages LIMIT 1").is_ok()
+    conn.query("SELECT COUNT(*) FROM fts_messages").is_ok()
 }
 
 #[cfg(test)]
@@ -2307,7 +2347,7 @@ struct StagedHistoricalSeed {
 
 fn stage_historical_bundle_for_seed(
     canonical_db_path: &Path,
-    bundle: &HistoricalDatabaseBundle,
+    source_root_path: &Path,
 ) -> Result<StagedHistoricalSeed> {
     let canonical_parent = canonical_db_path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(canonical_parent).with_context(|| {
@@ -2319,7 +2359,7 @@ fn stage_historical_bundle_for_seed(
     let tempdir = tempfile::TempDir::new_in(canonical_parent)
         .context("creating temporary baseline seed directory")?;
     let staged_seed_db = tempdir.path().join("baseline-seed-output.db");
-    copy_database_bundle(&bundle.root_path, &staged_seed_db)?;
+    copy_database_bundle(source_root_path, &staged_seed_db)?;
 
     Ok(StagedHistoricalSeed {
         tempdir,
@@ -2371,10 +2411,7 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
 ) -> Result<Option<HistoricalSalvageOutcome>> {
     let ordered_bundles = discover_historical_database_bundles(canonical_db_path);
     let mut last_seed_error: Option<anyhow::Error> = None;
-    for bundle in ordered_bundles
-        .into_iter()
-        .filter(|bundle| bundle.supports_direct_readonly)
-    {
+    for bundle in ordered_bundles {
         if let Some(version) = bundle.probe.schema_version
             && version < 13
         {
@@ -2399,7 +2436,10 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
         })?;
         let (conversations_imported, messages_imported) = historical_bundle_counts(&source.conn)?;
 
-        let staged_seed = match stage_historical_bundle_for_seed(canonical_db_path, &bundle) {
+        let staged_seed = match stage_historical_bundle_for_seed(
+            canonical_db_path,
+            &source.root_path,
+        ) {
             Ok(staged_seed) => staged_seed,
             Err(err) => {
                 tracing::warn!(
@@ -3190,11 +3230,16 @@ SELECT
     CAST(c.agent_id AS TEXT) || ':' ||
     CAST(length(c.external_id) AS TEXT) || ':' || c.external_id,
     c.id,
-    ts.ended_at,
-    ts.last_message_idx,
-    ts.last_message_created_at
+    (SELECT ts.ended_at
+     FROM conversation_tail_state ts
+     WHERE ts.conversation_id = c.id),
+    (SELECT ts.last_message_idx
+     FROM conversation_tail_state ts
+     WHERE ts.conversation_id = c.id),
+    (SELECT ts.last_message_created_at
+     FROM conversation_tail_state ts
+     WHERE ts.conversation_id = c.id)
 FROM conversations c
-LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
 WHERE c.external_id IS NOT NULL;
 ";
 
@@ -9581,10 +9626,7 @@ impl FrankenStorage {
                 |row| row.get_typed::<i64>(0),
             )?;
             let fts_queryable = fts_schema_rows == 1
-                && self
-                    .conn
-                    .query("SELECT rowid FROM fts_messages LIMIT 1")
-                    .is_ok();
+                && self.conn.query("SELECT COUNT(*) FROM fts_messages").is_ok();
             Ok((fts_schema_rows, fts_queryable))
         })();
 
@@ -20847,11 +20889,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(post_franken_schema_rows, 1);
+        let fts_probe = franken_seeded
+            .raw()
+            .query("SELECT COUNT(*) FROM fts_messages");
         assert!(
-            franken_seeded
-                .raw()
-                .query("SELECT rowid FROM fts_messages LIMIT 1")
-                .is_ok()
+            fts_probe.is_ok(),
+            "expected post-seed FTS to be queryable, got {fts_probe:?}"
         );
     }
 
@@ -24628,7 +24671,7 @@ mod tests {
         assert!(
             storage
                 .raw()
-                .query("SELECT rowid FROM fts_messages LIMIT 1")
+                .query("SELECT COUNT(*) FROM fts_messages")
                 .is_ok(),
             "fts_messages must be queryable through frankensqlite after open"
         );
