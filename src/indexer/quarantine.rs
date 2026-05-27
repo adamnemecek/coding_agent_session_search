@@ -73,6 +73,8 @@ pub struct QuarantineRecord {
     pub last_attempt_at: DateTime<Utc>,
     pub attempt_count: u64,
     pub last_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cass_version_at_quarantine: Option<String>,
 }
 
 /// In-memory view of the quarantine state file. Use [`QuarantineState::load`]
@@ -161,6 +163,7 @@ impl QuarantineState {
             record.last_attempt_at = now;
             record.attempt_count = record.attempt_count.saturating_add(1);
             record.last_reason = reason;
+            record.cass_version_at_quarantine = Some(current_cass_version().to_string());
         } else {
             self.entries.insert(
                 storage_key,
@@ -169,6 +172,7 @@ impl QuarantineState {
                     last_attempt_at: now,
                     attempt_count: 1,
                     last_reason: reason,
+                    cass_version_at_quarantine: Some(current_cass_version().to_string()),
                 },
             );
         }
@@ -201,6 +205,10 @@ impl QuarantineState {
             QuarantineKey::parse_storage_key(storage_key).map(|k| (k, record))
         })
     }
+}
+
+fn current_cass_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 #[cfg(test)]

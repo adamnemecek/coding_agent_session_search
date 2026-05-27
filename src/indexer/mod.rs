@@ -11043,6 +11043,19 @@ fn run_batch_index_with_connector_factories(
     Ok(ingest_outcome)
 }
 
+fn non_watch_scan_since_ts(
+    full: bool,
+    needs_rebuild: bool,
+    retry_stale_index_ingest_quarantine: bool,
+    last_scan_ts: Option<i64>,
+) -> Option<i64> {
+    if full || needs_rebuild || retry_stale_index_ingest_quarantine {
+        None
+    } else {
+        last_scan_ts.map(|ts| ts.saturating_sub(1))
+    }
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -11820,6 +11833,21 @@ pub fn run_index(
                     lexical_strategy,
                     lexical_strategy_reason,
                 );
+                let stale_index_ingest_quarantine_retry =
+                    if targeted_watch_once_only || canonical_only_full_rebuild {
+                        None
+                    } else {
+                        stale_index_ingest_quarantine_version_retry(&opts.data_dir)?
+                    };
+                if let Some(retry) = &stale_index_ingest_quarantine_retry {
+                    tracing::warn!(
+                        stale_records = retry.stale_records,
+                        legacy_records = retry.legacy_records,
+                        previous_versions = ?retry.previous_versions,
+                        current_version = current_cass_version(),
+                        "retrying stale index-ingest quarantine records after cass version change"
+                    );
+                }
                 if followup_scan_after_authoritative_repair {
                     tracing::info!(
                         strategy = lexical_strategy.as_str(),
@@ -11843,14 +11871,12 @@ pub fn run_index(
                 // Get last scan timestamp for incremental indexing.
                 // If full rebuild or force_rebuild, scan everything (since_ts = None).
                 // Otherwise, only scan files modified since last successful scan.
-                let since_ts = if opts.full || needs_rebuild {
-                    None
-                } else {
-                    storage
-                        .get_last_scan_ts()
-                        .unwrap_or(None)
-                        .map(|ts| ts.saturating_sub(1))
-                };
+                let since_ts = non_watch_scan_since_ts(
+                    opts.full,
+                    needs_rebuild,
+                    stale_index_ingest_quarantine_retry.is_some(),
+                    storage.get_last_scan_ts().unwrap_or(None),
+                );
 
                 if since_ts.is_some() {
                     tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
@@ -17491,7 +17517,7 @@ fn ingest_non_watch_batch_once(
         return Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory));
     }
 
-    ingest_batch_detailed(
+    let outcome = ingest_batch_detailed(
         storage,
         t_index,
         data_dir,
@@ -17499,7 +17525,14 @@ fn ingest_non_watch_batch_once(
         progress,
         lexical_strategy,
         defer_checkpoints,
-    )
+    )?;
+    clear_poison_conversations_after_successful_ingest(
+        data_dir,
+        INDEX_INGEST_POISON_FILE,
+        "index-ingest-out-of-memory",
+        convs,
+    );
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -17640,6 +17673,13 @@ fn ingest_batch_with_semantic_delta(
             return Err(error);
         }
     };
+
+    clear_poison_conversations_after_successful_ingest(
+        data_dir,
+        WATCH_INGEST_POISON_FILE,
+        "watch-ingest-out-of-memory",
+        convs,
+    );
 
     if let Some(p) = progress {
         p.current.fetch_add(convs.len(), Ordering::Relaxed);
@@ -17962,6 +18002,7 @@ fn record_poison_conversation(
         "first_quarantined_at_ms": first_quarantined_at_ms,
         "last_attempt_at_ms": now_ms,
         "attempt_count": attempt_count,
+        "cass_version_at_quarantine": current_cass_version(),
         "reason": reason,
         "error_kind": "out-of-memory",
         "last_error": full_error_chain,
@@ -18001,6 +18042,205 @@ fn record_poison_conversation(
         now_ms,
     );
     Ok(())
+}
+
+fn current_cass_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleIndexIngestQuarantineRetry {
+    stale_records: usize,
+    legacy_records: usize,
+    previous_versions: Vec<String>,
+}
+
+fn stale_index_ingest_quarantine_version_retry(
+    data_dir: &Path,
+) -> Result<Option<StaleIndexIngestQuarantineRetry>> {
+    let path = data_dir.join("quarantine").join(INDEX_INGEST_POISON_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("reading index ingest quarantine file {}", path.display()))?;
+    let current_version = current_cass_version();
+    let mut stale_records = 0usize;
+    let mut legacy_records = 0usize;
+    let mut previous_versions = BTreeSet::<String>::new();
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if poison_record_key_from_value(&value).is_none() {
+            continue;
+        }
+        match poison_record_cass_version(&value) {
+            Some(version) if version == current_version => {}
+            Some(version) => {
+                stale_records = stale_records.saturating_add(1);
+                previous_versions.insert(version.to_string());
+            }
+            None => {
+                stale_records = stale_records.saturating_add(1);
+                legacy_records = legacy_records.saturating_add(1);
+                previous_versions.insert("unknown".to_string());
+            }
+        }
+    }
+
+    Ok(
+        (stale_records > 0).then(|| StaleIndexIngestQuarantineRetry {
+            stale_records,
+            legacy_records,
+            previous_versions: previous_versions.into_iter().collect(),
+        }),
+    )
+}
+
+fn clear_poison_conversations_after_successful_ingest(
+    data_dir: &Path,
+    file_name: &str,
+    reason: &str,
+    convs: &[NormalizedConversation],
+) {
+    if convs.is_empty() {
+        return;
+    }
+    let conversation_ids = convs
+        .iter()
+        .map(poison_conversation_id)
+        .collect::<BTreeSet<_>>();
+
+    let jsonl_cleared =
+        match clear_poison_jsonl_records(data_dir, file_name, reason, &conversation_ids) {
+            Ok(cleared) => cleared,
+            Err(err) => {
+                tracing::warn!(
+                    data_dir = %data_dir.display(),
+                    file_name,
+                    error = %err,
+                    "failed to clear successful ingest records from poison quarantine JSONL"
+                );
+                0
+            }
+        };
+    let structured_cleared =
+        clear_structured_poison_quarantine_records(data_dir, reason, &conversation_ids);
+
+    let cleared = jsonl_cleared.saturating_add(structured_cleared);
+    if cleared > 0 {
+        tracing::info!(
+            data_dir = %data_dir.display(),
+            file_name,
+            reason,
+            cleared,
+            "cleared poison quarantine records after successful ingest retry"
+        );
+    }
+}
+
+fn clear_poison_jsonl_records(
+    data_dir: &Path,
+    file_name: &str,
+    reason: &str,
+    conversation_ids: &BTreeSet<String>,
+) -> Result<usize> {
+    let path = data_dir.join("quarantine").join(file_name);
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("reading ingest quarantine file {}", path.display()))?;
+    let mut retained_lines = Vec::new();
+    let mut cleared = 0usize;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let should_clear = serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|value| {
+                let record_reason_matches = value
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|record_reason| record_reason == reason);
+                record_reason_matches
+                    .then(|| poison_record_key_from_value(&value))
+                    .flatten()
+            })
+            .is_some_and(|(conversation_id, _)| conversation_ids.contains(&conversation_id));
+        if should_clear {
+            cleared = cleared.saturating_add(1);
+        } else {
+            retained_lines.push(trimmed.to_string());
+        }
+    }
+
+    if cleared == 0 {
+        return Ok(0);
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("opening ingest quarantine file {}", path.display()))?;
+    for line in retained_lines {
+        writeln!(file, "{line}")
+            .with_context(|| format!("rewriting ingest quarantine file {}", path.display()))?;
+    }
+    file.sync_all()
+        .with_context(|| format!("syncing ingest quarantine file {}", path.display()))?;
+    Ok(cleared)
+}
+
+fn clear_structured_poison_quarantine_records(
+    data_dir: &Path,
+    reason: &str,
+    conversation_ids: &BTreeSet<String>,
+) -> usize {
+    let mut state = QuarantineState::load(data_dir);
+    if state.is_empty() {
+        return 0;
+    }
+
+    let keys = state
+        .iter()
+        .filter(|(key, record)| {
+            conversation_ids.contains(&key.conversation_id)
+                && record.last_reason.starts_with(reason)
+        })
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return 0;
+    }
+
+    let mut cleared = 0usize;
+    for key in keys {
+        if state.clear(&key) {
+            cleared = cleared.saturating_add(1);
+        }
+    }
+    if let Err(err) = state.save(data_dir) {
+        tracing::warn!(
+            data_dir = %data_dir.display(),
+            error = %err,
+            "failed to persist structured ingest quarantine cleanup"
+        );
+    }
+    cleared
 }
 
 fn record_structured_poison_quarantine_state(
@@ -18103,6 +18343,14 @@ fn poison_record_key_from_value(value: &serde_json::Value) -> Option<(String, i6
         ),
         schema_version_at_quarantine,
     ))
+}
+
+fn poison_record_cass_version(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("cass_version_at_quarantine")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
 }
 
 fn poison_record_first_quarantined_at_ms(value: &serde_json::Value) -> Option<i64> {
@@ -31763,6 +32011,132 @@ mod tests {
             assert_eq!(summary.quarantined_conversations, 1);
             assert_eq!(summary.status, "degraded");
         }
+    }
+
+    #[test]
+    fn stale_index_ingest_quarantine_version_retry_detects_legacy_records() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let legacy = norm_conv(
+            Some("legacy-index-poison"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let current = norm_conv(
+            Some("current-index-poison"),
+            vec![norm_msg(0, 1_700_000_000_001)],
+        );
+        let legacy_id = poison_conversation_id(&legacy);
+        let current_id = poison_conversation_id(&current);
+        std::fs::write(
+            quarantine_dir.join(INDEX_INGEST_POISON_FILE),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "conversation_id": legacy_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "reason": "index-ingest-out-of-memory"
+                }),
+                serde_json::json!({
+                    "conversation_id": current_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "cass_version_at_quarantine": current_cass_version(),
+                    "reason": "index-ingest-out-of-memory"
+                })
+            ),
+        )
+        .context("write index-ingest poison fixture")?;
+
+        let retry = stale_index_ingest_quarantine_version_retry(&data_dir)
+            .context("load index-ingest poison retry state")?
+            .context("legacy missing-version record should request one retry")?;
+        assert_eq!(retry.stale_records, 1);
+        assert_eq!(retry.legacy_records, 1);
+        assert_eq!(retry.previous_versions, vec!["unknown".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn successful_ingest_clears_matching_index_poison_records_without_deleting_file() -> Result<()>
+    {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        let conv = norm_conv(
+            Some("stale-index-poison-cleared"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        let conversation_id = poison_conversation_id(&conv);
+        let jsonl_path = quarantine_dir.join(INDEX_INGEST_POISON_FILE);
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                    "reason": "index-ingest-out-of-memory",
+                    "cass_version_at_quarantine": "0.0.0"
+                })
+            ),
+        )
+        .context("write index-ingest poison fixture")?;
+
+        let schema_version = u32::try_from(crate::storage::sqlite::CURRENT_SCHEMA_VERSION)
+            .context("current schema version fits in quarantine key")?;
+        let mut state = QuarantineState::default();
+        state.record_attempt(
+            &QuarantineKey::new(conversation_id.clone(), schema_version),
+            "index-ingest-out-of-memory: out of memory",
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .context("valid quarantine timestamp")?,
+        );
+        state.save(&data_dir)?;
+
+        clear_poison_conversations_after_successful_ingest(
+            &data_dir,
+            INDEX_INGEST_POISON_FILE,
+            "index-ingest-out-of-memory",
+            &[conv],
+        );
+
+        assert!(
+            jsonl_path.exists(),
+            "cleanup must truncate the quarantine file in place, not delete it"
+        );
+        assert!(
+            std::fs::read_to_string(&jsonl_path)?.trim().is_empty(),
+            "successful retry should remove the matching JSONL poison record"
+        );
+        assert!(
+            QuarantineState::load(&data_dir).is_empty(),
+            "successful retry should clear the matching structured quarantine record"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_index_ingest_quarantine_retry_forces_scan_from_start() {
+        assert_eq!(
+            non_watch_scan_since_ts(false, false, false, Some(1234)),
+            Some(1233)
+        );
+        assert_eq!(
+            non_watch_scan_since_ts(false, false, true, Some(1234)),
+            None
+        );
+        assert_eq!(
+            non_watch_scan_since_ts(true, false, false, Some(1234)),
+            None
+        );
+        assert_eq!(
+            non_watch_scan_since_ts(false, true, false, Some(1234)),
+            None
+        );
     }
 
     #[test]
