@@ -214,6 +214,32 @@ fn swarm_status_goldens_follow_contract_shape() {
             output["privacy"]["redaction_policy"], "strict",
             "{fixture_id} must default to strict redaction"
         );
+        assert_eq!(
+            output["privacy"]["exposure_preview"]["schema_version"],
+            "cass.privacy.exposure_preview.v1",
+            "{fixture_id} missing privacy exposure preview"
+        );
+        assert_eq!(
+            output["privacy"]["exposure_preview"]["read_only"],
+            Value::Bool(true),
+            "{fixture_id} privacy exposure preview must be read-only"
+        );
+        assert!(
+            output["privacy"]["exposure_preview"]["candidate_actions"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|action| {
+                    action.get("action").and_then(Value::as_str) == Some("support-bundle")
+                        && action
+                            .get("required_opt_in_flags")
+                            .and_then(Value::as_array)
+                            .is_some_and(|flags| {
+                                flags.iter().any(|flag| {
+                                    flag.as_str() == Some("--include-sensitive-attachments")
+                                })
+                            })
+                })),
+            "{fixture_id} privacy exposure preview should name support-bundle opt-in boundary"
+        );
         assert!(
             output["recommendations"]
                 .as_array()
@@ -337,6 +363,21 @@ fn swarm_status_scenario_invariants_are_pinned() {
                 assert_eq!(
                     output["evidence"]["recent_proofs"][0]["redaction_status"],
                     "redacted"
+                );
+                assert_eq!(
+                    output["privacy"]["exposure_preview"]["coverage"],
+                    "fixture_probe"
+                );
+                assert_eq!(
+                    output["privacy"]["exposure_preview"]["redacted_sample_count"],
+                    4
+                );
+                assert!(
+                    output["privacy"]["exposure_preview"]["risk_categories"]
+                        .as_array()
+                        .is_some_and(|categories| categories
+                            .iter()
+                            .any(|category| category.as_str() == Some("secret_like_values")))
                 );
             }
             other => panic!("unexpected scenario {other}"),

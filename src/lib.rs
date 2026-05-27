@@ -9944,8 +9944,8 @@ fn swarm_evidence(
 }
 
 fn swarm_privacy(fixture_id: &str, evidence: &serde_json::Value) -> serde_json::Value {
-    if fixture_id == "privacy_guardrails" {
-        return serde_json::json!({
+    let mut privacy = if fixture_id == "privacy_guardrails" {
+        serde_json::json!({
             "raw_session_content_included": false,
             "mail_body_snippets_included": false,
             "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
@@ -9963,18 +9963,155 @@ fn swarm_privacy(fixture_id: &str, evidence: &serde_json::Value) -> serde_json::
                 "mailbox_snippet_omitted": 1,
                 "sensitive_path": 4
             }
-        });
+        })
+    } else {
+        serde_json::json!({
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
+            "redaction_applied": evidence
+                .get("redaction_applied")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            "sensitive_paths_scrubbed": 0
+        })
+    };
+
+    let exposure_preview = swarm_privacy_exposure_preview(fixture_id, &privacy);
+    if let Some(object) = privacy.as_object_mut() {
+        object.insert("exposure_preview".to_string(), exposure_preview);
     }
+    privacy
+}
+
+fn swarm_privacy_exposure_preview(
+    fixture_id: &str,
+    privacy: &serde_json::Value,
+) -> serde_json::Value {
+    let redaction_applied = privacy
+        .get("redaction_applied")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let privacy_probe = fixture_id == "privacy_guardrails";
+    let risk_categories = if privacy_probe {
+        serde_json::json!([
+            "private_paths",
+            "secret_like_values",
+            "mail_body_snippets",
+            "evidence_references",
+            "raw_session_content"
+        ])
+    } else {
+        serde_json::json!(["provider_roots", "session_content", "derived_search_assets"])
+    };
+    let redacted_samples = if redaction_applied {
+        serde_json::json!([
+            {"kind": "sensitive_path", "sample": "[REDACTED_PATH]"},
+            {"kind": "mail_body_snippet", "sample": crate::pages::redact::SWARM_MAIL_BODY_OMITTED},
+            {"kind": "secret_like_value", "sample": crate::pages::redact::SWARM_SECRET_ENV_ASSIGNMENT_REDACTED},
+            {"kind": "evidence_reference", "sample": "pack://[REDACTED_PATH]#L44"}
+        ])
+    } else {
+        serde_json::json!([])
+    };
 
     serde_json::json!({
-        "raw_session_content_included": false,
-        "mail_body_snippets_included": false,
-        "redaction_policy": crate::pages::redact::SWARM_REDACTION_POLICY,
-        "redaction_applied": evidence
-            .get("redaction_applied")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        "sensitive_paths_scrubbed": 0
+        "schema_version": "cass.privacy.exposure_preview.v1",
+        "read_only": true,
+        "mutation_performed": false,
+        "preview_scope": "swarm_status",
+        "coverage": if privacy_probe { "fixture_probe" } else { "policy_defaults" },
+        "risk_categories": risk_categories,
+        "source_classes": [
+            {
+                "class": "provider_roots",
+                "would_read": true,
+                "raw_values_included": false,
+                "risk": "medium",
+                "notes": "Provider roots and source paths are reported only after path redaction."
+            },
+            {
+                "class": "session_content",
+                "would_read": true,
+                "raw_values_included": false,
+                "risk": "high",
+                "notes": "Swarm status reports metadata and proof references; raw session text is not serialized."
+            },
+            {
+                "class": "derived_search_assets",
+                "would_read": true,
+                "raw_values_included": false,
+                "risk": "medium",
+                "notes": "SQLite and search asset readiness are summarized without dumping indexed text."
+            },
+            {
+                "class": "support_artifacts",
+                "would_read": false,
+                "raw_values_included": false,
+                "risk": "high",
+                "notes": "Support bundles and repro capsules require their own explicit command path."
+            }
+        ],
+        "candidate_actions": [
+            {
+                "action": "index",
+                "command_shape": "cass index --full --json",
+                "would_read": ["provider roots", "session files", "source metadata"],
+                "would_write": ["SQLite archive", "derived lexical index"],
+                "default_exclusions": ["raw mirror capture is not published by swarm status"],
+                "required_opt_in_flags": []
+            },
+            {
+                "action": "export-html",
+                "command_shape": "cass export-html <session> --json",
+                "would_read": ["selected session"],
+                "would_write": ["self-contained HTML export"],
+                "default_exclusions": ["skill content"],
+                "required_opt_in_flags": ["--include-skills"]
+            },
+            {
+                "action": "support-bundle",
+                "command_shape": "cass doctor --support-bundle --json",
+                "would_read": ["diagnostics", "doctor run metadata", "redacted manifests"],
+                "would_write": ["support bundle directory"],
+                "default_exclusions": ["operator-provided sensitive attachments"],
+                "required_opt_in_flags": ["--include-sensitive-attachments"]
+            },
+            {
+                "action": "repro-capsule",
+                "command_shape": "not yet exposed in cass.swarm.status.v1",
+                "would_read": ["selected failure metadata", "selected proof references"],
+                "would_write": ["none from swarm status"],
+                "default_exclusions": ["raw prompts", "raw session text", "mail body snippets"],
+                "required_opt_in_flags": []
+            }
+        ],
+        "opt_in_boundaries": [
+            {
+                "surface": "swarm status",
+                "flag": "--include-evidence",
+                "status": "unsupported",
+                "unlocks": "mail body snippets"
+            },
+            {
+                "surface": "export-html",
+                "flag": "--include-skills",
+                "status": "available",
+                "unlocks": "skill content in HTML exports"
+            },
+            {
+                "surface": "doctor support-bundle",
+                "flag": "--include-sensitive-attachments",
+                "status": "available",
+                "unlocks": "operator-provided sensitive attachments"
+            }
+        ],
+        "redacted_sample_count": redacted_samples.as_array().map_or(0, Vec::len),
+        "redacted_samples": redacted_samples,
+        "truth_limits": [
+            "Counts describe this status snapshot, not every future command.",
+            "No raw secrets, prompts, mail bodies, or absolute private paths are included in this preview."
+        ]
     })
 }
 
