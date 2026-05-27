@@ -2310,6 +2310,15 @@ struct IndexRunLockGuard {
     _path: PathBuf,
     started_at_ms: i64,
     updated_at_ms: i64,
+    /// Forward-progress timestamp owned exclusively by the indexing
+    /// thread (cass#258). The background `IndexRunLockHeartbeat` thread
+    /// refreshes `updated_at_ms` to prove the process is alive, but it
+    /// MUST NOT touch `last_progress_at_ms` — only real mode/phase
+    /// transitions (i.e. `write_metadata` / `set_mode`) advance it.
+    /// Readers (`asset_state::maintenance_stall_age_ms`) compare this
+    /// to wall-clock to flip `status: "stalled"` when the indexer
+    /// wedges while the heartbeat keeps refreshing.
+    last_progress_at_ms: i64,
     db_path: PathBuf,
     job_id: String,
     job_kind: SearchMaintenanceJobKind,
@@ -2331,7 +2340,16 @@ impl IndexRunLockGuard {
             .metadata_write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("index-run metadata write lock poisoned"))?;
-        self.updated_at_ms = FrankenStorage::now_millis();
+        let now_ms = FrankenStorage::now_millis();
+        self.updated_at_ms = now_ms;
+        // cass#258: every `write_metadata` / `set_mode` call is, by
+        // definition, the indexing thread reporting a real mode/phase
+        // transition — i.e. forward progress. Bump
+        // `last_progress_at_ms` here, while the background heartbeat
+        // thread refreshes `updated_at_ms` independently but preserves
+        // this field verbatim so a wedged indexer flips
+        // `status: "stalled"` instead of silently staying "building".
+        self.last_progress_at_ms = now_ms;
         self.file.set_len(0).with_context(|| {
             format!(
                 "truncating index-run lock file before metadata update: {}",
@@ -2346,10 +2364,11 @@ impl IndexRunLockGuard {
         })?;
         writeln!(
             self.file,
-            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path={}\nmode={}\njob_id={}\njob_kind={}\nphase={}",
+            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\nlast_progress_at_ms={}\ndb_path={}\nmode={}\njob_id={}\njob_kind={}\nphase={}",
             std::process::id(),
             self.started_at_ms,
             self.updated_at_ms,
+            self.last_progress_at_ms,
             self.db_path.display(),
             mode.as_lock_value(),
             self.job_id,
@@ -5050,11 +5069,17 @@ fn acquire_index_run_lock(
             .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
     }
 
+    let now_ms = FrankenStorage::now_millis();
     let mut guard = IndexRunLockGuard {
         file,
         _path: lock_path,
-        started_at_ms: FrankenStorage::now_millis(),
-        updated_at_ms: FrankenStorage::now_millis(),
+        started_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        // cass#258: seed with `now` so the very first `read_search_maintenance_snapshot`
+        // call after `acquire_index_run_lock` sees a populated cursor.
+        // Forward progress will refresh this on every `write_metadata`
+        // / `set_mode` call.
+        last_progress_at_ms: now_ms,
         db_path: crate::normalize_path_identity(db_path),
         job_id: String::new(),
         job_kind: maintenance_job_kind_for_mode(mode),
@@ -25442,6 +25467,70 @@ mod tests {
             temp_artifacts.is_empty(),
             "successful heartbeat refresh should not leave temp files: {temp_artifacts:?}"
         );
+    }
+
+    /// Regression for #258 (review follow-up — fix-and-test-the-writer-side).
+    ///
+    /// The original #258 fix landed the READER side
+    /// (`asset_state::maintenance_stall_age_ms` consumes
+    /// `last_progress_at_ms`) and the HEARTBEAT-PRESERVATION test below,
+    /// but the WRITER side — `IndexRunLockGuard::write_metadata`
+    /// actually emitting a `last_progress_at_ms=...` line into the
+    /// lock file — was missing in the initial commit. Without this
+    /// test, every lock file in production had
+    /// `last_progress_at_ms=None`, so the stall detector never fired
+    /// and the wedged-indexer fix was inert.
+    ///
+    /// This test exercises the REAL writer path (no string fixture):
+    /// it calls `acquire_index_run_lock` which calls `write_metadata`
+    /// on construction, then re-reads the lock file off disk and
+    /// asserts the field is populated. The same test passes through
+    /// `read_search_maintenance_snapshot` to verify the value flows
+    /// end-to-end into the same data the status JSON consumes.
+    #[test]
+    fn acquire_index_run_lock_writes_last_progress_at_ms_field() {
+        use crate::search::asset_state::read_search_maintenance_snapshot;
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder").unwrap();
+        let before_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
+            .expect("acquire index run lock");
+        let after_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+
+        // The on-disk lock file must include the `last_progress_at_ms`
+        // key with a fresh timestamp. Parsing it lets a future change
+        // to the field's value type surface as a precise test failure.
+        let lock_path = tmp.path().join("index-run.lock");
+        let raw = std::fs::read_to_string(&lock_path).expect("read lock file");
+        let last_progress_lines: Vec<&str> = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .collect();
+        assert_eq!(
+            last_progress_lines.len(),
+            1,
+            "lock file must contain exactly one last_progress_at_ms line; got {raw:?}",
+        );
+        let value: i64 = last_progress_lines[0]
+            .parse()
+            .expect("last_progress_at_ms must parse as i64");
+        assert!(
+            (before_ms..=after_ms).contains(&value),
+            "last_progress_at_ms ({value}) must be within [before_ms={before_ms}, after_ms={after_ms}] of the acquire_index_run_lock call",
+        );
+
+        // Cross-check via the same snapshot reader the status JSON uses:
+        // `last_progress_at_ms` must surface as Some(..) (NOT None,
+        // which is what production lock files had until this fix).
+        let snapshot = read_search_maintenance_snapshot(tmp.path());
+        assert_eq!(
+            snapshot.last_progress_at_ms,
+            Some(value),
+            "snapshot reader must surface last_progress_at_ms; #258 stall detector is inert otherwise",
+        );
+
+        drop(guard);
     }
 
     /// Regression for #258. The heartbeat thread must refresh
