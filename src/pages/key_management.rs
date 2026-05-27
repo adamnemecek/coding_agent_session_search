@@ -34,7 +34,7 @@ use rand::Rng;
 use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use tracing::info;
 
 /// Argon2id default parameters
@@ -1172,6 +1172,21 @@ fn copy_site_except_runtime_state(src: &Path, dst: &Path) -> Result<()> {
     copy_site_except_runtime_state_recursive(src, dst, src, &canonical_base)
 }
 
+fn safe_staged_site_destination(dst_root: &Path, rel_path: &Path) -> Result<PathBuf> {
+    let mut path_parts = vec![dst_root.to_path_buf()];
+    for component in rel_path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => path_parts.push(PathBuf::from(name)),
+            _ => bail!(
+                "Refusing to stage archive entry with unsafe relative path: {}",
+                rel_path.display()
+            ),
+        }
+    }
+    Ok(path_parts.into_iter().collect())
+}
+
 fn copy_site_except_runtime_state_recursive(
     src: &Path,
     dst: &Path,
@@ -1193,7 +1208,7 @@ fn copy_site_except_runtime_state_recursive(
 
         let metadata = std::fs::symlink_metadata(&path)?;
         let file_type = metadata.file_type();
-        let dest_path = dst.join(rel_path);
+        let dest_path = safe_staged_site_destination(dst, rel_path)?;
         if file_type.is_dir() {
             std::fs::create_dir_all(&dest_path)?;
             copy_site_except_runtime_state_recursive(&path, dst, base, canonical_base)?;
