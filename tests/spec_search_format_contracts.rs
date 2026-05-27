@@ -1,30 +1,24 @@
-//! INV-cass-11 (canonical slice) — `cass search --robot-format jsonl|compact`
+//! INV-cass-11: `cass search --robot-format jsonl|compact`
 //! emits output that satisfies the format's canonical line/JSON contract.
 //!
 //! Agents consume these streaming formats by splitting on newlines and parsing
-//! each line. The contract that matters — independent of the volatile `_meta`
-//! payload — is:
+//! each line. The contract that matters, independent of the volatile `_meta`
+//! payload, is:
 //!
 //!   - `jsonl`:   every non-empty stdout line is independently valid JSON.
 //!   - `compact`: stdout is exactly one line of valid JSON.
 //!
-//! Both invariants are corpus-independent (verified against the checked-in
+//! Both invariants are corpus-independent, verified against the checked-in
 //! search-demo fixture with a deliberately non-matching query for a
-//! deterministic 0-hit envelope). They do NOT freeze the `_meta` content,
+//! deterministic 0-hit envelope. They do NOT freeze the `_meta` content,
 //! which is heavily host/time-dependent (host parallelism, loadavg, elapsed_ms,
 //! age_seconds, paths, timestamps) and inappropriate to lock at the line-shape
-//! level — the existing `golden_robot_json` harness owns content goldens via
+//! level. The existing `golden_robot_json` harness owns content goldens via
 //! `scrub_robot_json`.
-//!
-//! Gauntlet provenance: F7-3 / SURF-cass-001 (output-format goldens). The
-//! 11-format content-golden push is intentionally not done here; this is the
-//! canonical contract layer that protects every agent-facing format consumer
-//! and is the right kind of guard to land cleanly (low-churn, no fixture
-//! introspection, no host-dependent scrubbing).
 
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use assert_cmd::Command;
 use tempfile::TempDir;
@@ -44,6 +38,18 @@ fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
     }
 }
 
+fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let mut dst = dst_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => dst.push(part),
+            _ => return Err(test_error("fixture path escaped source root")),
+        }
+    }
+    Ok(dst)
+}
+
 /// Copy the checked-in search-demo fixture into a fresh temp data-dir so the
 /// test reads from an isolated, byte-identical copy of the canonical DB +
 /// lexical index (mirrors `tests/golden_robot_json::isolated_search_demo_data`).
@@ -56,7 +62,7 @@ fn copy_search_demo_fixture(test_home: &Path) -> Result<PathBuf, Box<dyn Error>>
     for entry in WalkDir::new(&src) {
         let entry = entry?;
         let rel = entry.path().strip_prefix(&src)?;
-        let dst = dst_root.join(rel);
+        let dst = safe_fixture_destination(&dst_root, rel)?;
         if entry.file_type().is_dir() {
             fs::create_dir_all(&dst)?;
         } else {
@@ -73,7 +79,7 @@ fn copy_search_demo_fixture(test_home: &Path) -> Result<PathBuf, Box<dyn Error>>
 fn run_search(data_dir: &Path, args: &[&str]) -> Result<String, Box<dyn Error>> {
     let output = Command::cargo_bin("cass")?
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .args(["search"])
+        .args(["--color=never", "search"])
         .args(args)
         .args(["--data-dir", data_dir.to_str().ok_or("non-utf8 path")?])
         .output()?;
@@ -93,18 +99,20 @@ fn output_lines(stdout: &str) -> Vec<&str> {
 }
 
 fn parse_each_line_as_json(lines: &[&str]) -> Result<(), Box<dyn Error>> {
-    for (i, line) in lines.iter().enumerate() {
-        if serde_json::from_str::<serde_json::Value>(line).is_err() {
-            return Err(test_error(format!(
-                "jsonl line {i} failed to parse as independent JSON: {}…",
-                line.chars().take(120).collect::<String>()
-            )));
-        }
+    if let Some((i, line)) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| serde_json::from_str::<serde_json::Value>(line).is_err())
+    {
+        let snippet: String = line.chars().take(120).collect();
+        return Err(test_error(format!(
+            "jsonl line {i} failed to parse as independent JSON: {snippet}..."
+        )));
     }
     Ok(())
 }
 
-/// A deliberately non-matching query yields a deterministic 0-hit envelope —
+/// A deliberately non-matching query yields a deterministic 0-hit envelope:
 /// the only fully corpus-independent shape we can rely on for a structural
 /// contract test (we do NOT know the fixture's exact term inventory).
 const NO_MATCH_QUERY: &str = "zzznomatchquery_xyz_unique_token_99";
@@ -157,7 +165,7 @@ fn compact_format_is_exactly_one_line_of_valid_json() -> TestResult {
 fn json_format_parses_as_a_single_json_document() -> TestResult {
     // The default `--robot` (pretty JSON) output is one document across
     // possibly-many pretty-printed lines. Concatenated stdout must parse as a
-    // single JSON value — this is the contract distinct from jsonl/compact.
+    // single JSON value; this is the contract distinct from jsonl/compact.
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
     let stdout = run_search(&data_dir, &[NO_MATCH_QUERY, "--robot"])?;
