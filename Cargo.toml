@@ -23,7 +23,7 @@ anyhow = "1.0.102"
 thiserror = "1.0.69"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { version = "0.3.1", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "0.3.2", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -42,7 +42,7 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-frankensqlite = { version = "0.1.3", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68426d3eae863f4a621283b3bbd0cb9121d8d778", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { version = "0.1.4", package = "fsqlite", features = ["fts5"] }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -160,7 +160,7 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { version = "0.1.3", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "68426d3eae863f4a621283b3bbd0cb9121d8d778", package = "fsqlite-types" }
+fsqlite-types = { version = "0.1.4", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"
@@ -197,8 +197,9 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.3.x line. Keep
-# frankensqlite, frankensearch, and franken-agent-detection revs aligned
-# so Cargo.lock does not reintroduce a parallel asupersync 0.2.x stack.
+# frankensqlite registry versions plus frankensearch and franken-agent-detection
+# revs aligned so Cargo.lock does not reintroduce a parallel asupersync 0.2.x
+# stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
@@ -212,12 +213,12 @@ strip = false
 # franken-evidence = { path = "../asupersync/franken_evidence" }
 # franken-kernel = { path = "../asupersync/franken_kernel" }
 #
-# build.rs validates the committed path overrides below and can validate
-# sibling repos above when `strict-path-dep-validation` is enabled.
+# build.rs validates the committed dependency source contracts and can validate
+# sibling repos below when `strict-path-dep-validation` is enabled.
 #
 # LOCAL DEVELOPMENT: Uncomment the [patch] sections below to build against
-# local sibling repo checkouts instead of pinned git revisions. These are
-# commented out by default so that a clean clone builds without requiring
+# local sibling repo checkouts instead of committed registry/git pins. These
+# are commented out by default so that a clean clone builds without requiring
 # specific directory layout. See build.rs for validation details.
 #
 # A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)

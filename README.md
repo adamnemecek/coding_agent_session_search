@@ -2922,22 +2922,22 @@ Update check state is stored in the data directory:
 
 ---
 
-## Sibling Dependency Contract
+## Dependency Source Contract
 
-`cass` pins git revisions in [`Cargo.toml`](Cargo.toml) for `asupersync`, `frankensqlite`/`fsqlite-types`, `franken-agent-detection`, `frankensearch`, `frankentui`, and `toon` (`tru`). The repo keeps local `[patch]` overrides commented out by default; enable them only for local development and never commit an active sibling path override.
+`cass` pins dependency identities in [`Cargo.toml`](Cargo.toml): registry versions for crates.io-only dependencies and git revisions for source dependencies. The repo keeps local `[patch]` overrides commented out by default; enable them only for local development and never commit an active sibling path override.
 
-| Dependency | Pinned revision |
+| Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `68426d3e` |
+| `frankensqlite` / `fsqlite-types` | `0.1.4` (crates.io; #93 + #94 fixes) |
 | `franken-agent-detection` | `b62d8597` |
-| `asupersync` | `0.3.1` |
+| `asupersync` | `0.3.2` |
 | `frankensearch` | `2cad158f` |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 
 **Build-time validation**
-- `build.rs` validates the active local overrides against the expected package name, package version, patch path, and Cargo feature/default-features contract.
-- If an active sibling checkout has drifted away from the pinned git revision or has a dirty worktree, the build emits a warning instead of silently trusting it.
+- `build.rs` validates the committed dependency source contract against the expected package name, package version, Cargo feature/default-features contract, and git source where applicable.
+- If an active git-pinned sibling checkout has drifted away from the pinned revision or has a dirty worktree, the build emits a warning instead of silently trusting it. Crates.io-only pins are validated by package version.
 - Enable strict enforcement with `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation` or `rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. Strict mode upgrades drift warnings to hard errors and also validates the optional sibling repos before you switch them to local path overrides.
 - Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
 

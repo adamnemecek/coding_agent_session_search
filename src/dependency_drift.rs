@@ -64,7 +64,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite",
         manifest_table: "dependencies",
         manifest_key: "frankensqlite",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../frankensqlite",
         required_tests: &[
             STRICT_CHECK_COMMAND,
@@ -77,7 +77,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite-types",
         manifest_table: "dev-dependencies",
         manifest_key: "fsqlite-types",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../frankensqlite",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -373,7 +373,6 @@ fn git_output(repo_path: &Path, args: &[&str]) -> Option<String> {
     }
 
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn fixture_observation(value: &Value, inherited_upstream_status: &str) -> DependencyObservation {
@@ -856,9 +855,9 @@ mod tests {
         let frankensqlite_spec = dependency_spec("frankensqlite")?;
         let frankensqlite = manifest_pin(&manifest, frankensqlite_spec);
         ensure(
-            frankensqlite.status == "pinned",
+            frankensqlite.status == "version-pinned",
             format!(
-                "expected frankensqlite pinned, got {}",
+                "expected frankensqlite version-pinned, got {}",
                 frankensqlite.status
             ),
         )?;
@@ -867,11 +866,8 @@ mod tests {
             "frankensqlite package should match the dependency spec",
         )?;
         ensure(
-            frankensqlite
-                .rev
-                .as_deref()
-                .is_some_and(|rev| rev.len() >= 7),
-            "frankensqlite should expose a pinned git rev",
+            frankensqlite.version.as_deref() == Some("0.1.4"),
+            "frankensqlite registry version pin should match Cargo.toml",
         )?;
 
         let asupersync = manifest_pin(&manifest, dependency_spec("asupersync")?);
@@ -883,7 +879,7 @@ mod tests {
             ),
         )?;
         ensure(
-            asupersync.version.as_deref() == Some("0.3.1"),
+            asupersync.version.as_deref() == Some("0.3.2"),
             "asupersync version pin should match Cargo.toml",
         )
     }
