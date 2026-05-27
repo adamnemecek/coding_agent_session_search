@@ -110,6 +110,7 @@ pub(crate) struct SearchMaintenanceSnapshot {
     pub job_kind: Option<SearchMaintenanceJobKind>,
     pub phase: Option<String>,
     pub updated_at_ms: Option<i64>,
+    pub last_progress_at_ms: Option<i64>,
     pub orphaned: bool,
 }
 
@@ -137,6 +138,7 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
     let mut job_kind = None;
     let mut phase = None;
     let mut updated_at_ms = None;
+    let mut last_progress_at_ms = None;
     for line in raw.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -150,6 +152,7 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
             "job_kind" => job_kind = SearchMaintenanceJobKind::parse_lock_value(value),
             "phase" => phase = Some(value.trim().to_string()).filter(|value| !value.is_empty()),
             "updated_at_ms" => updated_at_ms = value.trim().parse::<i64>().ok(),
+            "last_progress_at_ms" => last_progress_at_ms = value.trim().parse::<i64>().ok(),
             _ => {}
         }
     }
@@ -161,7 +164,8 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         || job_id.is_some()
         || job_kind.is_some()
         || phase.is_some()
-        || updated_at_ms.is_some();
+        || updated_at_ms.is_some()
+        || last_progress_at_ms.is_some();
 
     let active = match file.try_lock_exclusive() {
         Ok(()) => {
@@ -223,8 +227,40 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         job_kind,
         phase,
         updated_at_ms,
+        last_progress_at_ms,
         orphaned: metadata_present && !active,
     }
+}
+
+pub(crate) const REBUILD_STALL_DETECT_SECS_DEFAULT: u64 = 120;
+
+pub(crate) fn rebuild_stall_detect_threshold_ms() -> Option<i64> {
+    let threshold_secs = dotenvy::var("CASS_REBUILD_STALL_DETECT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(REBUILD_STALL_DETECT_SECS_DEFAULT);
+    if threshold_secs == 0 {
+        return None;
+    }
+    let threshold_ms = threshold_secs.saturating_mul(1000);
+    Some(i64::try_from(threshold_ms).unwrap_or(i64::MAX))
+}
+
+pub(crate) fn maintenance_stall_age_ms(
+    snapshot: &SearchMaintenanceSnapshot,
+    now_ms: i64,
+) -> Option<i64> {
+    if !snapshot.active
+        || !snapshot
+            .mode
+            .is_some_and(SearchMaintenanceMode::rebuild_active)
+    {
+        return None;
+    }
+    let last_progress_at_ms = snapshot.last_progress_at_ms?;
+    let age_ms = now_ms.saturating_sub(last_progress_at_ms);
+    let threshold_ms = rebuild_stall_detect_threshold_ms()?;
+    (age_ms >= threshold_ms).then_some(age_ms)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -247,6 +283,19 @@ pub(crate) struct LexicalAssetState {
     pub fresh: bool,
     pub stale: bool,
     pub rebuilding: bool,
+    /// `true` when the rebuild is nominally active but the indexing
+    /// thread has not posted forward progress within the configured
+    /// stall threshold. Driven by `last_progress_at_ms` on the lock
+    /// file, NOT by `updated_at_ms` (which the heartbeat thread
+    /// refreshes unconditionally). See issue #258 for the regression
+    /// this guards against.
+    pub stalled: bool,
+    /// Wall-clock age of the most recent forward-progress event, when
+    /// the indexer thread has posted one. `None` when no
+    /// `last_progress_at_ms` is available (legacy lock file, or the
+    /// rebuild is not active).
+    pub last_progress_age_ms: Option<i64>,
+    pub last_progress_at_ms: Option<i64>,
     pub watch_active: bool,
     pub last_indexed_at_ms: Option<i64>,
     pub age_seconds: Option<u64>,
@@ -293,6 +342,23 @@ pub(crate) struct SemanticAssetState {
     pub hnsw_path: Option<PathBuf>,
     pub hnsw_ready: bool,
     pub progressive_ready: bool,
+    /// Sub-fix 3 for cass#257: true when a quality-tier vector index is
+    /// published, matches the current DB fingerprint, and could serve a
+    /// `--mode semantic` search even if the progressive/hybrid stack is
+    /// still building (e.g. the fast tier hasn't been backfilled yet).
+    ///
+    /// Distinct from `progressive_ready`, which only returns true when
+    /// BOTH the fast and quality tier index files exist on disk —
+    /// useful for the "hybrid stack is good to go" surface but
+    /// misleading for operators who only run `--mode semantic`.
+    pub quality_tier_published: bool,
+    /// Sub-fix 3 for cass#257: true when at least one tier (fast OR
+    /// quality) is queryable against the current DB. This collapses
+    /// the per-tier readiness into a single flag suitable for the
+    /// operator question "can I run `cass search --mode semantic`
+    /// right now?". Mirrors `can_search` but is named so it survives
+    /// future refactors of the can_search semantics.
+    pub semantic_only_search_available: bool,
     pub hint: Option<String>,
     pub fast_tier: SemanticTierAssetState,
     pub quality_tier: SemanticTierAssetState,
@@ -493,6 +559,13 @@ fn semantic_state_not_inspected(
         hnsw_path: None,
         hnsw_ready: false,
         progressive_ready: semantic_progressive_assets_ready(data_dir),
+        // The fast-path skip-DB-open lane doesn't have an
+        // `availability` to consult, so we can't honestly call the
+        // tiers queryable here — leave the sub-fix-3 flags false. The
+        // caller upgrades to `semantic_state_from_availability` when
+        // it needs an answer.
+        quality_tier_published: false,
+        semantic_only_search_available: false,
         hint: Some(
             "Use 'cass status --json' or 'cass models status --json' for semantic readiness."
                 .to_string(),
@@ -597,6 +670,14 @@ pub(crate) fn semantic_state_from_availability(
     let hnsw_ready = hnsw_path.as_ref().is_some_and(|path| path.is_file());
     let progressive_ready = semantic_progressive_assets_ready(data_dir);
 
+    // Sub-fix 3 for cass#257: report quality-tier readiness as a
+    // first-class flag so operators querying `--mode semantic` can
+    // tell when the quality index is usable even while the
+    // progressive/hybrid stack remains incomplete.
+    let quality_tier_published = semantic_tier_queryable(availability, &quality_tier);
+    let fast_tier_queryable = semantic_tier_queryable(availability, &fast_tier);
+    let semantic_only_search_available = quality_tier_published || fast_tier_queryable;
+
     SemanticAssetState {
         status: runtime.status,
         availability: runtime.availability,
@@ -611,6 +692,8 @@ pub(crate) fn semantic_state_from_availability(
         hnsw_path,
         hnsw_ready,
         progressive_ready,
+        quality_tier_published,
+        semantic_only_search_available,
         hint: runtime.hint,
         fast_tier,
         quality_tier,
@@ -1129,7 +1212,34 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
             .mode
             .is_some_and(SearchMaintenanceMode::rebuild_active);
     let active_rebuild_progress = rebuilding;
+    // Forward-progress liveness check (issue #258): when a rebuild is
+    // active but the indexing thread has not posted progress within
+    // `CASS_REBUILD_STALL_DETECT_SECS` (default 120 s), report
+    // `stalled` rather than `rebuilding`. The lock file's
+    // `updated_at_ms` is heartbeat-refreshed every ~1 s by a separate
+    // thread, so it cannot be used as a "work is happening" signal —
+    // only the indexer-thread-owned `last_progress_at_ms` can.
+    //
+    // `now_ms` is derived from `now_secs` (which we already accept) to
+    // avoid taking an extra clock read; the resolution is good enough
+    // for a 120 s threshold and the relative ordering is preserved.
+    let now_ms = (now_secs as i64).saturating_mul(1000);
+    let stall_age_ms = if rebuilding && maintenance_targets_current_db {
+        maintenance_stall_age_ms(&maintenance, now_ms)
+    } else {
+        None
+    };
+    let stalled = stall_age_ms.is_some();
+    let last_progress_at_ms = maintenance
+        .last_progress_at_ms
+        .filter(|_| maintenance_targets_current_db);
+    let last_progress_age_ms = last_progress_at_ms
+        .filter(|_| rebuilding)
+        .map(|ts| now_ms.saturating_sub(ts));
     let stale = if rebuilding {
+        // A stalled rebuild leaves the on-disk index unchanged; if it
+        // existed before the stall it is still searchable, so treat
+        // `stalled` like the indexer just hadn't gotten there yet.
         !exists || contract_mismatch
     } else {
         exists
@@ -1140,7 +1250,9 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
                 || fingerprint_mismatch)
     };
     let fresh = exists && !stale && !rebuilding;
-    let status = if rebuilding {
+    let status = if stalled {
+        "stalled"
+    } else if rebuilding {
         "building"
     } else if !exists {
         "missing"
@@ -1149,7 +1261,12 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     } else {
         "ready"
     };
-    let status_reason = if rebuilding {
+    let status_reason = if stalled {
+        let secs = stall_age_ms.unwrap_or(0) / 1000;
+        Some(format!(
+            "indexing thread has not posted forward progress for {secs}s while the lock heartbeat keeps refreshing — see issue #258 for diagnostics (run `cass doctor check --json` and capture a stack trace)"
+        ))
+    } else if rebuilding {
         Some("lexical rebuild is in progress".to_string())
     } else if !exists {
         Some("lexical Tantivy metadata missing".to_string())
@@ -1202,6 +1319,9 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         fresh,
         stale,
         rebuilding,
+        stalled,
+        last_progress_age_ms,
+        last_progress_at_ms,
         watch_active,
         last_indexed_at_ms,
         age_seconds,
@@ -1420,6 +1540,21 @@ pub(crate) fn evaluate_maintenance_coordination_from_snapshot(
                 ),
             };
         }
+    }
+    // Forward-progress liveness check (issue #258). Even if the
+    // heartbeat is fresh, treat the job as `Stale` when the indexing
+    // thread itself has not posted progress for longer than the stall
+    // threshold. Coordination consumers (search fail-open, attach-or-
+    // wait) then route around the wedged worker instead of waiting on
+    // it indefinitely.
+    if let Some(stall_age_ms) = maintenance_stall_age_ms(snapshot, now_ms) {
+        let threshold_ms = rebuild_stall_detect_threshold_ms().unwrap_or(0);
+        return MaintenanceCoordinationOutcome::Stale {
+            job_id,
+            reason: format!(
+                "indexing thread has not posted forward progress for {stall_age_ms}ms while the heartbeat keeps refreshing (stall threshold {threshold_ms}ms) — see issue #258"
+            ),
+        };
     }
     MaintenanceCoordinationOutcome::Active {
         job_id,
@@ -2141,6 +2276,7 @@ mod tests {
                 job_kind: None,
                 phase: None,
                 updated_at_ms: None,
+                last_progress_at_ms: None,
                 orphaned: false,
             },
             checkpoint: Some(&checkpoint),
@@ -2250,6 +2386,7 @@ mod tests {
                 job_kind: None,
                 phase: None,
                 updated_at_ms: Some(1_733_000_456_000),
+                last_progress_at_ms: None,
                 orphaned: false,
             },
             checkpoint: Some(&checkpoint),
@@ -2301,6 +2438,7 @@ mod tests {
                 job_kind: None,
                 phase: None,
                 updated_at_ms: None,
+                last_progress_at_ms: None,
                 orphaned: false,
             },
             checkpoint: Some(&checkpoint),
@@ -2352,6 +2490,7 @@ mod tests {
                 job_kind: None,
                 phase: None,
                 updated_at_ms: None,
+                last_progress_at_ms: None,
                 orphaned: false,
             },
             checkpoint: None,
@@ -2364,6 +2503,206 @@ mod tests {
         assert!(!state.rebuilding);
         assert!(!state.watch_active);
         assert_eq!(state.activity_at_ms, None);
+    }
+
+    // ---- Forward-progress liveness / stall detection (issue #258) ----
+
+    /// `last_progress_at_ms` is older than the default 120 s stall
+    /// threshold; the heartbeat `updated_at_ms` is fresh (the heartbeat
+    /// thread kept refreshing it independently). Status must flip to
+    /// `stalled`, NOT remain `building` — this is the regression #258
+    /// guards against.
+    #[test]
+    fn lexical_state_reports_stalled_when_progress_is_stale_despite_fresh_heartbeat() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        // now = 1_733_000_300 s (= 1_733_000_300_000 ms).
+        // heartbeat updated 500 ms ago: fresh.
+        // forward progress posted 300 s ago: well past the 120 s default stall threshold.
+        let now_secs: u64 = 1_733_000_300;
+        let now_ms: i64 = (now_secs as i64) * 1000;
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs,
+            maintenance: SearchMaintenanceSnapshot {
+                active: true,
+                pid: Some(std::process::id()),
+                started_at_ms: Some(now_ms - 600_000),
+                db_path: Some(db_path.clone()),
+                mode: Some(SearchMaintenanceMode::WatchStartup),
+                job_id: Some("lexical_refresh-1-1".to_string()),
+                job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
+                phase: Some("watch_startup".to_string()),
+                updated_at_ms: Some(now_ms - 500),
+                last_progress_at_ms: Some(now_ms - 300_000),
+                orphaned: false,
+            },
+            checkpoint: None,
+            current_db_fingerprint: None,
+        });
+
+        assert!(state.rebuilding, "active rebuild lock must still register");
+        assert!(
+            state.stalled,
+            "stale forward-progress timestamp must flip stalled=true",
+        );
+        assert_eq!(state.status, "stalled");
+        assert_eq!(
+            state.last_progress_at_ms,
+            Some(now_ms - 300_000),
+            "last_progress_at_ms must be surfaced to status callers",
+        );
+        let age = state
+            .last_progress_age_ms
+            .expect("last_progress_age_ms must be computed");
+        assert!(
+            (299_900..=300_100).contains(&age),
+            "computed last_progress_age_ms ({age}ms) should equal now - last_progress_at_ms (300_000ms)",
+        );
+        let reason = state
+            .status_reason
+            .as_deref()
+            .expect("stalled state should populate status_reason");
+        assert!(
+            reason.contains("forward progress")
+                && (reason.contains("#258") || reason.contains("issue #258")),
+            "status_reason should mention forward progress and reference #258 ({reason})",
+        );
+    }
+
+    /// Heartbeat is fresh AND forward-progress is fresh: no stall.
+    /// Status remains `building`. Ensures the new gate does not regress
+    /// the happy path.
+    #[test]
+    fn lexical_state_stays_building_when_progress_is_recent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let now_secs: u64 = 1_733_000_300;
+        let now_ms: i64 = (now_secs as i64) * 1000;
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs,
+            maintenance: SearchMaintenanceSnapshot {
+                active: true,
+                pid: Some(std::process::id()),
+                started_at_ms: Some(now_ms - 30_000),
+                db_path: Some(db_path.clone()),
+                mode: Some(SearchMaintenanceMode::Index),
+                job_id: Some("lexical_refresh-1-1".to_string()),
+                job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
+                phase: Some("scanning".to_string()),
+                updated_at_ms: Some(now_ms - 500),
+                last_progress_at_ms: Some(now_ms - 1_000),
+                orphaned: false,
+            },
+            checkpoint: None,
+            current_db_fingerprint: None,
+        });
+
+        assert!(state.rebuilding);
+        assert!(!state.stalled, "fresh progress must not flip stalled");
+        assert_eq!(state.status, "building");
+    }
+
+    /// Legacy lock files (older cass that didn't write
+    /// `last_progress_at_ms`) must not be misreported as stalled. The
+    /// stall check only fires when an explicit `last_progress_at_ms`
+    /// is present; absent that, we fall back to the previous behavior.
+    #[test]
+    fn lexical_state_does_not_stall_when_legacy_lock_omits_progress_field() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let now_secs: u64 = 1_733_000_300;
+        let now_ms: i64 = (now_secs as i64) * 1000;
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs,
+            maintenance: SearchMaintenanceSnapshot {
+                active: true,
+                pid: Some(std::process::id()),
+                started_at_ms: Some(now_ms - 30_000),
+                db_path: Some(db_path.clone()),
+                mode: Some(SearchMaintenanceMode::Index),
+                job_id: None,
+                job_kind: None,
+                phase: None,
+                updated_at_ms: Some(now_ms - 500),
+                last_progress_at_ms: None,
+                orphaned: false,
+            },
+            checkpoint: None,
+            current_db_fingerprint: None,
+        });
+
+        assert!(state.rebuilding);
+        assert!(
+            !state.stalled,
+            "legacy lock without last_progress_at_ms must NOT be misreported as stalled",
+        );
+        assert_eq!(state.status, "building");
+        assert!(state.last_progress_age_ms.is_none());
+    }
+
+    /// Coordination outcome layer must also degrade to `Stale` when
+    /// forward progress is stuck — search-side single-flight callers
+    /// then route around the wedged worker instead of attaching to it.
+    #[test]
+    fn coordination_reports_stale_when_forward_progress_is_stuck() {
+        let now_ms: i64 = 1_733_000_300_000;
+        let snapshot = SearchMaintenanceSnapshot {
+            active: true,
+            pid: Some(12345),
+            started_at_ms: Some(now_ms - 600_000),
+            db_path: Some(PathBuf::from("/tmp/cass/agent_search.db")),
+            mode: Some(SearchMaintenanceMode::WatchStartup),
+            job_id: Some("lexical_refresh-1-12345".to_string()),
+            job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
+            phase: Some("watch_startup".to_string()),
+            updated_at_ms: Some(now_ms - 500),
+            last_progress_at_ms: Some(now_ms - 300_000),
+            orphaned: false,
+        };
+
+        let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
+        match outcome {
+            MaintenanceCoordinationOutcome::Stale { ref reason, .. } => {
+                assert!(
+                    reason.contains("forward progress")
+                        && (reason.contains("#258") || reason.contains("issue #258")),
+                    "stalled coordination reason should mention forward progress and #258: {reason}",
+                );
+            }
+            other => {
+                panic!("stalled forward-progress snapshot must coordinate as Stale, got {other:?}",)
+            }
+        }
     }
 
     #[test]
@@ -2574,6 +2913,7 @@ mod tests {
                 schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
                 chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
                 saved_at_ms: 1_733_100_300_000,
+                last_message_id: None,
             }),
             ..Default::default()
         };
@@ -2786,6 +3126,7 @@ mod tests {
             job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
             phase: Some("scanning".to_string()),
             updated_at_ms: Some(now_ms - 500),
+            last_progress_at_ms: Some(now_ms - 500),
             orphaned: false,
         }
     }

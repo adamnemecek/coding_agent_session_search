@@ -15726,6 +15726,9 @@ fn state_meta_json_inner(
                     .mode
                     .is_some_and(crate::search::asset_state::SearchMaintenanceMode::rebuild_active)
                     && index_run.active,
+                stalled: false,
+                last_progress_age_ms: None,
+                last_progress_at_ms: index_run.last_progress_at_ms,
                 watch_active: index_run
                     .mode
                     .is_some_and(crate::search::asset_state::SearchMaintenanceMode::watch_active)
@@ -15768,6 +15771,8 @@ fn state_meta_json_inner(
                 hnsw_path: None,
                 hnsw_ready: false,
                 progressive_ready: false,
+                quality_tier_published: false,
+                semantic_only_search_available: false,
                 hint: Some(
                     "Repair semantic assets when convenient; lexical search remains available."
                         .to_string(),
@@ -15798,6 +15803,8 @@ fn state_meta_json_inner(
         assets.semantic.hnsw_path = None;
         assets.semantic.hnsw_ready = false;
         assets.semantic.progressive_ready = false;
+        assets.semantic.quality_tier_published = false;
+        assets.semantic.semantic_only_search_available = false;
         assets.semantic.hint = Some(
             "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'."
                 .to_string(),
@@ -15961,6 +15968,7 @@ fn state_meta_json_inner(
             "stale": lexical.stale,
             "stale_threshold_seconds": stale_threshold,
             "rebuilding": lexical.rebuilding,
+            "stalled": lexical.stalled,
             "activity_at": lexical.activity_at_ms.map(|ts| {
                 chrono::DateTime::from_timestamp_millis(ts)
                     .unwrap_or_else(chrono::Utc::now)
@@ -16000,6 +16008,18 @@ fn state_meta_json_inner(
         },
         "rebuild": {
             "active": lexical.rebuilding,
+            // `stalled=true` means active=true but the indexing thread
+            // has not made forward progress for at least
+            // CASS_REBUILD_STALL_DETECT_SECS (default 120s), even though
+            // the lock-file heartbeat is still being refreshed. Surface
+            // this distinctly from `active` so operators (and the TUI)
+            // can tell a slow-but-progressing rebuild apart from a
+            // wedged one. Regression #258.
+            "stalled": lexical.stalled,
+            "last_progress_at": lexical.last_progress_at_ms.and_then(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+            }),
+            "last_progress_age_ms": lexical.last_progress_age_ms,
             "orphaned": index_run.orphaned,
             "pid": index_run.pid,
             "mode": index_run.mode.map(|mode| mode.as_lock_value()),
@@ -16035,6 +16055,13 @@ fn state_meta_json_inner(
             "hnsw_path": semantic.hnsw_path.as_ref().map(|path| path.display().to_string()),
             "hnsw_ready": semantic.hnsw_ready,
             "progressive_ready": semantic.progressive_ready,
+            // Sub-fix 3 for cass#257 — additive fields that report
+            // quality-tier readiness independently of the
+            // progressive/hybrid stack so `--mode semantic` consumers
+            // see "yes, you can search" even while the fast tier or
+            // lexical surface is still building.
+            "quality_tier_published": semantic.quality_tier_published,
+            "semantic_only_search_available": semantic.semantic_only_search_available,
             "hint": semantic.hint,
             "fast_tier": {
                 "present": semantic.fast_tier.present,
@@ -64276,6 +64303,11 @@ fn run_status(
         .and_then(|r| r.get("active"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let rebuild_stalled = state
+        .get("rebuild")
+        .and_then(|r| r.get("stalled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let rebuild_processed = state
         .get("rebuild")
         .and_then(|r| r.get("processed_conversations"))
@@ -64380,7 +64412,14 @@ fn run_status(
         && !rebuild_active
         && !index_empty_with_messages
         && !ingest_quarantine_critical;
-    let status = if rebuild_active {
+    // Stalled rebuilds are reported as a distinct status so operators
+    // can tell a wedged indexer apart from a slow-but-progressing one
+    // (issue #258). `stalled` implies `rebuild_active=true`, but it
+    // *overrides* the "rebuilding" status because health is not
+    // monotonically improving — the operator must intervene.
+    let status = if rebuild_stalled {
+        "stalled"
+    } else if rebuild_active {
         "rebuilding"
     } else if ingest_quarantine_critical {
         "unhealthy"
@@ -64399,7 +64438,9 @@ fn run_status(
         None
     };
 
-    let recommended_action = if rebuild_active {
+    let recommended_action = if rebuild_stalled {
+        Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for issue #258".to_string())
+    } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
@@ -64711,6 +64752,11 @@ fn run_triage(
         .and_then(|rebuild| rebuild.get("active"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let rebuild_stalled = state
+        .get("rebuild")
+        .and_then(|rebuild| rebuild.get("stalled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let db_exists = state
         .get("database")
         .and_then(|database| database.get("exists"))
@@ -64746,7 +64792,9 @@ fn run_triage(
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages;
-    let status = if rebuild_active {
+    let status = if rebuild_stalled {
+        "stalled"
+    } else if rebuild_active {
         "rebuilding"
     } else if healthy {
         "healthy"
@@ -64762,7 +64810,12 @@ fn run_triage(
     } else {
         None
     };
-    let recommended_action = if rebuild_active {
+    let recommended_action = if rebuild_stalled {
+        Some(
+            "Index rebuild is wedged; capture diagnostics for issue #258 and restart the watcher"
+                .to_string(),
+        )
+    } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
@@ -64900,6 +64953,11 @@ fn run_health(
         .and_then(|r| r.get("active"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let rebuild_stalled = state
+        .get("rebuild")
+        .and_then(|r| r.get("stalled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let db_exists = state
         .get("database")
         .and_then(|d| d.get("exists"))
@@ -65016,7 +65074,12 @@ fn run_health(
     if index_exists && !index_fresh && !not_initialized {
         errors.push("index stale".to_string());
     }
-    if rebuild_active {
+    if rebuild_stalled {
+        errors.push(
+            "index rebuild stalled — indexing thread is not making forward progress (issue #258)"
+                .to_string(),
+        );
+    } else if rebuild_active {
         errors.push("index rebuild in progress".to_string());
     }
     if index_empty_with_messages {
@@ -65027,7 +65090,9 @@ fn run_health(
     }
 
     // Determine status string for structured output.
-    let status = if rebuild_active {
+    let status = if rebuild_stalled {
+        "stalled"
+    } else if rebuild_active {
         "rebuilding"
     } else if ingest_quarantine_critical {
         "unhealthy"
@@ -72391,6 +72456,17 @@ fn response_schema_rebuild_progress() -> serde_json::Value {
         "type": "object",
         "properties": {
             "active": { "type": "boolean" },
+            // `stalled=true` means the rebuild is nominally active but
+            // the indexing thread has not posted forward progress for
+            // longer than CASS_REBUILD_STALL_DETECT_SECS (default 120s)
+            // — even though the lock heartbeat is still being
+            // refreshed. Distinguishes a wedged indexer from a
+            // slow-but-progressing one. Regression #258.
+            "stalled": { "type": "boolean" },
+            // RFC3339 timestamp of the last forward-progress event
+            // posted by the indexing thread itself.
+            "last_progress_at": { "type": ["string", "null"] },
+            "last_progress_age_ms": { "type": ["integer", "null"] },
             "mode": { "type": ["string", "null"] },
             "phase": { "type": ["string", "null"] },
             "processed_conversations": { "type": ["integer", "null"] },
@@ -78352,7 +78428,8 @@ const INDEX_STALL_HINT: &str = concat!(
     "Indexer made no forward progress for the configured stall window. ",
     "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
     "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
-    "and attach to issue #244. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable."
+    "and attach to issue #244 (indexing-phase wedges) or #258 (watch_startup wedges where the lock-file ",
+    "heartbeat keeps refreshing while one thread spins). Set CASS_INDEX_STALL_DETECT_SECS=0 to disable."
 );
 
 fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
@@ -78416,7 +78493,17 @@ impl IndexStallWatchdog {
         }
 
         let threshold = self.threshold?;
-        if phase_code == 0 || self.stall_reported_for_phase == Some(phase_code) {
+        // Historically this gated on `phase_code != 0` so the watchdog
+        // never fired during the "preparing" phase (phase=0). Issue #258
+        // is exactly that: the v0.6.2 watcher wedged at startup before
+        // ever advancing to Scanning/Indexing, the watchdog stayed
+        // silent for 4+ hours, and operators had no signal that the
+        // indexer was stuck. The fix is to also fire on phase=0 wedges
+        // — a startup that takes >120 s with no progress is, by any
+        // sensible definition, a stall worth reporting. The repeat
+        // guard `stall_reported_for_phase == Some(phase_code)` still
+        // prevents log spam from a single stalled phase.
+        if self.stall_reported_for_phase == Some(phase_code) {
             return None;
         }
         if self.last_progress_advance.elapsed() < threshold {
@@ -78546,6 +78633,63 @@ mod stall_diagnostics_tests {
         assert!(entry.contains_key("content_omitted"));
         assert!(!entry.contains_key("content"));
         assert_eq!(entry["size_bytes"], serde_json::json!(big.len() as u64));
+    }
+
+    /// Regression for #258: `IndexStallWatchdog` previously short-
+    /// circuited on `phase_code == 0` (the "preparing" phase before
+    /// Scanning/Indexing), so any startup wedge that never advanced
+    /// past phase=0 was invisible. The v0.6.2 watcher reporter saw
+    /// 4+ hours of silence on exactly that path. The watchdog now
+    /// fires whenever no progress is observed within the threshold,
+    /// regardless of phase.
+    #[test]
+    fn watchdog_fires_on_phase_zero_startup_wedge() {
+        use super::IndexStallWatchdog;
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut watchdog =
+            IndexStallWatchdog::new(tmp.path().to_path_buf(), Duration::from_millis(50));
+        // Force a tiny stall threshold so the test does not need to
+        // sleep 120 s. Using a smaller-than-default value still
+        // exercises the same code path because
+        // `index_stall_threshold` floors at `progress_interval + 1s`,
+        // but for the unit test we drive the watchdog by directly
+        // tampering with `last_progress_advance`.
+        watchdog.threshold = Some(Duration::from_millis(1));
+        // Simulate "indexer just started, phase=0, current=0". Force
+        // last_progress_advance into the past so the threshold has
+        // already elapsed by the time we call `observe`.
+        watchdog.last_phase = 0;
+        watchdog.last_current = 0;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        // Caller has not touched phase/current — still 0/0.
+        assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.current.load(Ordering::Relaxed), 0);
+
+        let payload = watchdog.observe(&progress, 100);
+        let payload = payload.expect(
+            "phase=0 wedges past the stall threshold must emit a stall_detected event (#258)",
+        );
+        let obj = payload.as_object().expect("event payload is an object");
+        assert_eq!(obj["event"], serde_json::json!("stall_detected"));
+        assert!(
+            obj.contains_key("stall_elapsed_ms"),
+            "watchdog event missing stall_elapsed_ms",
+        );
+
+        // Second observe call with no progress must be silenced by
+        // the per-phase repeat guard.
+        let repeat = watchdog.observe(&progress, 200);
+        assert!(
+            repeat.is_none(),
+            "watchdog must not spam repeated events for the same phase",
+        );
     }
 }
 
@@ -89360,8 +89504,18 @@ fn run_models_backfill(
         retryable: embedder_type != "hash",
     })?;
 
+    // Sub-fix 1 for cass#257: open a JSONL progress sink whose
+    // destination is taken from `CASS_SEMANTIC_PROGRESS_JSONL`. The
+    // sink is silent when the env var is unset, so behaviour for
+    // existing operators is unchanged. The sink threads through to
+    // selection / packet replay / embed / staging / checkpoint /
+    // publish events.
+    let progress_sink = crate::indexer::semantic_progress::SemanticProgressSink::open(
+        tier.as_str(),
+        indexer.embedder_id(),
+    );
     let outcome = indexer
-        .run_backfill_from_storage(
+        .run_backfill_from_storage_with_sink(
             &storage,
             &data_dir,
             &mut manifest,
@@ -89371,6 +89525,7 @@ fn run_models_backfill(
                 model_revision,
                 max_conversations: effective_batch_conversations,
             },
+            &progress_sink,
         )
         .map_err(|e| CliError {
             code: 5,

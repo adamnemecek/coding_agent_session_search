@@ -6,6 +6,7 @@ pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
+pub mod semantic_progress;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
 use self::refresh_ledger::{
@@ -25440,6 +25441,58 @@ mod tests {
         assert!(
             temp_artifacts.is_empty(),
             "successful heartbeat refresh should not leave temp files: {temp_artifacts:?}"
+        );
+    }
+
+    /// Regression for #258. The heartbeat thread must refresh
+    /// `updated_at_ms` (its job: prove the process is alive) but MUST
+    /// NOT touch `last_progress_at_ms` (which the indexing thread alone
+    /// updates on real forward progress). If the heartbeat were to
+    /// refresh both, the stall detector in
+    /// `crate::search::asset_state::maintenance_stall_age_ms` would
+    /// silently never fire, recreating the bug.
+    #[test]
+    fn heartbeat_preserves_last_progress_at_ms_field_for_stall_detection() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("index-run.lock");
+        // Note: last_progress_at_ms is set to a deliberately small
+        // value (333) representing "indexing thread last reported
+        // forward progress at t=333ms".
+        std::fs::write(
+            &lock_path,
+            "pid=123\nstarted_at_ms=111\nupdated_at_ms=222\nlast_progress_at_ms=333\ndb_path=/tmp/db.sqlite\nmode=watch_startup\njob_id=lexical_refresh-123\njob_kind=lexical_refresh\nphase=watch_startup\n",
+        )
+        .unwrap();
+
+        // Heartbeat twice — simulate ~5 s of clock advance with no
+        // indexing-thread activity.
+        heartbeat_index_run_lock(tmp.path()).unwrap();
+        heartbeat_index_run_lock(tmp.path()).unwrap();
+
+        let refreshed = std::fs::read_to_string(&lock_path).unwrap();
+        let last_progress_lines: Vec<&str> = refreshed
+            .lines()
+            .filter_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .collect();
+        assert_eq!(
+            last_progress_lines.len(),
+            1,
+            "heartbeat must keep exactly one last_progress_at_ms line, got {refreshed:?}",
+        );
+        assert_eq!(
+            last_progress_lines.first().copied(),
+            Some("333"),
+            "heartbeat must preserve last_progress_at_ms verbatim — refreshing it would silently disable the #258 stall detector",
+        );
+        // updated_at_ms must have moved.
+        let updated_at_value: Option<i64> = refreshed
+            .lines()
+            .filter_map(|line| line.strip_prefix("updated_at_ms="))
+            .next()
+            .and_then(|raw| raw.parse().ok());
+        assert!(
+            updated_at_value.is_some_and(|value| value > 222),
+            "updated_at_ms must advance past initial 222, got {refreshed:?}",
         );
     }
 

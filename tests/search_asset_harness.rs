@@ -372,6 +372,7 @@ impl CorruptionInjector {
                 schema_version: SEMANTIC_SCHEMA_VERSION,
                 chunking_version: CHUNKING_STRATEGY_VERSION,
                 saved_at_ms: now_ms(),
+                last_message_id: None,
             }),
             ..Default::default()
         };

@@ -643,6 +643,7 @@ mod tests {
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
             saved_at_ms: 1_700_000_000_000,
+            last_message_id: None,
         }
     }
 

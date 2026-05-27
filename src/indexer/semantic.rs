@@ -19,6 +19,9 @@ use crate::indexer::memoization::{
     ContentAddressedMemoCache, MemoCacheAuditRecord, MemoContentHash, MemoKey, MemoLookup,
 };
 use crate::indexer::responsiveness;
+use crate::indexer::semantic_progress::{
+    SemanticProgressEvent, SemanticProgressFields, SemanticProgressSink,
+};
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
@@ -549,23 +552,6 @@ pub(crate) struct CanonicalIncrementalEmbeddingBatch {
     pub raw_max_message_id: Option<i64>,
 }
 
-fn matching_semantic_checkpoint_offset(
-    manifest: &SemanticManifest,
-    tier: TierKind,
-    embedder_id: &str,
-    db_fingerprint: &str,
-) -> i64 {
-    manifest
-        .checkpoint
-        .as_ref()
-        .filter(|checkpoint| {
-            checkpoint.tier == tier
-                && checkpoint.embedder_id == embedder_id
-                && checkpoint.is_valid(db_fingerprint)
-        })
-        .map_or(0, |checkpoint| checkpoint.last_offset)
-}
-
 fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     let count: i64 = storage
         .raw()
@@ -854,6 +840,27 @@ fn fetch_canonical_embedding_batch(
     after_conversation_id: i64,
     max_conversations: usize,
 ) -> Result<CanonicalEmbeddingBatch> {
+    fetch_canonical_embedding_batch_inner(storage, after_conversation_id, max_conversations, None)
+}
+
+/// Variant of [`fetch_canonical_embedding_batch`] that additionally
+/// filters out canonical messages with `message_id <= after_message_id`
+/// when set. This is how sub-fix 2 (`last_message_id` cursor) enforces
+/// the "resume MUST advance past `last_message_id`" rule on a partially
+/// embedded conversation: even if we re-select a conversation that
+/// straddled a checkpoint, no message in it is re-embedded.
+///
+/// The implementation deliberately filters Rust-side after the SQL
+/// fetch rather than pushing the predicate into a JOIN, because that
+/// keeps the SQL identical to the existing path (we only widen the
+/// scope post-selection). The SQL-shape perf optimization issue
+/// (cass#257 follow-up) tracks moving the filter into the query.
+fn fetch_canonical_embedding_batch_inner(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    max_conversations: usize,
+    after_message_id: Option<i64>,
+) -> Result<CanonicalEmbeddingBatch> {
     let total_conversations = total_semantic_conversations(storage)?;
     let max_conversations_i64 = i64::try_from(max_conversations.max(1)).unwrap_or(i64::MAX);
     let conversation_ids: Vec<i64> = storage
@@ -896,10 +903,17 @@ fn fetch_canonical_embedding_batch(
         let provenance = canonical_embedding_packet_provenance(conversation);
         let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
         let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
-        inputs.extend(embedding_inputs_from_conversation_packet(
-            conversation,
-            &packet,
-        ));
+        let conversation_inputs = embedding_inputs_from_conversation_packet(conversation, &packet);
+        if let Some(min_exclusive) = after_message_id {
+            let cutoff = u64::try_from(min_exclusive).unwrap_or(0);
+            inputs.extend(
+                conversation_inputs
+                    .into_iter()
+                    .filter(|input| input.message_id > cutoff),
+            );
+        } else {
+            inputs.extend(conversation_inputs);
+        }
     }
 
     let conversations_in_batch = u64::try_from(conversation_ids.len()).unwrap_or(u64::MAX);
@@ -907,6 +921,7 @@ fn fetch_canonical_embedding_batch(
         conversations_in_batch,
         packet_driven = true,
         semantic_inputs = inputs.len(),
+        ?after_message_id,
         "built semantic backfill batch from ConversationPacket canonical replay"
     );
 
@@ -1269,6 +1284,18 @@ impl SemanticIndexer {
     }
 
     pub fn embed_messages(&self, messages: &[EmbeddingInput]) -> Result<Vec<EmbeddedMessage>> {
+        self.embed_messages_with_sink(messages, &SemanticProgressSink::disabled())
+    }
+
+    /// Variant of [`embed_messages`] that emits `embed_batch_*` events
+    /// into the given JSONL sink. The sink is silent unless
+    /// `CASS_SEMANTIC_PROGRESS_JSONL` is set, so this path is safe to
+    /// take in production.
+    pub fn embed_messages_with_sink(
+        &self,
+        messages: &[EmbeddingInput],
+        sink: &SemanticProgressSink,
+    ) -> Result<Vec<EmbeddedMessage>> {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
@@ -1298,6 +1325,9 @@ impl SemanticIndexer {
         let prep_memo_capacity = resolved_semantic_prep_memo_capacity();
         let mut prep_memo =
             serial_prep.then(|| ContentAddressedMemoCache::with_capacity(prep_memo_capacity));
+        let mut batch_index: u64 = 0;
+        let mut rows_processed: u64 = 0;
+        let rows_total = u64::try_from(messages.len()).ok();
         for (window_index, window_slice) in messages.chunks(window).enumerate() {
             let prepared_window = match prep_memo.as_mut() {
                 Some(cache) => {
@@ -1321,7 +1351,42 @@ impl SemanticIndexer {
             }
 
             for batch in prepared_window.chunks(self.batch_size) {
+                let batch_rows = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+                // Sum the canonicalized byte count so an operator can
+                // distinguish a stalled inference from a stalled query —
+                // a tiny `bytes` value paired with a long batch wall-time
+                // points at the model; a huge `bytes` paired with a short
+                // wall-time points at the storage side.
+                let batch_bytes: u64 = batch.iter().map(|p| p.canonical.len() as u64).sum();
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::EmbedBatchStart,
+                        SemanticProgressFields {
+                            batch_index: Some(batch_index),
+                            batch_rows: Some(batch_rows),
+                            rows_processed: Some(rows_processed),
+                            rows_total,
+                            bytes: Some(batch_bytes),
+                            ..Default::default()
+                        },
+                    );
+                }
                 flush_prepared_batch(batch, &mut embeddings, &pb, self.embedder.as_ref())?;
+                rows_processed = rows_processed.saturating_add(batch_rows);
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::EmbedBatchDone,
+                        SemanticProgressFields {
+                            batch_index: Some(batch_index),
+                            batch_rows: Some(batch_rows),
+                            rows_processed: Some(rows_processed),
+                            rows_total,
+                            bytes: Some(batch_bytes),
+                            ..Default::default()
+                        },
+                    );
+                }
+                batch_index = batch_index.saturating_add(1);
             }
         }
 
@@ -1665,6 +1730,30 @@ impl SemanticIndexer {
         manifest: &mut SemanticManifest,
         plan: SemanticBackfillBatchPlan,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        self.run_backfill_batch_with_sink(
+            messages,
+            data_dir,
+            manifest,
+            plan,
+            None,
+            &SemanticProgressSink::disabled(),
+        )
+    }
+
+    /// Variant of [`run_backfill_batch`] that emits semantic progress
+    /// events to the given JSONL sink and persists `last_message_id`
+    /// into the resumable checkpoint when supplied. The sink is silent
+    /// unless `CASS_SEMANTIC_PROGRESS_JSONL` is set, so this path is
+    /// safe to take in production.
+    pub fn run_backfill_batch_with_sink(
+        &self,
+        messages: &[EmbeddingInput],
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillBatchPlan,
+        last_message_id: Option<i64>,
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
         if plan.db_fingerprint.trim().is_empty() {
             bail!("semantic backfill requires a non-empty DB fingerprint");
         }
@@ -1697,13 +1786,33 @@ impl SemanticIndexer {
             .as_ref()
             .map_or(0, |checkpoint| checkpoint.docs_embedded);
 
-        let embeddings = self.embed_messages(messages)?;
+        let embeddings = self.embed_messages_with_sink(messages, sink)?;
         let embedded_docs = u64::try_from(embeddings.len()).unwrap_or(u64::MAX);
+        if sink.is_active() {
+            sink.emit(
+                SemanticProgressEvent::StagingWriteStart,
+                SemanticProgressFields {
+                    batch_rows: Some(embedded_docs),
+                    note: Some(staging_path.display().to_string()),
+                    ..Default::default()
+                },
+            );
+        }
         let mut staged_index = self.write_backfill_staging_index(
             embeddings,
             &staging_path,
             prior_checkpoint.is_some(),
         )?;
+        if sink.is_active() {
+            sink.emit(
+                SemanticProgressEvent::StagingWriteDone,
+                SemanticProgressFields {
+                    batch_rows: Some(embedded_docs),
+                    note: Some(staging_path.display().to_string()),
+                    ..Default::default()
+                },
+            );
+        }
         let conversations_processed = prior_conversations
             .saturating_add(plan.conversations_in_batch)
             .min(plan.total_conversations);
@@ -1719,6 +1828,19 @@ impl SemanticIndexer {
                 })?;
             }
             drop(staged_index);
+            if sink.is_active() {
+                sink.emit(
+                    SemanticProgressEvent::PublishStart,
+                    SemanticProgressFields {
+                        rows_processed: Some(conversations_processed),
+                        rows_total: Some(plan.total_conversations),
+                        last_conversation_id: Some(plan.last_offset),
+                        last_message_id,
+                        note: Some(final_path.display().to_string()),
+                        ..Default::default()
+                    },
+                );
+            }
             fs::rename(&staging_path, &final_path).with_context(|| {
                 format!(
                     "publishing staged semantic index {} to {}",
@@ -1757,12 +1879,43 @@ impl SemanticIndexer {
             });
             manifest.refresh_backlog(plan.total_conversations, &db_fingerprint);
             manifest.save(data_dir)?;
+            if sink.is_active() {
+                sink.emit(
+                    SemanticProgressEvent::PublishDone,
+                    SemanticProgressFields {
+                        rows_processed: Some(conversations_processed),
+                        rows_total: Some(plan.total_conversations),
+                        last_conversation_id: Some(plan.last_offset),
+                        last_message_id,
+                        note: Some(final_path.display().to_string()),
+                        ..Default::default()
+                    },
+                );
+            }
         } else {
             let docs_embedded_on_disk =
                 u64::try_from(staged_index.record_count()).unwrap_or(u64::MAX);
             let checkpoint_docs = prior_docs
                 .saturating_add(embedded_docs)
                 .max(docs_embedded_on_disk);
+            if sink.is_active() {
+                sink.emit(
+                    SemanticProgressEvent::CheckpointSaveStart,
+                    SemanticProgressFields {
+                        rows_processed: Some(conversations_processed),
+                        rows_total: Some(plan.total_conversations),
+                        last_conversation_id: Some(plan.last_offset),
+                        last_message_id,
+                        ..Default::default()
+                    },
+                );
+            }
+            // Preserve any existing `last_message_id` cursor when the
+            // caller did not supply a fresher one — see sub-fix 2 for
+            // why durable message-PK resume matters.
+            let prior_last_message_id = prior_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.last_message_id);
             manifest.save_checkpoint(BuildCheckpoint {
                 tier: plan.tier,
                 embedder_id: self.embedder_id().to_string(),
@@ -1774,8 +1927,21 @@ impl SemanticIndexer {
                 schema_version: SEMANTIC_SCHEMA_VERSION,
                 chunking_version: CHUNKING_STRATEGY_VERSION,
                 saved_at_ms: now_ms(),
+                last_message_id: last_message_id.or(prior_last_message_id),
             });
             manifest.save(data_dir)?;
+            if sink.is_active() {
+                sink.emit(
+                    SemanticProgressEvent::CheckpointSaveDone,
+                    SemanticProgressFields {
+                        rows_processed: Some(conversations_processed),
+                        rows_total: Some(plan.total_conversations),
+                        last_conversation_id: Some(plan.last_offset),
+                        last_message_id: last_message_id.or(prior_last_message_id),
+                        ..Default::default()
+                    },
+                );
+            }
         }
 
         Ok(SemanticBackfillBatchOutcome {
@@ -1799,18 +1965,140 @@ impl SemanticIndexer {
         manifest: &mut SemanticManifest,
         plan: SemanticBackfillStoragePlan,
     ) -> Result<SemanticBackfillBatchOutcome> {
-        let after_conversation_id = matching_semantic_checkpoint_offset(
+        self.run_backfill_from_storage_with_sink(
+            storage,
+            data_dir,
             manifest,
-            plan.tier,
-            self.embedder_id(),
-            &plan.db_fingerprint,
-        );
-        let batch = fetch_canonical_embedding_batch(
+            plan,
+            &SemanticProgressSink::disabled(),
+        )
+    }
+
+    /// Variant of [`run_backfill_from_storage`] that emits semantic
+    /// progress events to a JSONL sink and persists `last_message_id`
+    /// in the resumable checkpoint. The sink is silent unless
+    /// `CASS_SEMANTIC_PROGRESS_JSONL` is set.
+    pub fn run_backfill_from_storage_with_sink(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillStoragePlan,
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
+        // Resume cursor: prefer `last_message_id` (sub-fix 2) when a
+        // valid checkpoint matches this tier+embedder+db; fall back to
+        // the conversation offset for old-shape manifests written by
+        // pre-#257 binaries.
+        let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
+            checkpoint.tier == plan.tier
+                && checkpoint.embedder_id == self.embedder_id()
+                && checkpoint.is_valid(&plan.db_fingerprint)
+        });
+        let after_conversation_id = prior_checkpoint.map_or(0, |checkpoint| checkpoint.last_offset);
+        let prior_last_message_id =
+            prior_checkpoint.and_then(|checkpoint| checkpoint.last_message_id);
+
+        if sink.is_active() {
+            sink.emit(
+                SemanticProgressEvent::SelectionStart,
+                SemanticProgressFields {
+                    last_conversation_id: Some(after_conversation_id),
+                    last_message_id: prior_last_message_id,
+                    rows_total: Some(plan.max_conversations as u64),
+                    note: Some(plan.tier.as_str().to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let batch = match fetch_canonical_embedding_batch_inner(
             storage,
             after_conversation_id,
             plan.max_conversations,
-        )?;
-        self.run_backfill_batch(
+            prior_last_message_id,
+        ) {
+            Ok(batch) => batch,
+            Err(err) => {
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::Error,
+                        SemanticProgressFields {
+                            error: Some(format!("selection: {err}")),
+                            last_conversation_id: Some(after_conversation_id),
+                            last_message_id: prior_last_message_id,
+                            ..Default::default()
+                        },
+                    );
+                }
+                return Err(err);
+            }
+        };
+
+        if sink.is_active() {
+            sink.emit(
+                SemanticProgressEvent::SelectionDone,
+                SemanticProgressFields {
+                    last_conversation_id: Some(batch.last_conversation_id),
+                    last_message_id: prior_last_message_id,
+                    conversations_in_batch: Some(batch.conversations_in_batch),
+                    rows_total: Some(batch.total_conversations),
+                    ..Default::default()
+                },
+            );
+            // PacketReplay {start,progress,done} bracket the
+            // envelope/messages/packet build done by
+            // `fetch_canonical_embedding_batch`. We can't easily plumb
+            // a callback inside that helper without refactoring it, so
+            // the start/done bracket here straddles the work that
+            // already happened (replay always finishes before we see
+            // the result). A future refactor — flagged in the
+            // SQL-shape follow-up — can move the packet-replay work
+            // into a streaming iterator and emit `progress` ticks
+            // per conversation. For now, the bracket still gives
+            // operators a clear "we got past replay" signal.
+            sink.emit(
+                SemanticProgressEvent::PacketReplayStart,
+                SemanticProgressFields {
+                    conversations_in_batch: Some(batch.conversations_in_batch),
+                    ..Default::default()
+                },
+            );
+            sink.emit(
+                SemanticProgressEvent::PacketReplayProgress,
+                SemanticProgressFields {
+                    conversations_in_batch: Some(batch.conversations_in_batch),
+                    rows_processed: Some(batch.inputs.len() as u64),
+                    bytes: Some(batch.inputs.iter().map(|i| i.content.len() as u64).sum()),
+                    ..Default::default()
+                },
+            );
+            sink.emit(
+                SemanticProgressEvent::PacketReplayDone,
+                SemanticProgressFields {
+                    conversations_in_batch: Some(batch.conversations_in_batch),
+                    rows_processed: Some(batch.inputs.len() as u64),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Compute the freshest `last_message_id` from the inputs we are
+        // about to embed. EmbeddingInput.message_id is u64 (canonical
+        // message PK); we coerce to i64 since the manifest stores i64.
+        let batch_last_message_id = batch
+            .inputs
+            .iter()
+            .map(|input| i64::try_from(input.message_id).unwrap_or(i64::MAX))
+            .max();
+        let next_last_message_id = match (prior_last_message_id, batch_last_message_id) {
+            (Some(prior), Some(batch_max)) => Some(prior.max(batch_max)),
+            (Some(prior), None) => Some(prior),
+            (None, Some(batch_max)) => Some(batch_max),
+            (None, None) => None,
+        };
+
+        let outcome = self.run_backfill_batch_with_sink(
             &batch.inputs,
             data_dir,
             manifest,
@@ -1822,7 +2110,41 @@ impl SemanticIndexer {
                 conversations_in_batch: batch.conversations_in_batch,
                 last_offset: batch.last_conversation_id,
             },
-        )
+            next_last_message_id,
+            sink,
+        );
+
+        match &outcome {
+            Ok(o) => {
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::Complete,
+                        SemanticProgressFields {
+                            rows_processed: Some(o.conversations_processed),
+                            rows_total: Some(o.total_conversations),
+                            last_conversation_id: Some(o.last_offset),
+                            last_message_id: next_last_message_id,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            Err(err) => {
+                if sink.is_active() {
+                    sink.emit(
+                        SemanticProgressEvent::Error,
+                        SemanticProgressFields {
+                            error: Some(err.to_string()),
+                            last_conversation_id: Some(batch.last_conversation_id),
+                            last_message_id: next_last_message_id,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+
+        outcome
     }
 
     /// Build and save an HNSW index for approximate nearest neighbor search.

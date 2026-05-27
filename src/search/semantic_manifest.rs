@@ -41,7 +41,35 @@ use super::policy::{
 
 /// Current manifest format version.  Bump when the JSON schema changes in a
 /// backwards-incompatible way.
-pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+/// Manifest format version.
+///
+/// History:
+/// - **v1** (pre-cass#257): `BuildCheckpoint` resume cursor is the
+///   conversation offset only.
+/// - **v2** (cass#257 sub-fix 2): `BuildCheckpoint` may additionally
+///   carry `last_message_id`, an inclusive canonical message PK
+///   advanced by every batch. Resume strictly skips messages ≤ this
+///   cursor so an interrupted bounded run never re-embeds work it
+///   already staged. The new field is `Option<i64>` with
+///   `#[serde(default)]`, so the JSON-on-disk shape only differs when
+///   at least one batch persisted the cursor — a freshly-created
+///   manifest still parses cleanly under v1 readers.
+///
+/// **Compatibility:**
+/// - **Old binary reading v2 manifest:** clean `UnsupportedVersion`
+///   error from `load()`; operator sees a clear "manifest version
+///   $V is newer than max-supported $MAX" message and can upgrade.
+/// - **New binary reading v1 manifest:** loads fine. `last_message_id`
+///   defaults to `None`; resume falls back to the conversation offset
+///   with a one-shot warning that resume granularity is coarser than
+///   ideal until the next checkpoint save bumps the on-disk shape.
+pub const MANIFEST_FORMAT_VERSION: u32 = 2;
+
+/// Highest manifest-version emitted by pre-cass#257 binaries; loading
+/// this is fully supported, but resume granularity will be coarser
+/// until a fresh checkpoint is saved. Kept as a named constant so the
+/// fallback warning quotes a stable number.
+pub const MANIFEST_FORMAT_VERSION_PRE_LAST_MESSAGE_CURSOR: u32 = 1;
 
 /// Filename for the durable manifest.
 pub const MANIFEST_FILENAME: &str = "semantic_manifest.json";
@@ -564,6 +592,14 @@ impl SemanticShardManifest {
 // ─── Build checkpoint ──────────────────────────────────────────────────────
 
 /// Resumable position for an interrupted semantic build.
+///
+/// Sub-fix 2 for cass#257 added the optional `last_message_id` cursor.
+/// Resume strictly advances past this cursor when present, so that a
+/// rerun of an interrupted bounded backfill never re-embeds messages
+/// that already made it into the staged index. Pre-#257 binaries wrote
+/// checkpoints without the field (it deserializes to `None` via
+/// `#[serde(default)]`), and modern binaries fall back to the
+/// conversation offset when `last_message_id` is absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildCheckpoint {
     /// Which tier is being built.
@@ -586,6 +622,14 @@ pub struct BuildCheckpoint {
     pub chunking_version: u32,
     /// Unix timestamp (ms) when this checkpoint was saved.
     pub saved_at_ms: i64,
+    /// Highest canonical message PK embedded in this run so far.
+    ///
+    /// Added in cass#257 (sub-fix 2). `None` for checkpoints written
+    /// by pre-#257 binaries; new code falls back to `last_offset`
+    /// (conversation-granularity) when this is absent. New code
+    /// strictly resumes past this cursor when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id: Option<i64>,
 }
 
 impl BuildCheckpoint {
@@ -708,6 +752,13 @@ impl SemanticManifest {
 
     /// Load the manifest from disk.  Returns `None` if the file doesn't
     /// exist, `Err` if it exists but is corrupt.
+    ///
+    /// **Migration notes (cass#257 sub-fix 2):** a v1 manifest written
+    /// by a pre-#257 binary loads cleanly — `last_message_id` defaults
+    /// to `None` and resume falls back to the conversation offset.
+    /// A one-shot warning surfaces on first load so an operator sees
+    /// that resume granularity is coarser than ideal until the next
+    /// checkpoint save lands and the on-disk shape upgrades.
     pub fn load(data_dir: &Path) -> Result<Option<Self>, ManifestError> {
         let path = Self::path(data_dir);
         let bytes = match fs::read(&path) {
@@ -732,6 +783,25 @@ impl SemanticManifest {
                 found: manifest.manifest_version,
                 max_supported: MANIFEST_FORMAT_VERSION,
             });
+        }
+
+        // Backwards-compatible: a v1 manifest with an active checkpoint
+        // means a previous interrupted backfill saved without the
+        // `last_message_id` cursor. Warn so an operator monitoring an
+        // overnight run knows resume granularity is conversation-coarse
+        // until the next checkpoint save bumps the on-disk shape.
+        if manifest.manifest_version <= MANIFEST_FORMAT_VERSION_PRE_LAST_MESSAGE_CURSOR
+            && manifest
+                .checkpoint
+                .as_ref()
+                .is_some_and(|cp| cp.last_message_id.is_none())
+        {
+            tracing::warn!(
+                manifest_version = manifest.manifest_version,
+                supported_version = MANIFEST_FORMAT_VERSION,
+                path = %path.display(),
+                "semantic checkpoint manifest predates last_message_id cursor (cass#257 sub-fix 2); resume will fall back to conversation offset until the next checkpoint save"
+            );
         }
 
         Ok(Some(manifest))
@@ -1311,6 +1381,7 @@ mod tests {
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
             saved_at_ms: 1_700_000_030_000,
+            last_message_id: None,
         }
     }
 

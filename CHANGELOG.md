@@ -17,6 +17,16 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+### Quality semantic backfill hardening (cass#257)
+
+Three sub-fixes from @DanielsLoud's comprehensive [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257) proposal landed independently so they can be reverted in isolation if needed. The SQL-shape perf optimizations and batch-watchdog env vars from the same proposal are deferred to a follow-up issue until we have telemetry-driven thresholds.
+
+- **Progress JSONL sink for quality semantic backfill telemetry.** Setting `CASS_SEMANTIC_PROGRESS_JSONL=/abs/path/to/progress.jsonl` appends one JSON object per transition event during semantic backfill. 16 named events (`selection_{start,done}`, `packet_replay_{start,progress,done}`, `embed_batch_{start,done}`, `staging_write_{start,done}`, `checkpoint_save_{start,done}`, `publish_{start,done}`, `error`, `cancelled`, `complete`) carry a wall-clock timestamp, phase + sub-phase classification, batch/row counters, byte counts (so a stalled query is distinguishable from a stalled model), wall-time delta since the sink opened, and a cheap RSS estimate. The sink is silent when the env var is unset, so it has zero cost on the normal operator path. Best-effort writes — a failed write logs at debug and never crashes a backfill that would otherwise succeed.
+- **Per-message `last_message_id` checkpoint cursor with durable resume.** The semantic checkpoint manifest now persists the highest canonical message PK embedded in the most recent batch, in addition to the existing conversation offset. Resume strictly filters out messages with `id <= last_message_id`, so an interrupted bounded backfill never re-embeds messages already staged. The manifest format version bumped 1→2; pre-#257 binaries reading a v2 manifest get a clean `UnsupportedVersion` error, and post-#257 binaries reading a v1 manifest fall back to the conversation offset gracefully with a one-shot warning that resume granularity is coarser than ideal until the next checkpoint save.
+- **`cass status` quality-tier-aware reporting.** The status JSON now carries two additive fields: `semantic.quality_tier_published` (true when the quality vector index is published and matches the current DB fingerprint, independent of the fast/progressive stack) and `semantic.semantic_only_search_available` (true when at least one tier is queryable). Operators querying with `--mode semantic` against a quality-only published index no longer see the surface incorrectly reporting "building/unavailable" just because the progressive/hybrid stack hasn't been backfilled.
+
+Tests: `tests/cass_257_semantic_progress_jsonl.rs` (sub-fix 1, end-to-end against a fixture corpus), `tests/cass_257_checkpoint_last_message_id.rs` (sub-fix 2, write-kill-restart resume + forward-compat fallback), `tests/cass_257_status_quality_tier_aware.rs` (sub-fix 3, JSON-shape assertions against a quality-only fixture).
+
 ## [v0.6.3] -- 2026-05-27
 
 **Critical fixes: v0.6.2 startup panic / indexing-and-query stall (upstream frankensqlite regression) and Windows binary illegal-instruction on pre-AVX2 CPUs.**
