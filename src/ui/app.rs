@@ -15103,12 +15103,6 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
     }
 }
 
-fn sync_file_path(path: &Path) -> Result<(), String> {
-    std::fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| format!("failed syncing {}: {e}", path.display()))
-}
-
 #[cfg(not(windows))]
 fn sync_parent_directory(path: &Path) -> Result<(), String> {
     let Some(parent) = path.parent() else {
@@ -15149,17 +15143,41 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
     ))
 }
 
+fn write_persisted_state_temp_file(path: &Path, payload: &[u8]) -> Result<PathBuf, String> {
+    for _ in 0..100 {
+        let tmp_path = unique_atomic_temp_path(path);
+        match write_persisted_state_temp_file_at(&tmp_path, payload) {
+            Ok(()) => return Ok(tmp_path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("failed writing {}: {err}", tmp_path.display())),
+        }
+    }
+
+    Err(format!(
+        "failed to allocate unique TUI state temp path for {}",
+        path.display()
+    ))
+}
+
+fn write_persisted_state_temp_file_at(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()
+}
+
 fn save_persisted_state_to_path(path: &Path, state: &PersistedState) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed creating {}: {e}", parent.display()))?;
     }
-    let tmp_path = unique_atomic_temp_path(path);
     let payload = serde_json::to_vec_pretty(&persisted_state_file_from_state(state))
         .map_err(|e| format!("failed serializing state: {e}"))?;
-    std::fs::write(&tmp_path, payload)
-        .map_err(|e| format!("failed writing {}: {e}", tmp_path.display()))?;
-    sync_file_path(&tmp_path)?;
+    let tmp_path = write_persisted_state_temp_file(path, &payload)?;
     replace_file_from_temp(&tmp_path, path)?;
     Ok(())
 }
@@ -24865,6 +24883,35 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), final_path.parent());
         assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_temp_write_refuses_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let protected = tmp.path().join("protected-state.json");
+        let temp_path = tmp.path().join(".tui_state.json.tmp");
+
+        std::fs::write(&protected, b"protected").expect("write protected target");
+        symlink(&protected, &temp_path).expect("create temp symlink");
+
+        let err = write_persisted_state_temp_file_at(&temp_path, br#"{"version":1}"#)
+            .expect_err("existing temp symlink must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&protected).expect("read protected target"),
+            b"protected"
+        );
+        assert!(
+            std::fs::symlink_metadata(&temp_path)
+                .expect("temp path metadata")
+                .file_type()
+                .is_symlink(),
+            "failed temp write should leave the existing symlink untouched"
+        );
     }
 
     #[test]
