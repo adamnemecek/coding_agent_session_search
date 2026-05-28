@@ -1168,20 +1168,67 @@ impl std::fmt::Display for FtsMessagesIntegrityError {
 
 impl std::error::Error for FtsMessagesIntegrityError {}
 
+pub fn fts_messages_integrity_error_from_message(
+    source_error: impl Into<String>,
+) -> Option<FtsMessagesIntegrityError> {
+    let source_error = source_error.into();
+    let lower = source_error.to_ascii_lowercase();
+    if !lower.contains("fts_messages") {
+        return None;
+    }
+
+    let mentions_structural_fts_failure = lower.contains("shadow table")
+        || lower.contains("vtable constructor failed")
+        || lower.contains("sqlite_corrupt")
+        || lower.contains("databasecorrupt")
+        || lower.contains("database corrupt")
+        || lower.contains("missing required");
+    if !mentions_structural_fts_failure {
+        return None;
+    }
+
+    let missing_shadow_tables = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
+        .iter()
+        .copied()
+        .filter(|table| lower.contains(&table.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+
+    Some(FtsMessagesIntegrityError::new(
+        missing_shadow_tables,
+        Some(FTS_MESSAGES_INTEGRITY_PROBE_SQL),
+        Some(source_error),
+    ))
+}
+
+fn fts_schema_tolerates_missing_shadow_metadata(sql: &str) -> bool {
+    let normalized = sql
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized.contains("usingfts5(")
+        && normalized.contains("content=''")
+        && !normalized.contains("message_id")
+}
+
 pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) -> Result<()> {
-    let fts_schema_rows: i64 = conn
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+    let fts_schema_sql: Vec<String> = conn
+        .query_map_collect(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
             fparams![],
-            |row| row.get_typed(0),
+            |row: &FrankenRow| row.get_typed::<String>(0),
         )
         .with_context(|| "checking for fts_messages in sqlite_master")?;
-    if fts_schema_rows == 0 {
+    if fts_schema_sql.is_empty() {
         return Ok(());
     }
 
     let probe_error = conn.query(FTS_MESSAGES_INTEGRITY_PROBE_SQL).err();
-    if probe_error.is_none() {
+    if probe_error.is_none()
+        && fts_schema_sql
+            .iter()
+            .all(|sql| fts_schema_tolerates_missing_shadow_metadata(sql))
+    {
         return Ok(());
     }
 
@@ -24787,46 +24834,38 @@ mod tests {
     #[test]
     fn fts_messages_integrity_reports_missing_shadow_tables() {
         let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_corrupt_fts_missing_shadows.db");
+        let healthy_db_path = dir.path().join("healthy_fts.db");
 
         {
-            let storage = FrankenStorage::open(&db_path).unwrap();
+            let storage = FrankenStorage::open(&healthy_db_path).unwrap();
             storage.ensure_search_fallback_fts_consistency().unwrap();
             storage
                 .validate_fts_messages_integrity()
                 .expect("freshly materialized fts_messages should pass integrity validation");
         }
 
+        let corrupt_db_path = dir.path().join("test_corrupt_fts_missing_shadows.db");
         {
-            let conn = rusqlite_test_fixture_conn(&db_path);
+            let conn = rusqlite_test_fixture_conn(&corrupt_db_path);
+            conn.execute("CREATE TABLE schema_anchor(id INTEGER PRIMARY KEY)", [])
+                .unwrap();
+            let orphaned_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
             conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
             conn.execute(
-                "DELETE FROM sqlite_master
-                 WHERE name IN (
-                   'fts_messages_config',
-                   'fts_messages_content',
-                   'fts_messages_data',
-                   'fts_messages_docsize',
-                   'fts_messages_idx'
-                 )",
-                [],
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                [orphaned_fts_sql],
             )
             .unwrap();
             conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
         }
 
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        let err = storage
-            .validate_fts_messages_integrity()
-            .expect_err("missing FTS5 shadow tables must be reported as corruption");
-        let integrity = err
-            .downcast_ref::<FtsMessagesIntegrityError>()
-            .expect("error should preserve the typed FTS integrity kind");
-        assert_eq!(
-            integrity.missing_shadow_tables(),
-            &FTS_MESSAGES_REQUIRED_SHADOW_TABLES[..]
-        );
-        let rendered = err.to_string();
+        let open_err = FrankenConnection::open(corrupt_db_path.to_string_lossy().to_string())
+            .expect_err("orphaned fts_messages schema should fail during connection open");
+        let integrity = fts_messages_integrity_error_from_message(open_err.to_string())
+            .expect("open-time FTS corruption should map to the typed FTS integrity kind");
+        assert_eq!(integrity.missing_shadow_tables(), &["fts_messages_content"]);
+        let rendered = integrity.to_string();
         assert!(
             rendered.contains("fts_messages")
                 && rendered.contains("required FTS5 shadow tables")

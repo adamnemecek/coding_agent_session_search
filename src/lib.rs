@@ -14081,13 +14081,19 @@ fn open_franken_cli_read_db(
                 Err(raw_readonly_err) => {
                     let raw_readonly_retryable =
                         crate::storage::sqlite::retryable_franken_anyhow(&raw_readonly_err);
+                    let message = format!(
+                        "Failed to open {reason} database at {}: readonly storage open failed ({err}); raw readonly open failed ({raw_readonly_err})",
+                        path.display()
+                    );
+                    if let Some(fts_err) =
+                        crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
+                    {
+                        return Err(fts_messages_integrity_cli_error(reason, fts_err.into()));
+                    }
                     return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::DbOpen.kind_str(),
-                        message: format!(
-                            "Failed to open {reason} database at {}: readonly storage open failed ({err}); raw readonly open failed ({raw_readonly_err})",
-                            path.display()
-                        ),
+                        message,
                         hint: None,
                         retryable: readonly_retryable || raw_readonly_retryable,
                     });

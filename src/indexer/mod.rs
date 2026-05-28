@@ -12955,7 +12955,7 @@ fn open_storage_for_index(
             Err(err) => {
                 return Err(canonical_archive_unhealthy_for_index_error(
                     db_path,
-                    &format!("{err:#}"),
+                    &index_storage_open_error_reason(&err),
                 ));
             }
         }
@@ -12986,7 +12986,7 @@ fn open_storage_for_index(
             }
             Err(err) => Err(canonical_archive_unhealthy_for_index_error(
                 db_path,
-                &format!("{err:#}"),
+                &index_storage_open_error_reason(&err),
             )),
         }
     } else {
@@ -12994,6 +12994,13 @@ fn open_storage_for_index(
             .map(|storage| (storage, false, full_index))
             .with_context(|| format!("creating frankensqlite storage at {}", db_path.display()))
     }
+}
+
+fn index_storage_open_error_reason(err: &anyhow::Error) -> String {
+    let message = format!("{err:#}");
+    crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
+        .map(|fts_err| fts_err.to_string())
+        .unwrap_or(message)
 }
 
 fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
