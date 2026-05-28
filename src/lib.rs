@@ -15628,15 +15628,7 @@ fn state_meta_json_for_status(
     db_path: &Path,
     stale_threshold: u64,
 ) -> serde_json::Value {
-    state_meta_json_inner(
-        data_dir,
-        db_path,
-        stale_threshold,
-        true,
-        None,
-        false,
-        true,
-    )
+    state_meta_json_inner(data_dir, db_path, stale_threshold, true, None, false, true)
 }
 
 /// `coding_agent_session_search-d0rmo`: variant of `state_meta_json`
