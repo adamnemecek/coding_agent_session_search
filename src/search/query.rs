@@ -4842,15 +4842,66 @@ impl SearchClient {
             .as_ref()
             .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
 
-        let placeholder_capacity = results.len().saturating_mul(2).saturating_sub(1);
-        let mut placeholders = String::with_capacity(placeholder_capacity);
-        let mut params: Vec<ParamValue> = Vec::with_capacity(results.len());
-        for (idx, result) in results.iter().enumerate() {
-            if idx > 0 {
-                placeholders.push(',');
+        #[derive(Debug)]
+        struct MessageHydrationRow {
+            message_id: u64,
+            conversation_id: i64,
+            full_content: String,
+            msg_created_at: Option<i64>,
+            idx: Option<i64>,
+        }
+
+        #[derive(Debug)]
+        struct ConversationHydrationRow {
+            title: Option<String>,
+            source_path: String,
+            source_id: String,
+            origin_host: Option<String>,
+            agent: String,
+            workspace: Option<String>,
+            origin_kind: Option<String>,
+            started_at: Option<i64>,
+        }
+
+        let mut unique_message_ids = Vec::with_capacity(results.len());
+        let mut seen_message_ids = HashSet::with_capacity(results.len());
+        for result in results {
+            if seen_message_ids.insert(result.message_id) {
+                unique_message_ids.push(result.message_id);
             }
-            placeholders.push('?');
-            params.push(ParamValue::from(i64::try_from(result.message_id)?));
+        }
+
+        let message_placeholder_capacity =
+            unique_message_ids.len().saturating_mul(2).saturating_sub(1);
+        let mut message_placeholders = String::with_capacity(message_placeholder_capacity);
+        let mut message_params: Vec<ParamValue> = Vec::with_capacity(unique_message_ids.len());
+        for (idx, message_id) in unique_message_ids.iter().enumerate() {
+            if idx > 0 {
+                message_placeholders.push(',');
+            }
+            message_placeholders.push('?');
+            message_params.push(ParamValue::from(i64::try_from(*message_id)?));
+        }
+
+        let message_sql = format!(
+            "SELECT id, conversation_id, content, created_at, idx
+             FROM messages
+             WHERE id IN ({message_placeholders})"
+        );
+
+        let message_rows: Vec<MessageHydrationRow> =
+            conn.query_map_collect(&message_sql, &message_params, |row: &frankensqlite::Row| {
+                let message_id: i64 = row.get_typed(0)?;
+                Ok(MessageHydrationRow {
+                    message_id: semantic_message_id_from_db(message_id)?,
+                    conversation_id: row.get_typed(1)?,
+                    full_content: row.get_typed(2)?,
+                    msg_created_at: row.get_typed(3)?,
+                    idx: row.get_typed(4)?,
+                })
+            })?;
+        if message_rows.is_empty() {
+            return Ok(Vec::new());
         }
 
         let title_expr = if field_mask.wants_title() {
@@ -4860,89 +4911,126 @@ impl SearchClient {
         };
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+        let mut conversation_ids = Vec::with_capacity(message_rows.len());
+        let mut seen_conversation_ids = HashSet::with_capacity(message_rows.len());
+        for row in &message_rows {
+            if seen_conversation_ids.insert(row.conversation_id) {
+                conversation_ids.push(row.conversation_id);
+            }
+        }
+        let conversation_placeholder_capacity =
+            conversation_ids.len().saturating_mul(2).saturating_sub(1);
+        let mut conversation_placeholders =
+            String::with_capacity(conversation_placeholder_capacity);
+        let mut conversation_params: Vec<ParamValue> = Vec::with_capacity(conversation_ids.len());
+        for (idx, conversation_id) in conversation_ids.iter().enumerate() {
+            if idx > 0 {
+                conversation_placeholders.push(',');
+            }
+            conversation_placeholders.push('?');
+            conversation_params.push(ParamValue::from(*conversation_id));
+        }
         // LEFT JOIN + COALESCE on agents so search hits for conversations
         // with NULL agent_id (legacy V1 schema) still surface instead of
         // being silently dropped from results.  Consistent with the fts/
         // lexical rebuild paths (8a0c547c, e1c08e7c).
         let sql = format!(
-            "SELECT m.id, c.id, m.content, m.created_at, m.idx, m.role, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
+            "SELECT c.id, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
+             FROM conversations c
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
-             WHERE m.id IN ({placeholders})"
+             WHERE c.id IN ({conversation_placeholders})"
         );
 
-        let rows: Vec<(u64, SearchHit)> =
-            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
-                let message_id: i64 = row.get_typed(0)?;
-                let conversation_id: i64 = row.get_typed(1)?;
-                let full_content: String = row.get_typed(2)?;
-                let msg_created_at: Option<i64> = row.get_typed(3)?;
-                let idx: Option<i64> = row.get_typed(4)?;
+        let conversation_rows: Vec<(i64, ConversationHydrationRow)> =
+            conn.query_map_collect(&sql, &conversation_params, |row: &frankensqlite::Row| {
+                let conversation_id: i64 = row.get_typed(0)?;
                 let title: Option<String> = if field_mask.wants_title() {
-                    row.get_typed(6)?
+                    row.get_typed(1)?
                 } else {
                     None
                 };
-                let source_path: String = row.get_typed(7)?;
-                let raw_source_id: String = row.get_typed(8)?;
-                let origin_host: Option<String> = row.get_typed(9)?;
-                let agent: String = row.get_typed(10)?;
-                let workspace: Option<String> = row.get_typed(11)?;
-                let raw_origin_kind: Option<String> = row.get_typed(12)?;
-                let started_at: Option<i64> = row.get_typed(13)?;
+                Ok((
+                    conversation_id,
+                    ConversationHydrationRow {
+                        title,
+                        source_path: row.get_typed(2)?,
+                        source_id: row.get_typed(3)?,
+                        origin_host: row.get_typed(4)?,
+                        agent: row.get_typed(5)?,
+                        workspace: row.get_typed(6)?,
+                        origin_kind: row.get_typed(7)?,
+                        started_at: row.get_typed(8)?,
+                    },
+                ))
+            })?;
 
-                let created_at = msg_created_at.or(started_at);
-                let line_number = idx
+        let conversations_by_id: HashMap<i64, ConversationHydrationRow> =
+            conversation_rows.into_iter().collect();
+
+        let rows: Vec<(u64, SearchHit)> = message_rows
+            .into_iter()
+            .filter_map(|message| {
+                let conversation = conversations_by_id.get(&message.conversation_id)?;
+
+                let created_at = message.msg_created_at.or(conversation.started_at);
+                let line_number = message
+                    .idx
                     .and_then(|i| usize::try_from(i).ok())
                     .map(|i| i.saturating_add(1));
                 let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&full_content)
+                    snippet_from_content(&message.full_content)
                 } else {
                     String::new()
                 };
                 let content = if field_mask.needs_content() {
-                    full_content.clone()
+                    message.full_content.clone()
                 } else {
                     String::new()
                 };
-                let content_hash =
-                    stable_hit_hash(&full_content, &source_path, line_number, created_at);
-                let source_id = normalized_search_hit_source_id_parts(
-                    raw_source_id.as_str(),
-                    raw_origin_kind.as_deref().unwrap_or_default(),
-                    origin_host.as_deref(),
+                let content_hash = stable_hit_hash(
+                    &message.full_content,
+                    &conversation.source_path,
+                    line_number,
+                    created_at,
                 );
-                let origin_kind =
-                    normalized_search_hit_origin_kind(&source_id, raw_origin_kind.as_deref());
+                let source_id = normalized_search_hit_source_id_parts(
+                    conversation.source_id.as_str(),
+                    conversation.origin_kind.as_deref().unwrap_or_default(),
+                    conversation.origin_host.as_deref(),
+                );
+                let origin_kind = normalized_search_hit_origin_kind(
+                    &source_id,
+                    conversation.origin_kind.as_deref(),
+                );
 
                 let hit = SearchHit {
                     title: if field_mask.wants_title() {
-                        title.unwrap_or_default()
+                        conversation.title.clone().unwrap_or_default()
                     } else {
                         String::new()
                     },
                     snippet,
                     content,
                     content_hash,
-                    conversation_id: Some(conversation_id),
+                    conversation_id: Some(message.conversation_id),
                     score: 0.0,
-                    source_path,
-                    agent,
-                    workspace: workspace.unwrap_or_default(),
+                    source_path: conversation.source_path.clone(),
+                    agent: conversation.agent.clone(),
+                    workspace: conversation.workspace.clone().unwrap_or_default(),
                     workspace_original: None,
                     created_at,
                     line_number,
                     match_type: MatchType::Exact,
                     source_id,
                     origin_kind,
-                    origin_host,
+                    origin_host: conversation.origin_host.clone(),
                 };
 
-                Ok((semantic_message_id_from_db(message_id)?, hit))
-            })?;
+                Some((message.message_id, hit))
+            })
+            .collect();
 
         let mut hits_by_id = HashMap::new();
         for (id, hit) in rows {
