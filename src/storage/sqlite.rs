@@ -2386,17 +2386,87 @@ fn record_historical_bundle_import(
     Ok(())
 }
 
+fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Result<()> {
+    let status = Command::new("sqlite3")
+        .arg("-batch")
+        .arg(staged_db_path)
+        .arg(
+            "PRAGMA writable_schema = ON;
+             DELETE FROM sqlite_master
+              WHERE name = 'fts_messages'
+                 OR tbl_name = 'fts_messages'
+                 OR name IN (
+                    'fts_messages_config',
+                    'fts_messages_content',
+                    'fts_messages_data',
+                    'fts_messages_docsize',
+                    'fts_messages_idx'
+                 )
+                 OR tbl_name IN (
+                    'fts_messages_config',
+                    'fts_messages_content',
+                    'fts_messages_data',
+                    'fts_messages_docsize',
+                    'fts_messages_idx'
+                 );
+             PRAGMA writable_schema = OFF;",
+        )
+        .status()
+        .with_context(|| {
+            format!(
+                "running sqlite3 staged FTS metadata scrub for {}",
+                staged_db_path.display()
+            )
+        })?;
+    if !status.success() {
+        anyhow::bail!(
+            "sqlite3 staged FTS metadata scrub exited with status {} for {}",
+            status,
+            staged_db_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_seeded_canonical_fts_consistency(staged_db_path: &Path) -> Result<FtsConsistencyRepair> {
+    match ensure_fts_consistency_via_rusqlite(staged_db_path) {
+        Ok(repair) => Ok(repair),
+        Err(err) => {
+            if fts_messages_integrity_error_from_message(format!("{err:#}")).is_none() {
+                return Err(err).with_context(|| {
+                    format!(
+                        "repairing staged canonical FTS consistency before finalization: {}",
+                        staged_db_path.display()
+                    )
+                });
+            }
+
+            tracing::warn!(
+                path = %staged_db_path.display(),
+                error = %err,
+                "staged historical seed has malformed derived FTS metadata; scrubbing and rebuilding FTS on staged copy"
+            );
+            scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path).with_context(|| {
+                format!(
+                    "scrubbing malformed staged FTS metadata before finalization: {}",
+                    staged_db_path.display()
+                )
+            })?;
+            ensure_fts_consistency_via_rusqlite(staged_db_path).with_context(|| {
+                format!(
+                    "repairing staged canonical FTS consistency after metadata scrub: {}",
+                    staged_db_path.display()
+                )
+            })
+        }
+    }
+}
+
 fn finalize_seeded_canonical_bundle_via_rusqlite(
     canonical_db_path: &Path,
     bundle: &HistoricalDatabaseBundle,
 ) -> Result<(usize, usize)> {
-    let _fts_repair =
-        ensure_fts_consistency_via_rusqlite(canonical_db_path).with_context(|| {
-            format!(
-                "repairing staged canonical FTS consistency before finalization: {}",
-                canonical_db_path.display()
-            )
-        })?;
+    let _fts_repair = ensure_seeded_canonical_fts_consistency(canonical_db_path)?;
 
     let path_str = canonical_db_path.to_string_lossy();
     let conn = FrankenConnection::open(path_str.as_ref()).with_context(|| {
