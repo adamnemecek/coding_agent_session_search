@@ -2389,9 +2389,7 @@ fn record_historical_bundle_import(
 fn finalize_seeded_canonical_bundle_via_rusqlite(
     canonical_db_path: &Path,
     bundle: &HistoricalDatabaseBundle,
-    conversations_imported: usize,
-    messages_imported: usize,
-) -> Result<()> {
+) -> Result<(usize, usize)> {
     let _fts_repair =
         ensure_fts_consistency_via_rusqlite(canonical_db_path).with_context(|| {
             format!(
@@ -2426,6 +2424,7 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
     }
 
     clear_seeded_runtime_meta(&conn)?;
+    let (conversations_imported, messages_imported) = historical_bundle_counts(&conn)?;
 
     conn.execute_compat(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
@@ -2443,7 +2442,7 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
         conversations_imported,
         messages_imported,
     )?;
-    Ok(())
+    Ok((conversations_imported, messages_imported))
 }
 
 fn read_meta_schema_version(conn: &FrankenConnection) -> Result<Option<i64>> {
@@ -2561,6 +2560,17 @@ fn stage_historical_bundle_for_seed(
     })
 }
 
+fn stage_and_finalize_historical_seed(
+    canonical_db_path: &Path,
+    bundle: &HistoricalDatabaseBundle,
+    source_root_path: &Path,
+) -> Result<(StagedHistoricalSeed, usize, usize)> {
+    let staged_seed = stage_historical_bundle_for_seed(canonical_db_path, source_root_path)?;
+    let (conversations_imported, messages_imported) =
+        finalize_seeded_canonical_bundle_via_rusqlite(&staged_seed.db_path, bundle)?;
+    Ok((staged_seed, conversations_imported, messages_imported))
+}
+
 fn promote_staged_historical_seed(
     canonical_db_path: &Path,
     staged_seed: &StagedHistoricalSeed,
@@ -2622,40 +2632,61 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
             continue;
         }
 
-        let source = open_historical_bundle_for_salvage(&bundle).with_context(|| {
-            format!(
-                "opening historical seed bundle {} for baseline import",
+        let (staged_seed, conversations_imported, messages_imported) =
+            match stage_and_finalize_historical_seed(canonical_db_path, &bundle, &bundle.root_path)
+            {
+                Ok(result) => result,
+                Err(primary_err) => {
+                    tracing::warn!(
+                        path = %bundle.root_path.display(),
+                        error = %primary_err,
+                        "direct bulk baseline seed from historical bundle failed; trying sqlite3 salvage copy"
+                    );
+                    let source = match open_historical_bundle_for_salvage(&bundle).with_context(
+                        || {
+                            format!(
+                                "opening historical seed bundle {} for baseline import",
+                                bundle.root_path.display()
+                            )
+                        },
+                    ) {
+                        Ok(source) => source,
+                        Err(salvage_err) => {
+                            last_seed_error = Some(anyhow!(
+                                "direct baseline seed from {} failed: {primary_err:#}; sqlite3 salvage open also failed: {salvage_err:#}",
+                                bundle.root_path.display()
+                            ));
+                            continue;
+                        }
+                    };
+                    match stage_and_finalize_historical_seed(
+                        canonical_db_path,
+                        &bundle,
+                        &source.root_path,
+                    ) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            tracing::warn!(
+                                path = %bundle.root_path.display(),
+                                source_path = %source.root_path.display(),
+                                error = %err,
+                                "bulk baseline seed staging from sqlite3-salvaged historical bundle failed; trying next candidate"
+                            );
+                            last_seed_error = Some(err);
+                            continue;
+                        }
+                    }
+                }
+            };
+
+        if conversations_imported == 0 && messages_imported == 0 {
+            let err = anyhow!(
+                "historical bundle {} has no core rows for baseline import",
                 bundle.root_path.display()
-            )
-        })?;
-        let (conversations_imported, messages_imported) = historical_bundle_counts(&source.conn)?;
-
-        let staged_seed = match stage_historical_bundle_for_seed(
-            canonical_db_path,
-            &source.root_path,
-        ) {
-            Ok(staged_seed) => staged_seed,
-            Err(err) => {
-                tracing::warn!(
-                    path = %bundle.root_path.display(),
-                    error = %err,
-                    "bulk baseline seed staging from historical bundle failed; trying next candidate"
-                );
-                last_seed_error = Some(err);
-                continue;
-            }
-        };
-
-        if let Err(err) = finalize_seeded_canonical_bundle_via_rusqlite(
-            &staged_seed.db_path,
-            &bundle,
-            conversations_imported,
-            messages_imported,
-        ) {
+            );
             tracing::warn!(
                 path = %bundle.root_path.display(),
-                error = %err,
-                "finalizing staged historical seed import failed; trying next candidate"
+                "historical bundle has no core rows for baseline seed import"
             );
             last_seed_error = Some(err);
             continue;
