@@ -2084,15 +2084,34 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn real_system_choose_method_returns_some() {
+    fn real_system_choose_method_respects_live_capabilities() {
         let sys = local_system_info();
         let res = local_resource_info();
-        // This system should have at least curl or cargo, so a method should exist
+
         let installer = RemoteInstaller::new("localhost", sys, res);
+        let compile_safe = installer.can_compile().is_ok();
+        let source_install_possible = compile_safe
+            && ((installer.system_info.has_cargo_binstall
+                && installer.prebuilt_binary_fast_path_is_safe())
+                || installer.system_info.has_cargo
+                || installer.system_info.has_curl);
         let method = installer.choose_method();
+        let method_matches_live_capabilities = if source_install_possible {
+            method.is_some()
+        } else {
+            method.is_none()
+                || matches!(
+                    method,
+                    Some(InstallMethod::PrebuiltBinary {
+                        checksum: Some(_),
+                        ..
+                    })
+                )
+        };
+
         assert!(
-            method.is_some(),
-            "real system should have at least one install method"
+            method_matches_live_capabilities,
+            "real system selected an unexpected install method: source_install_possible={source_install_possible}, method={method:?}"
         );
     }
 
