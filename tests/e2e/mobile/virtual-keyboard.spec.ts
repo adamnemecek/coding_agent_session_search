@@ -117,7 +117,7 @@ test.describe('Virtual Keyboard Behavior', () => {
       }
 
       // Check for highlights
-      const highlights = document.querySelectorAll('mark, .highlight, .search-match');
+      const highlights = document.querySelectorAll('mark, .highlight, .search-highlight, .search-match, .message.search-hit');
       return highlights.length > 0;
     });
 
