@@ -34,13 +34,27 @@ use std::time::Duration;
 use walkdir::WalkDir;
 
 /// Build a `cass` binary invocation with the env knobs required for
-/// deterministic test output (no update check, no ambient data-dir surprise).
+/// deterministic test output (no update check, no ambient data-dir or CWD
+/// connector-discovery surprise).
 fn cass_cmd(test_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    let codex_home = test_home.join(".codex");
+    let claude_home = test_home.join(".claude");
+    let gemini_home = test_home.join(".gemini");
+    let opencode_root = test_home.join(".opencode");
+    let aider_root = test_home.join(".aider-missing");
+    let xdg_config_home = test_home.join(".config");
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .current_dir(test_home)
         // Pin data dir so the test never touches the user's real cache.
         .env("XDG_DATA_HOME", test_home)
+        .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("HOME", test_home)
+        .env("CODEX_HOME", codex_home)
+        .env("CLAUDE_HOME", claude_home)
+        .env("GEMINI_HOME", gemini_home)
+        .env("OPENCODE_STORAGE_ROOT", opencode_root)
+        .env("CASS_AIDER_DATA_ROOT", aider_root)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Keep resource-policy goldens stable across hosts; dynamic default
         // scaling is covered by responsiveness unit tests.

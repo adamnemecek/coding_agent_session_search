@@ -27963,7 +27963,10 @@ fn doctor_forensic_bundle_id(operation_id: &str, created_at_ms: i64) -> String {
 }
 
 fn doctor_forensic_relative_path_is_safe(relative_path: &Path) -> bool {
-    !relative_path.as_os_str().is_empty()
+    let raw = relative_path.as_os_str().to_string_lossy();
+    !raw.is_empty()
+        && !raw.contains('\\')
+        && !raw.contains(':')
         && !relative_path.is_absolute()
         && relative_path.components().all(|component| match component {
             std::path::Component::Normal(name) => doctor_portable_relative_component_is_safe(name),
