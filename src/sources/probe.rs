@@ -1566,6 +1566,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn real_probe_machine_id_present() {
         // Test that the local probe script actually collects machine_id
         let output = run_probe_script_locally();

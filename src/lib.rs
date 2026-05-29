@@ -18945,15 +18945,25 @@ mod search_lexical_self_heal_tests {
             .open(&lock_path)
             .expect("open index-run lock");
         fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold active index-run lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+        let metadata = format!(
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
             std::process::id(),
             1_733_000_111_000_i64,
             db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        );
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            lock_file.set_len(0).expect("truncate index-run lock");
+            lock_file
+                .seek(SeekFrom::Start(0))
+                .expect("rewind index-run lock");
+            lock_file
+                .write_all(metadata.as_bytes())
+                .expect("write index-run lock metadata");
+            lock_file.flush().expect("flush index-run lock metadata");
+        }
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(&lock_path, &metadata)
+            .expect("write index-run lock metadata sidecar");
         lock_file
     }
 
@@ -27826,12 +27836,16 @@ fn doctor_canonical_blake3(prefix: &str, value: serde_json::Value) -> String {
 }
 
 fn doctor_redacted_path(path: &str, data_dir: &Path) -> String {
+    fn portable_display(path: &Path) -> String {
+        path.display().to_string().replace('\\', "/")
+    }
+
     let path_ref = Path::new(path);
     if let Ok(relative) = path_ref.strip_prefix(data_dir) {
         if relative.as_os_str().is_empty() {
             return "[cass-data]".to_string();
         }
-        return format!("[cass-data]/{}", relative.display());
+        return format!("[cass-data]/{}", portable_display(relative));
     }
     path_ref
         .file_name()
@@ -27949,7 +27963,9 @@ fn doctor_forensic_bundle_id(operation_id: &str, created_at_ms: i64) -> String {
 }
 
 fn doctor_forensic_relative_path_is_safe(relative_path: &Path) -> bool {
-    !relative_path.as_os_str().is_empty()
+    let raw = relative_path.as_os_str().to_string_lossy();
+    !raw.contains('\\')
+        && !relative_path.as_os_str().is_empty()
         && !relative_path.is_absolute()
         && relative_path.components().all(|component| match component {
             std::path::Component::Normal(name) => doctor_portable_relative_component_is_safe(name),
@@ -54738,16 +54754,19 @@ mod doctor_asset_taxonomy_tests {
             .open(&lock_path)
             .expect("open lock file");
         fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path={}\nmode=index\njob_id=lexical-refresh-test\njob_kind=lexical_refresh\nphase=rebuilding",
+        let metadata = format!(
+            "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path={}\nmode=index\njob_id=lexical-refresh-test\njob_kind=lexical_refresh\nphase=rebuilding\n",
             std::process::id(),
             1_733_001_111_000_i64,
             1_733_001_112_000_i64,
             db_path.display()
-        )
-        .expect("write lock metadata");
+        );
+        lock_file
+            .write_all(metadata.as_bytes())
+            .expect("write lock metadata");
         lock_file.flush().expect("flush lock metadata");
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(&lock_path, &metadata)
+            .expect("write lock metadata sidecar");
 
         let snapshot = probe_index_run_lock(data_dir, &db_path);
         let doctor_lock = DoctorMutationLockObservation::Absent {
@@ -65814,6 +65833,21 @@ mod cli_read_db_tests {
         (temp, db_path)
     }
 
+    fn write_index_lock_metadata(lock_path: &Path, lock_file: &mut std::fs::File, metadata: &str) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        lock_file.set_len(0).expect("truncate index lock metadata");
+        lock_file
+            .seek(SeekFrom::Start(0))
+            .expect("rewind index lock metadata");
+        lock_file
+            .write_all(metadata.as_bytes())
+            .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(lock_path, metadata)
+            .expect("write lock metadata sidecar");
+    }
+
     #[test]
     fn analytics_db_open_is_readonly() {
         let (temp, _db_path) = seed_cli_db();
@@ -66368,15 +66402,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         let runtime = &state["rebuild"]["pipeline"]["runtime"];
@@ -66486,15 +66521,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -66544,15 +66580,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -66610,15 +66647,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
@@ -66647,18 +66685,16 @@ mod cli_read_db_tests {
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}
-started_at_ms={}
-db_path={}
-mode=index",
-            std::process::id(),
-            1_733_000_556_000_i64,
-            db_path_variant.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_556_000_i64,
+                db_path_variant.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -66684,18 +66720,16 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}
-started_at_ms={}
-db_path={}
-mode=index",
-            std::process::id(),
-            1_733_000_557_000_i64,
-            db_path_variant.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_557_000_i64,
+                db_path_variant.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["exists"].as_bool(), Some(false));
@@ -66723,16 +66757,15 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}
-started_at_ms={}
-mode=index",
-            std::process::id(),
-            1_733_000_558_000_i64
-        )
-        .expect("write legacy lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_558_000_i64
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -66782,15 +66815,16 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
-            std::process::id(),
-            1_733_000_555_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
+                std::process::id(),
+                1_733_000_555_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
@@ -66822,15 +66856,16 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=watch",
-            std::process::id(),
-            1_733_000_777_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=watch\n",
+                std::process::id(),
+                1_733_000_777_000_i64,
+                db_path.display()
+            ),
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["pending"]["watch_active"].as_bool(), Some(true));
@@ -66902,22 +66937,23 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            concat!(
-                "pid={}\n",
-                "started_at_ms={}\n",
-                "updated_at_ms={}\n",
-                "db_path={}\n",
-                "mode=index\n"
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                concat!(
+                    "pid={}\n",
+                    "started_at_ms={}\n",
+                    "updated_at_ms={}\n",
+                    "db_path={}\n",
+                    "mode=index\n"
+                ),
+                std::process::id(),
+                1_733_000_555_000_i64,
+                1_733_000_666_000_i64,
+                db_path.display()
             ),
-            std::process::id(),
-            1_733_000_555_000_i64,
-            1_733_000_666_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        );
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["status"].as_str(), Some("error"));
@@ -67017,15 +67053,16 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}",
-            pid,
-            1_733_001_111_000_i64,
-            db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\n",
+                pid,
+                1_733_001_111_000_i64,
+                db_path.display()
+            ),
+        );
 
         let details =
             active_index_run_details(temp.path(), &db_path).expect("matching active index run");
@@ -67053,15 +67090,16 @@ mode=index",
             .open(&lock_path)
             .expect("open lock file");
         lock_file.try_lock_exclusive().expect("hold index lock");
-        writeln!(
-            lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}",
-            pid,
-            1_733_001_222_000_i64,
-            other_db_path.display()
-        )
-        .expect("write lock metadata");
-        lock_file.flush().expect("flush lock metadata");
+        write_index_lock_metadata(
+            &lock_path,
+            &mut lock_file,
+            &format!(
+                "pid={}\nstarted_at_ms={}\ndb_path={}\n",
+                pid,
+                1_733_001_222_000_i64,
+                other_db_path.display()
+            ),
+        );
 
         let details = active_index_run_details(temp.path(), &db_path)
             .expect("active lock in same data dir should still be reported");
@@ -78188,7 +78226,7 @@ fn parse_followup_jsonl_messages(
 
 fn infer_followup_agent_and_workspace(path: &Path) -> (Option<String>, Option<String>) {
     let path_str = path.to_string_lossy();
-    let path_lower = path_str.to_ascii_lowercase();
+    let path_lower = path_str.to_ascii_lowercase().replace('\\', "/");
 
     let agent_name = [
         (".local/share/opencode", "opencode"),

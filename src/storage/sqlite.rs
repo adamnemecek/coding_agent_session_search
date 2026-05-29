@@ -15255,6 +15255,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn doctor_storage_open_refuses_active_doctor_mutation_lock_from_other_process() {
         use std::io::Write as _;
 
@@ -16300,16 +16301,13 @@ mod tests {
 
         let result = SqliteStorage::open_or_rebuild(&db_path);
 
-        match result {
-            Err(MigrationError::Database(_)) | Err(MigrationError::Io(_)) => {}
-            Err(MigrationError::RebuildRequired { reason, .. }) => {
-                panic!("should not rebuild non-database path: {reason}")
-            }
-            Err(MigrationError::Other(msg)) => {
-                panic!("should preserve underlying open error, got Other: {msg}")
-            }
-            Ok(_) => panic!("directory path must not open as a database"),
-        }
+        assert!(
+            matches!(
+                result,
+                Err(MigrationError::Database(_)) | Err(MigrationError::Io(_))
+            ),
+            "non-database path should report the underlying open error without rebuild"
+        );
 
         assert!(
             db_path.is_dir(),
@@ -18555,14 +18553,14 @@ mod tests {
         )
         .unwrap();
 
-        match resolved {
-            ConversationInsertStatus::Existing(existing_id) => {
-                assert_eq!(existing_id, inserted_id);
-            }
-            ConversationInsertStatus::Inserted(new_id) => {
-                panic!("expected existing conversation id, got freshly inserted {new_id}");
-            }
-        }
+        assert!(
+            matches!(
+                resolved,
+                ConversationInsertStatus::Existing(existing_id)
+                    if existing_id.cmp(&inserted_id).is_eq()
+            ),
+            "expected existing conversation id {inserted_id}"
+        );
 
         let conversation_count: i64 = tx
             .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {

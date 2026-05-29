@@ -1674,11 +1674,17 @@ fn set_private_create_file_mode(options: &mut OpenOptions) {
 fn set_private_create_file_mode(_options: &mut OpenOptions) {}
 
 fn sync_file(path: &Path) -> Result<()> {
-    File::open(path)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    options
+        .open(path)
         .and_then(|file| file.sync_all())
         .with_context(|| format!("sync raw mirror file {}", path.display()))
 }
 
+#[cfg(not(windows))]
 fn sync_parent(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -1686,6 +1692,11 @@ fn sync_parent(path: &Path) -> Result<()> {
     File::open(parent)
         .and_then(|file| file.sync_all())
         .with_context(|| format!("sync raw mirror parent {}", parent.display()))
+}
+
+#[cfg(windows)]
+fn sync_parent(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn unique_temp_path(dir: &Path, label: &str) -> PathBuf {

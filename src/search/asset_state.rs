@@ -10,7 +10,7 @@
 //! for repair/acquisition work and never duplicate basic maintenance jobs.
 
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,93 @@ pub(crate) struct SearchMaintenanceSnapshot {
     pub orphaned: bool,
 }
 
+pub(crate) fn index_run_lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("index-run.lock")
+}
+
+pub(crate) fn index_run_lock_metadata_sidecar_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_file_name("index-run.lock.meta")
+}
+
+pub(crate) fn write_index_run_lock_metadata_sidecar(
+    lock_path: &Path,
+    contents: &str,
+) -> Result<()> {
+    let sidecar_path = index_run_lock_metadata_sidecar_path(lock_path);
+    let mut sidecar = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&sidecar_path)
+        .with_context(|| {
+            format!(
+                "opening index-run lock metadata sidecar {}",
+                sidecar_path.display()
+            )
+        })?;
+    sidecar.write_all(contents.as_bytes()).with_context(|| {
+        format!(
+            "writing index-run lock metadata sidecar {}",
+            sidecar_path.display()
+        )
+    })?;
+    sidecar.flush().with_context(|| {
+        format!(
+            "flushing index-run lock metadata sidecar {}",
+            sidecar_path.display()
+        )
+    })?;
+    sidecar.sync_all().with_context(|| {
+        format!(
+            "syncing index-run lock metadata sidecar {}",
+            sidecar_path.display()
+        )
+    })
+}
+
+pub(crate) fn clear_index_run_lock_metadata_sidecar(lock_path: &Path) -> Result<()> {
+    let sidecar_path = index_run_lock_metadata_sidecar_path(lock_path);
+    let sidecar = match OpenOptions::new()
+        .truncate(true)
+        .write(true)
+        .open(&sidecar_path)
+    {
+        Ok(sidecar) => sidecar,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "opening index-run lock metadata sidecar {}",
+                    sidecar_path.display()
+                )
+            });
+        }
+    };
+    sidecar.sync_all().with_context(|| {
+        format!(
+            "syncing cleared index-run lock metadata sidecar {}",
+            sidecar_path.display()
+        )
+    })
+}
+
+fn read_capped_metadata_from_path(path: &Path, max_len: u64) -> std::io::Result<String> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let mut raw = String::new();
+    (&file).take(max_len).read_to_string(&mut raw)?;
+    Ok(raw)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_lock_conflict(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn windows_lock_conflict(_err: &std::io::Error) -> bool {
+    false
+}
+
 pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMaintenanceSnapshot {
     // Real index-run.lock files written by `acquire_index_run_lock`
     // have a fixed key=value shape under ~1 KiB. Cap the read at 64 KiB
@@ -121,15 +208,113 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
     // allocate arbitrary memory just to inspect its metadata.
     const MAX_LOCK_FILE_READ: u64 = 64 * 1024;
 
-    let lock_path = data_dir.join("index-run.lock");
+    let lock_path = index_run_lock_path(data_dir);
+    let sidecar_path = index_run_lock_metadata_sidecar_path(&lock_path);
     let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
         Ok(file) => file,
+        Err(err) if windows_lock_conflict(&err) => {
+            let raw = read_capped_metadata_from_path(&sidecar_path, MAX_LOCK_FILE_READ)
+                .unwrap_or_default();
+            return parse_search_maintenance_snapshot(raw, true);
+        }
         Err(_) => return SearchMaintenanceSnapshot::default(),
     };
 
     let mut raw = String::new();
-    let _ = (&file).take(MAX_LOCK_FILE_READ).read_to_string(&mut raw);
+    let mut read_blocked_by_lock = false;
+    if let Err(err) = (&file).take(MAX_LOCK_FILE_READ).read_to_string(&mut raw)
+        && windows_lock_conflict(&err)
+    {
+        read_blocked_by_lock = true;
+    }
+    if raw.trim().is_empty() {
+        raw = read_capped_metadata_from_path(&sidecar_path, MAX_LOCK_FILE_READ).unwrap_or_default();
+    }
 
+    let mut snapshot = parse_search_maintenance_snapshot(raw, read_blocked_by_lock);
+    if read_blocked_by_lock {
+        return snapshot;
+    }
+
+    let metadata_present = snapshot.pid.is_some()
+        || snapshot.started_at_ms.is_some()
+        || snapshot.db_path.is_some()
+        || snapshot.mode.is_some()
+        || snapshot.job_id.is_some()
+        || snapshot.job_kind.is_some()
+        || snapshot.phase.is_some()
+        || snapshot.updated_at_ms.is_some()
+        || snapshot.last_progress_at_ms.is_some();
+
+    #[cfg(windows)]
+    let current_process_owns_recorded_lock =
+        metadata_present && snapshot.pid == Some(std::process::id());
+    #[cfg(not(windows))]
+    let current_process_owns_recorded_lock = false;
+
+    snapshot.active = if current_process_owns_recorded_lock {
+        true
+    } else {
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                // We acquired the exclusive lock with no waiting, which is
+                // proof that no process holds it. POSIX flock (via fs2) is
+                // released automatically when the owning file description
+                // is closed — either explicitly on graceful drop, or by the
+                // kernel on process exit / crash. Therefore, if the file
+                // contains metadata but no holder is present, the previous
+                // owner is gone.
+                //
+                // Historically this produced a permanent `orphaned: true`
+                // state that callers (notably the TUI) interpreted as
+                // "rebuild in progress, keep polling" — yielding a tight
+                // CPU-bound loop that only cleared when the user manually
+                // deleted the lock file (see issue #176).
+                //
+                // Reap the stale metadata in place while we hold the lock,
+                // so that this and every subsequent reader observes a
+                // clean state.
+                //
+                // We deliberately do NOT gate this on a `kill(pid, 0)`
+                // liveness probe. Under PID reuse (the recorded pid is
+                // reassigned to an unrelated live process), such a probe
+                // would refuse to reap and the spin would reappear. Flock
+                // acquisition is the stronger and more precise signal.
+                if metadata_present {
+                    if let Err(err) = file.set_len(0) {
+                        tracing::warn!(
+                            path = %lock_path.display(),
+                            error = %err,
+                            "failed to truncate stale index-run lock metadata"
+                        );
+                    } else {
+                        let _ = clear_index_run_lock_metadata_sidecar(&lock_path);
+                        let _ = file.sync_all();
+                        tracing::info!(
+                            path = %lock_path.display(),
+                            stale_pid = ?snapshot.pid,
+                            "cleared stale index-run lock metadata (previous owner gone)"
+                        );
+                        let _ = file.unlock();
+                        return SearchMaintenanceSnapshot::default();
+                    }
+                }
+                let _ = file.unlock();
+                false
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(err) if windows_lock_conflict(&err) => true,
+            Err(_) => false,
+        }
+    };
+    snapshot.orphaned = metadata_present && !snapshot.active;
+    snapshot
+}
+
+fn parse_search_maintenance_snapshot(
+    raw: String,
+    active_when_metadata_unreadable: bool,
+) -> SearchMaintenanceSnapshot {
     let mut pid = None;
     let mut started_at_ms = None;
     let mut lock_db_path = None::<PathBuf>;
@@ -167,67 +352,8 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         || updated_at_ms.is_some()
         || last_progress_at_ms.is_some();
 
-    #[cfg(windows)]
-    let current_process_owns_recorded_lock = metadata_present && pid == Some(std::process::id());
-    #[cfg(not(windows))]
-    let current_process_owns_recorded_lock = false;
-
-    let active = if current_process_owns_recorded_lock {
-        true
-    } else {
-        match file.try_lock_exclusive() {
-            Ok(()) => {
-                // We acquired the exclusive lock with no waiting, which is
-                // proof that no process holds it. POSIX flock (via fs2) is
-                // released automatically when the owning file description
-                // is closed — either explicitly on graceful drop, or by the
-                // kernel on process exit / crash. Therefore, if the file
-                // contains metadata but no holder is present, the previous
-                // owner is gone.
-                //
-                // Historically this produced a permanent `orphaned: true`
-                // state that callers (notably the TUI) interpreted as
-                // "rebuild in progress, keep polling" — yielding a tight
-                // CPU-bound loop that only cleared when the user manually
-                // deleted the lock file (see issue #176).
-                //
-                // Reap the stale metadata in place while we hold the lock,
-                // so that this and every subsequent reader observes a
-                // clean state.
-                //
-                // We deliberately do NOT gate this on a `kill(pid, 0)`
-                // liveness probe. Under PID reuse (the recorded pid is
-                // reassigned to an unrelated live process), such a probe
-                // would refuse to reap and the spin would reappear. Flock
-                // acquisition is the stronger and more precise signal.
-                if metadata_present {
-                    if let Err(err) = file.set_len(0) {
-                        tracing::warn!(
-                            path = %lock_path.display(),
-                            error = %err,
-                            "failed to truncate stale index-run lock metadata"
-                        );
-                    } else {
-                        let _ = file.sync_all();
-                        tracing::info!(
-                            path = %lock_path.display(),
-                            stale_pid = ?pid,
-                            "cleared stale index-run lock metadata (previous owner gone)"
-                        );
-                        let _ = file.unlock();
-                        return SearchMaintenanceSnapshot::default();
-                    }
-                }
-                let _ = file.unlock();
-                false
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
-            Err(_) => false,
-        }
-    };
-
     SearchMaintenanceSnapshot {
-        active,
+        active: active_when_metadata_unreadable,
         pid,
         started_at_ms,
         db_path: lock_db_path,
@@ -237,7 +363,7 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         phase,
         updated_at_ms,
         last_progress_at_ms,
-        orphaned: metadata_present && !active,
+        orphaned: metadata_present && !active_when_metadata_unreadable,
     }
 }
 
@@ -1974,6 +2100,23 @@ mod tests {
         non_windows_pid
     }
 
+    fn write_locked_metadata(
+        lock_path: &Path,
+        owner: &mut std::fs::File,
+        contents: &str,
+    ) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        owner.set_len(0)?;
+        owner.seek(SeekFrom::Start(0))?;
+        owner.write_all(contents.as_bytes())?;
+        owner.flush()?;
+        owner.sync_all()?;
+        write_index_run_lock_metadata_sidecar(lock_path, contents)
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
     #[test]
     fn maintenance_mode_round_trips_lock_values() {
         for mode in [
@@ -2063,7 +2206,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let lock_path = temp.path().join("index-run.lock");
         let owner_pid = active_lock_fixture_pid(4242);
-        let owner = OpenOptions::new()
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -2071,8 +2214,9 @@ mod tests {
             .open(&lock_path)?;
         owner.try_lock_exclusive()?;
         // Write metadata while holding the lock, matching acquire_index_run_lock's order.
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
                 concat!(
                     "pid={}\n",
@@ -2085,7 +2229,8 @@ mod tests {
                     "phase=rebuilding\n"
                 ),
                 owner_pid
-            ),
+            )
+            .as_str(),
         )?;
 
         let snapshot = read_search_maintenance_snapshot(temp.path());
@@ -2806,9 +2951,10 @@ mod tests {
                     "stalled coordination reason should mention forward progress and #258: {reason}",
                 );
             }
-            other => {
-                panic!("stalled forward-progress snapshot must coordinate as Stale, got {other:?}",)
-            }
+            other => assert!(
+                matches!(other, MaintenanceCoordinationOutcome::Stale { .. }),
+                "stalled forward-progress snapshot must coordinate as Stale, got {other:?}",
+            ),
         }
     }
 
@@ -3466,7 +3612,7 @@ mod tests {
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
         let pid = active_lock_fixture_pid(99999);
-        let owner = OpenOptions::new()
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3474,13 +3620,15 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
                 "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-1\njob_kind=lexical_refresh\nphase=scanning\n",
                 now_ms - 1_000,
                 now_ms,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
@@ -3509,7 +3657,7 @@ mod tests {
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
         let pid = active_lock_fixture_pid(99999);
-        let owner = OpenOptions::new()
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3517,13 +3665,15 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
                 "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-stale\njob_kind=lexical_refresh\nphase=scanning\n",
                 now_ms - 120_000,
                 now_ms - 120_000,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
@@ -3549,7 +3699,7 @@ mod tests {
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
         let pid = active_lock_fixture_pid(99999);
-        let owner = OpenOptions::new()
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3557,13 +3707,15 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
                 "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-2\njob_kind=lexical_refresh\nphase=committing\n",
                 now_ms - 1_000,
                 now_ms,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
@@ -3592,7 +3744,7 @@ mod tests {
         let pid = active_lock_fixture_pid(99999);
 
         use fs2::FileExt;
-        let owner = OpenOptions::new()
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3600,13 +3752,15 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
                 "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-job-1\njob_kind=lexical_refresh\nphase=indexing\n",
                 now_ms - 1_000,
                 now_ms,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
@@ -3641,7 +3795,7 @@ mod tests {
         let pid = active_lock_fixture_pid(99999);
 
         use fs2::FileExt;
-        let owner = OpenOptions::new()
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3649,13 +3803,15 @@ mod tests {
             .open(&lock_path)
             .expect("open owner handle");
         owner.try_lock_exclusive().expect("acquire lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
                 "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-stale-1\njob_kind=lexical_refresh\nphase=indexing\n",
                 now_ms - 120_000,
                 now_ms - 120_000,
-            ),
+            )
+            .as_str(),
         )
         .expect("write lock metadata");
 
@@ -3823,7 +3979,7 @@ mod tests {
         let lock_path = temp.path().join("index-run.lock");
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
         let pid = active_lock_fixture_pid(99999);
-        let owner = OpenOptions::new()
+        let mut owner = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -3831,13 +3987,15 @@ mod tests {
             .open(&lock_path)
             .expect("open");
         owner.try_lock_exclusive().expect("lock");
-        std::fs::write(
+        write_locked_metadata(
             &lock_path,
+            &mut owner,
             format!(
                 "pid={pid}\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/t.db\nmode=index\njob_id=uv-1\njob_kind=lexical_refresh\nphase=indexing\n",
                 now_ms - 1_000,
                 now_ms,
-            ),
+            )
+            .as_str(),
         )
         .expect("write metadata");
 

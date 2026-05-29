@@ -2382,6 +2382,7 @@ impl Drop for IndexRunLockGuard {
         let _ = self.file.set_len(0);
         let _ = self.file.rewind();
         let _ = self.file.flush();
+        let _ = crate::search::asset_state::clear_index_run_lock_metadata_sidecar(&self._path);
         let _ = self.file.unlock();
     }
 }
@@ -2416,8 +2417,7 @@ impl IndexRunLockGuard {
                 self._path.display()
             )
         })?;
-        writeln!(
-            self.file,
+        let metadata = format!(
             "pid={}\nstarted_at_ms={}\nupdated_at_ms={}\nlast_progress_at_ms={}\ndb_path={}\nmode={}\njob_id={}\njob_kind={}\nphase={}",
             std::process::id(),
             self.started_at_ms,
@@ -2428,14 +2428,19 @@ impl IndexRunLockGuard {
             self.job_id,
             self.job_kind.as_lock_value(),
             mode.as_lock_value()
-        )
-        .with_context(|| format!("writing index-run metadata to {}", self._path.display()))?;
+        );
+        writeln!(self.file, "{metadata}")
+            .with_context(|| format!("writing index-run metadata to {}", self._path.display()))?;
         self.file
             .flush()
             .with_context(|| format!("flushing index-run lock file {}", self._path.display()))?;
         self.file
             .sync_all()
             .with_context(|| format!("syncing index-run lock file {}", self._path.display()))?;
+        crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+            &self._path,
+            &format!("{metadata}\n"),
+        )?;
         Ok(())
     }
 
@@ -2565,11 +2570,28 @@ fn heartbeat_index_run_lock_with_lock_and_progress(
                 .map_err(|_| anyhow::anyhow!("index-run metadata write lock poisoned"))
         })
         .transpose()?;
-    let lock_path = data_dir.join("index-run.lock");
+    let lock_path = crate::search::asset_state::index_run_lock_path(data_dir);
     let existing = match fs::read_to_string(&lock_path) {
         Ok(contents) if !contents.is_empty() => contents,
         Ok(_) => return Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if crate::search::asset_state::windows_lock_conflict(&err) => {
+            let sidecar_path =
+                crate::search::asset_state::index_run_lock_metadata_sidecar_path(&lock_path);
+            match fs::read_to_string(&sidecar_path) {
+                Ok(contents) if !contents.is_empty() => contents,
+                Ok(_) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "reading index-run lock heartbeat sidecar {}",
+                            sidecar_path.display()
+                        )
+                    });
+                }
+            }
+        }
         Err(err) => {
             return Err(err).with_context(|| {
                 format!("reading index-run lock heartbeat {}", lock_path.display())
@@ -2636,6 +2658,28 @@ fn heartbeat_index_run_lock_with_lock_and_progress(
 }
 
 fn write_index_run_lock_heartbeat_in_place(lock_path: &Path, refreshed: &str) -> Result<()> {
+    match write_index_run_lock_file_in_place(lock_path, refreshed) {
+        Ok(()) => {
+            crate::search::asset_state::write_index_run_lock_metadata_sidecar(lock_path, refreshed)
+        }
+        Err(err) => {
+            let lock_conflict = err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(crate::search::asset_state::windows_lock_conflict)
+            });
+            if lock_conflict {
+                crate::search::asset_state::write_index_run_lock_metadata_sidecar(
+                    lock_path, refreshed,
+                )
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn write_index_run_lock_file_in_place(lock_path: &Path, refreshed: &str) -> Result<()> {
     // Do not temp-file+rename `index-run.lock`: POSIX advisory locks attach
     // to the existing file inode/open handle, and replacing the path would
     // let another process lock a fresh inode while this process still holds
