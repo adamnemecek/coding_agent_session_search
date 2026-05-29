@@ -866,7 +866,7 @@ mod tests {
             "frankensqlite package should match the dependency spec",
         )?;
         ensure(
-            frankensqlite.version.as_deref() == Some("0.1.4"),
+            frankensqlite.version.as_deref() == Some("0.1.5"),
             "frankensqlite registry version pin should match Cargo.toml",
         )?;
 

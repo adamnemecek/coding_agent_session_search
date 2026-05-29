@@ -40,7 +40,9 @@ async function globalSetup() {
     }
   });
 
-  const skipExportRegenerate = allExportsExist && process.env.E2E_SKIP_REGENERATE !== '0';
+  const forceRegenerate =
+    process.env.CI === 'true' || process.env.E2E_SKIP_REGENERATE === '0';
+  const skipExportRegenerate = allExportsExist && !forceRegenerate;
   if (skipExportRegenerate) {
     console.log('All exports exist, skipping regeneration. Set E2E_SKIP_REGENERATE=0 to force regeneration.');
   }

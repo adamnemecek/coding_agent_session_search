@@ -1607,6 +1607,11 @@ const ENCRYPTION_STYLES: &str = r#"
   backdrop-filter: blur(8px);
 }
 
+.decrypt-modal[hidden],
+.decrypt-error[hidden] {
+  display: none !important;
+}
+
 .decrypt-form {
   width: 100%;
   max-width: 360px;

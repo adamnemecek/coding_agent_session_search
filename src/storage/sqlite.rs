@@ -2269,30 +2269,40 @@ fn recover_historical_bundle_via_sqlite3(
             .context("committing recovery import transaction")?;
     }
 
-    let recover_status = recover
-        .wait()
-        .context("waiting for sqlite3 .recover process")?;
-    if !recover_status.success() {
-        anyhow::bail!(
-            "sqlite3 .recover exited with status {} for {}",
-            recover_status,
-            bundle.root_path.display()
-        );
-    }
-
     let importer_status = importer
         .wait()
         .context("waiting for sqlite3 recovery importer")?;
+    let recover_status = recover
+        .wait()
+        .context("waiting for sqlite3 .recover process")?;
     if !importer_status.success() {
         anyhow::bail!(
-            "sqlite3 recovery importer exited with status {} for {}",
+            "sqlite3 recovery importer exited with status {} for {} after sqlite3 .recover exited with status {}",
             importer_status,
-            recovered_db.display()
+            recovered_db.display(),
+            recover_status
         );
     }
 
     let conn = open_historical_bundle_readonly(&recovered_db)?;
     historical_bundle_has_queryable_core_tables(&conn)?;
+    if !recover_status.success() {
+        let (conversations, messages) = historical_bundle_counts(&conn)?;
+        if conversations == 0 && messages == 0 {
+            anyhow::bail!(
+                "sqlite3 .recover exited with status {} for {} and recovered no core rows",
+                recover_status,
+                bundle.root_path.display()
+            );
+        }
+        tracing::warn!(
+            path = %bundle.root_path.display(),
+            status = %recover_status,
+            conversations,
+            messages,
+            "sqlite3 .recover exited nonzero after emitting recoverable core rows; continuing with recovered subset"
+        );
+    }
     Ok(HistoricalReadConnection {
         conn,
         method: "sqlite3-recover",

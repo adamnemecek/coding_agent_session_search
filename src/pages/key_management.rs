@@ -54,6 +54,16 @@ const ARGON2_PARALLELISM: u32 = 1;
 /// Schema version for encryption
 const SCHEMA_VERSION: u8 = 2;
 const MAX_ARCHIVE_CHUNKS: u64 = u32::MAX as u64;
+const REQUIRED_SITE_FILES: &[&str] = &[
+    "index.html",
+    "config.json",
+    "sw.js",
+    "viewer.js",
+    "auth.js",
+    "styles.css",
+    "robots.txt",
+    ".nojekyll",
+];
 
 fn max_encryptable_plaintext_bytes(chunk_size: usize) -> u64 {
     MAX_ARCHIVE_CHUNKS.saturating_mul(chunk_size as u64)
@@ -175,6 +185,7 @@ pub fn key_add_password(
     let slot_id = next_key_slot_id(&config.key_slots)?;
     let new_slot = create_password_slot(new_password, &dek, &config.export_id, slot_id)?;
 
+    materialize_safe_required_file_symlinks(&archive_dir)?;
     config.key_slots.push(new_slot);
 
     // Write updated config
@@ -209,6 +220,7 @@ pub fn key_add_recovery(
     let slot_id = next_key_slot_id(&config.key_slots)?;
     let new_slot = create_recovery_slot(secret.as_bytes(), &dek, &config.export_id, slot_id)?;
 
+    materialize_safe_required_file_symlinks(&archive_dir)?;
     config.key_slots.push(new_slot);
 
     // Write updated config
@@ -276,6 +288,8 @@ pub fn key_revoke(
         .find(|s| s.id == slot_id_to_revoke)
         .map(|s| s.slot_type == SlotType::Recovery)
         .unwrap_or(false);
+
+    materialize_safe_required_file_symlinks(&archive_dir)?;
 
     // Remove the slot (keeping IDs stable - they're part of the AAD binding)
     config.key_slots.retain(|s| s.id != slot_id_to_revoke);
@@ -911,6 +925,85 @@ fn regenerate_integrity_manifest(
     Ok(Some(integrity))
 }
 
+fn materialize_safe_required_file_symlinks(archive_dir: &Path) -> Result<()> {
+    let canonical_archive_dir = archive_dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve archive directory {} before key mutation",
+            archive_dir.display()
+        )
+    })?;
+
+    for rel_path in REQUIRED_SITE_FILES {
+        let path = archive_dir.join(rel_path);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to inspect required site file {} before key mutation",
+                        path.display()
+                    )
+                });
+            }
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let canonical_target = path.canonicalize().with_context(|| {
+            format!(
+                "Failed to resolve symlinked required site file {} before key mutation",
+                path.display()
+            )
+        })?;
+        if !canonical_target.starts_with(&canonical_archive_dir) {
+            bail!(
+                "Refusing to materialize required site file symlink outside archive root: {}",
+                path.display()
+            );
+        }
+
+        let target_metadata = std::fs::metadata(&canonical_target).with_context(|| {
+            format!(
+                "Failed to inspect symlink target {} before key mutation",
+                canonical_target.display()
+            )
+        })?;
+        if !target_metadata.file_type().is_file() {
+            bail!(
+                "Refusing to materialize required site file symlink that does not point to a regular file: {}",
+                path.display()
+            );
+        }
+
+        let temp_path = unique_atomic_sidecar_path(&path, "materialize", "site-file");
+        std::fs::copy(&canonical_target, &temp_path).with_context(|| {
+            format!(
+                "Failed copying symlink target {} into staged required site file {}",
+                canonical_target.display(),
+                temp_path.display()
+            )
+        })?;
+        File::open(&temp_path)
+            .and_then(|file| file.sync_all())
+            .with_context(|| {
+                format!(
+                    "Failed syncing materialized required site file {}",
+                    temp_path.display()
+                )
+            })?;
+        replace_file_from_temp(&temp_path, &path).with_context(|| {
+            format!(
+                "Failed materializing required site file symlink {} before key mutation",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 fn write_json_pretty_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let temp_path = unique_atomic_temp_path(path);
     {
@@ -1362,8 +1455,6 @@ mod tests {
 
         let manifest = crate::pages::bundle::generate_integrity_manifest(site_dir).unwrap();
         write_json_pretty(&site_dir.join("integrity.json"), &manifest).unwrap();
-
-        assert_eq!(verify_bundle(site_dir, false).unwrap().status, "valid");
     }
 
     fn setup_test_archive() -> (TempDir, std::path::PathBuf) {
@@ -1795,7 +1886,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_key_add_password_preserves_in_tree_symlinked_required_asset() {
+    fn test_key_add_password_materializes_in_tree_symlinked_required_asset() {
         let (_temp_dir, archive_dir) = setup_test_archive();
         let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
         replace_viewer_with_in_tree_symlink(&site_dir);
@@ -1803,12 +1894,26 @@ mod tests {
         key_add_password(&archive_dir, "test-password", "new-password").unwrap();
 
         assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js")).unwrap();
+        assert!(viewer_metadata.file_type().is_file());
+        assert!(!viewer_metadata.file_type().is_symlink());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_key_add_password_wrong_password_preserves_in_tree_symlinked_required_asset() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        replace_viewer_with_in_tree_symlink(&site_dir);
+
+        let err = key_add_password(&archive_dir, "wrong-password", "new-password").unwrap_err();
+
         assert!(
-            std::fs::symlink_metadata(site_dir.join("viewer.js"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
+            err.to_string().contains("Invalid password"),
+            "unexpected error: {err:#}"
         );
+        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js")).unwrap();
+        assert!(viewer_metadata.file_type().is_symlink());
     }
 
     #[test]
