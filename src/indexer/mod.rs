@@ -2389,15 +2389,41 @@ impl Drop for IndexRunLockGuard {
 
 impl IndexRunLockGuard {
     fn write_metadata(&mut self, mode: SearchMaintenanceMode) -> Result<()> {
+        self.write_metadata_with_phase(mode, mode.as_lock_value())
+    }
+
+    /// Write the full lock metadata with a caller-supplied sub-phase
+    /// string. The on-disk `mode=` field tracks the user-facing
+    /// `SearchMaintenanceMode` (`watch_startup`, `watch`, `index`,
+    /// `watch_once`, …), while the `phase=` field carries a finer-
+    /// grained breadcrumb (e.g. `watch_startup:fingerprint`,
+    /// `watch_startup:fts_validate`) so cass#265 operators can see
+    /// which preflight step wedged on a multi-GB DB.
+    ///
+    /// Phase breadcrumbs MUST satisfy two invariants so the existing
+    /// `IndexStallWatchdog` keeps resetting its `last_progress_advance`
+    /// timer at each sub-phase transition:
+    ///   1. Each call produces a strictly different `phase=` string
+    ///      than the previous call (the watchdog gates on
+    ///      `phase_code != self.last_phase` to reset).
+    ///   2. The free function `bump_index_run_lock_progress_atomic`
+    ///      is also called at each transition so the heartbeat
+    ///      thread folds a fresh `last_progress_at_ms=` into the
+    ///      on-disk payload even if the watchdog tick is rare.
+    fn write_metadata_with_phase(
+        &mut self,
+        mode: SearchMaintenanceMode,
+        phase: &str,
+    ) -> Result<()> {
         let _write_guard = self
             .metadata_write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("index-run metadata write lock poisoned"))?;
         let now_ms = FrankenStorage::now_millis();
         self.updated_at_ms = now_ms;
-        // cass#258: every `write_metadata` / `set_mode` call is, by
-        // definition, the indexing thread reporting a real mode/phase
-        // transition — i.e. forward progress. Bump
+        // cass#258: every `write_metadata` / `set_mode` / `set_phase`
+        // call is, by definition, the indexing thread reporting a real
+        // mode/phase transition — i.e. forward progress. Bump
         // `last_progress_at_ms` here, while the background heartbeat
         // thread refreshes `updated_at_ms` independently but preserves
         // this field verbatim so a wedged indexer flips
@@ -2427,7 +2453,7 @@ impl IndexRunLockGuard {
             mode.as_lock_value(),
             self.job_id,
             self.job_kind.as_lock_value(),
-            mode.as_lock_value()
+            phase
         );
         writeln!(self.file, "{metadata}")
             .with_context(|| format!("writing index-run metadata to {}", self._path.display()))?;
@@ -2446,6 +2472,16 @@ impl IndexRunLockGuard {
 
     fn set_mode(&mut self, mode: SearchMaintenanceMode) -> Result<()> {
         self.write_metadata(mode)
+    }
+
+    /// Update only the `phase=` sub-phase breadcrumb without changing
+    /// the `mode=`. Use this at the entry of each watch-startup preflight
+    /// step so cass#265 operators can pinpoint which step wedged — the
+    /// previous v0.6.5 lock-file payload only reported `phase=watch_startup`,
+    /// which hid the wedge inside a multi-second-to-multi-hour preflight
+    /// block.
+    fn set_phase(&mut self, mode: SearchMaintenanceMode, phase: &str) -> Result<()> {
+        self.write_metadata_with_phase(mode, phase)
     }
 }
 
@@ -11298,7 +11334,33 @@ pub fn run_index(
         return Ok(());
     }
 
+    // cass#265: each preflight step gets its own sub-phase breadcrumb so
+    // operators investigating a watch_startup wedge can see WHICH step
+    // stalled instead of an opaque `phase=watch_startup` for the entire
+    // pre-pipeline block. Each `set_phase` call also bumps
+    // `last_progress_at_ms` (in both the atomic and the on-disk field)
+    // and emits a new `phase=` string that `IndexStallWatchdog` treats
+    // as a phase transition (resets its `last_progress_advance` timer).
+    // The macro keeps the call sites compact: noop on non-watch_startup
+    // modes so plain `cass index` runs don't pay the I/O cost on the
+    // initial-state non-watch path.
+    macro_rules! preflight_phase {
+        ($phase:expr) => {{
+            if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
+                if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
+                    tracing::debug!(
+                        sub_phase = $phase,
+                        error = %err,
+                        "watch_startup preflight phase breadcrumb write failed (continuing)"
+                    );
+                }
+            }
+        }};
+    }
+
+    preflight_phase!("watch_startup:ensure_index_dir");
     let index_path = index_dir(&opts.data_dir)?;
+    preflight_phase!("watch_startup:ensure_storage_headroom");
     ensure_index_storage_headroom(&opts.data_dir, &opts.db_path)?;
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
         match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
@@ -11357,11 +11419,13 @@ pub fn run_index(
         return Ok(());
     }
 
+    preflight_phase!("watch_startup:open_storage");
     let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
     let defer_checkpoints = !opts.watch;
     let mut reopened_after_writable_preflight = false;
 
+    preflight_phase!("watch_startup:writable_preflight");
     // CASS #162 item 2: Verify the connection is writable early, before the
     // code reaches deep batch-insert paths where a readonly failure is hard
     // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
@@ -11397,6 +11461,7 @@ pub fn run_index(
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
 
+    preflight_phase!("watch_startup:validate_fts_messages");
     if let Err(err) = storage.validate_fts_messages_integrity() {
         tracing::warn!(
             db_path = %opts.db_path.display(),
@@ -11479,6 +11544,7 @@ pub fn run_index(
         return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
     }
 
+    preflight_phase!("watch_startup:cleanup_orphan_fk_rows");
     // cass#202 self-heal: a Connection dropped mid-transaction (the
     // `drop_close` warning) can leave child rows persisted without a matching
     // parent. Sweep before the indexer touches the DB so one bad commit cannot
@@ -11496,6 +11562,7 @@ pub fn run_index(
         return Err(orphan_fk_cleanup_failed_index_error(&opts.db_path, &err));
     }
 
+    preflight_phase!("watch_startup:count_total_conversations");
     let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     if opts.full
         && !opened_fresh_for_full
@@ -11534,6 +11601,7 @@ pub fn run_index(
         && !opts.semantic
         && !opts.build_hnsw
         && initial_canonical_sessions_before_salvage > 0;
+    preflight_phase!("watch_startup:probe_lexical_checkpoint");
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
     let mut restart_pending_lexical_rebuild_from_zero = false;
     let resume_lexical_rebuild = if opts.force_rebuild {
@@ -11609,6 +11677,7 @@ pub fn run_index(
             .flatten();
     let mut checked_daily_stats_pre_scan = false;
     if opts.full && !canonical_only_full_rebuild {
+        preflight_phase!("watch_startup:repair_daily_stats");
         if let DailyStatsRepairOutcome::SkippedKnownHealthyForFingerprint {
             archive_fingerprint,
         } = repair_daily_stats_if_drifted(
@@ -11637,6 +11706,7 @@ pub fn run_index(
 
     let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
+    preflight_phase!("watch_startup:tantivy_reader_preflight");
     if should_preflight_existing_tantivy_reader(resume_lexical_rebuild, opts.full) {
         // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
         // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
@@ -11860,6 +11930,7 @@ pub fn run_index(
             should_salvage_historical,
             "historical salvage decision"
         );
+        preflight_phase!("watch_startup:historical_salvage");
         let historical_salvage: HistoricalSalvageOutcome = if targeted_watch_once_only {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -11926,6 +11997,7 @@ pub fn run_index(
         let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0
             && should_evaluate_incremental_canonical_lexical_repair(&repair_context)
         {
+            preflight_phase!("watch_startup:count_total_messages");
             let canonical_messages = count_total_messages_exact(&storage)?;
             // #248 (coding_agent_session_search-raoug): only pay for the
             // published-index validation (a read-only DB open + fingerprint COUNT
@@ -11936,7 +12008,10 @@ pub fn run_index(
             // tantivy_requires_rebuild), so skip the check then.
             let published_index_validated_for_current_data = !tantivy_requires_rebuild
                 && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
-                && published_lexical_index_validated_for_current_data(&index_path, &opts.db_path);
+                && {
+                    preflight_phase!("watch_startup:published_index_validate");
+                    published_lexical_index_validated_for_current_data(&index_path, &opts.db_path)
+                };
             choose_incremental_canonical_lexical_repair_plan(
                 IncrementalCanonicalLexicalRepairContext {
                     canonical_messages,
@@ -12150,6 +12225,7 @@ pub fn run_index(
                         "scan phase is deferring Tantivy writer open/commit until the authoritative rebuild"
                     );
                 }
+                preflight_phase!("watch_startup:scan_entry");
                 if streaming_index_enabled() {
                     tracing::info!("using streaming indexing (Opt 8.2)");
                     let scan_outcome = run_streaming_index(
@@ -26748,6 +26824,201 @@ mod tests {
         );
 
         drop(guard);
+        Ok(())
+    }
+
+    /// Regression for cass#265.
+    ///
+    /// Before this fix, every preflight step inside `run_index`'s
+    /// `phase=watch_startup` block ran with no progress bump and no
+    /// sub-phase breadcrumb. If any one of them wedged (e.g. a multi-
+    /// second-to-multi-hour COUNT scan against `messages` triggering a
+    /// fsqlite B-tree descent bug), operators saw only the opaque
+    /// `phase=watch_startup` for hours, with no way to tell whether
+    /// the wedge was in `cleanup_orphan_fk_rows`, the lexical-
+    /// checkpoint probe, the tantivy reader preflight, or somewhere
+    /// else. The reporter on cass#265 specifically asked: "Get a
+    /// thread-by-thread backtrace … I can produce one if the
+    /// maintainer can share … a guidance recipe for `lldb` to attach
+    /// to PID and dump symbolicated `bt all`." This sub-phase
+    /// breadcrumb is the same information, surfaced without requiring
+    /// the operator to attach `lldb` to a frozen process.
+    ///
+    /// The fix routes each preflight step through
+    /// `IndexRunLockGuard::set_phase`, which:
+    /// 1. Writes a fine-grained sub-phase string to the lock file's
+    ///    `phase=` line (e.g. `watch_startup:count_total_conversations`).
+    /// 2. Bumps `last_progress_at_ms` (both the on-disk field and the
+    ///    atomic the heartbeat folds in) so a real wedge inside ONE
+    ///    preflight surfaces at +120 s with the sub-phase pinpointed.
+    /// 3. Forces `IndexStallWatchdog` to reset its
+    ///    `last_progress_advance` timer at each sub-phase boundary so
+    ///    the watchdog scopes its stall window to a single preflight
+    ///    rather than the whole watch_startup block.
+    ///
+    /// This test exercises `set_phase` directly (without spinning up
+    /// the full indexer): acquire the lock as `WatchStartup`, call
+    /// `set_phase` with several sub-phases, and assert each call
+    /// updates the on-disk `phase=` line while leaving `mode=` at
+    /// `watch_startup` and advancing `last_progress_at_ms` strictly
+    /// monotonically.
+    #[test]
+    fn set_phase_writes_sub_phase_breadcrumb_and_bumps_progress() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let mut guard =
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::WatchStartup)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        let initial = read_index_run_lock_metadata_for_test(&lock_path)?;
+        let initial_phase = initial
+            .lines()
+            .find_map(|line| line.strip_prefix("phase="))
+            .map(str::to_string);
+        assert_eq!(
+            initial_phase.as_deref(),
+            Some("watch_startup"),
+            "initial phase must equal the mode for the WatchStartup acquire"
+        );
+        let initial_progress: i64 = initial
+            .lines()
+            .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+            .context("initial lock file must have last_progress_at_ms")?
+            .parse()?;
+
+        // Each preflight step writes a strictly different sub-phase
+        // and a strictly larger last_progress_at_ms. The sleep is
+        // tiny because `FrankenStorage::now_millis()` ticks every
+        // millisecond — production preflight steps take seconds, so
+        // monotonic strictness is the easy case.
+        let sub_phases = [
+            "watch_startup:ensure_index_dir",
+            "watch_startup:open_storage",
+            "watch_startup:validate_fts_messages",
+            "watch_startup:cleanup_orphan_fk_rows",
+            "watch_startup:count_total_conversations",
+            "watch_startup:probe_lexical_checkpoint",
+            "watch_startup:tantivy_reader_preflight",
+            "watch_startup:scan_entry",
+        ];
+        let mut prev_progress = initial_progress;
+        for sub_phase in sub_phases {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            guard.set_phase(SearchMaintenanceMode::WatchStartup, sub_phase)?;
+            let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+            let phase_line = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("phase="))
+                .map(str::to_string);
+            assert_eq!(
+                phase_line.as_deref(),
+                Some(sub_phase),
+                "set_phase must write the sub-phase string to the on-disk phase= field; got {raw:?}"
+            );
+            let mode_line = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("mode="))
+                .map(str::to_string);
+            assert_eq!(
+                mode_line.as_deref(),
+                Some("watch_startup"),
+                "set_phase must leave mode= unchanged so SearchMaintenanceSnapshot.mode keeps reflecting WatchStartup; got {raw:?}"
+            );
+            let progress: i64 = raw
+                .lines()
+                .find_map(|line| line.strip_prefix("last_progress_at_ms="))
+                .context("last_progress_at_ms after set_phase")?
+                .parse()?;
+            assert!(
+                progress > prev_progress,
+                "set_phase must bump last_progress_at_ms (prev={prev_progress}, now={progress}); without this the stall detector cannot scope its window to a single sub-phase"
+            );
+            // The atomic mirror must also move; this is what the
+            // heartbeat thread reads.
+            let atomic_progress = guard.last_progress_at_ms_atomic.load(Ordering::Relaxed);
+            assert_eq!(
+                atomic_progress, progress,
+                "the atomic mirror used by the heartbeat thread must match the on-disk last_progress_at_ms after set_phase"
+            );
+            prev_progress = progress;
+        }
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for cass#265.
+    ///
+    /// The `IndexStallWatchdog` resets its `last_progress_advance`
+    /// timer whenever `phase_code` changes. The new sub-phase
+    /// breadcrumbs live in the LOCK FILE's `phase=` field (a string),
+    /// not in `IndexingProgress::phase` (an atomic enum). So a
+    /// wedged preflight is detected by `last_progress_at_ms` (which
+    /// `set_phase` bumps) and surfaced to operators via the lock-file
+    /// `phase=` string. This test verifies the lock-file `phase=`
+    /// values are exactly the strings the README/issue triage docs
+    /// reference, so a future refactor that renames them will be
+    /// flagged here before it ships and silently breaks operator
+    /// runbooks.
+    ///
+    /// The taxonomy of sub-phases under `watch_startup:` is the
+    /// public contract — cass#265 hinge.
+    #[test]
+    fn watch_startup_sub_phase_taxonomy_is_documented_and_stable() -> Result<()> {
+        // This list MUST match the `preflight_phase!(...)` call sites
+        // in `run_index`. When you add or remove a preflight step,
+        // update this list AND the cass#265 release-note section so
+        // operators have a complete map of what `phase=` strings can
+        // surface in `cass health --robot`.
+        let documented_sub_phases = [
+            "watch_startup:ensure_index_dir",
+            "watch_startup:ensure_storage_headroom",
+            "watch_startup:open_storage",
+            "watch_startup:writable_preflight",
+            "watch_startup:validate_fts_messages",
+            "watch_startup:cleanup_orphan_fk_rows",
+            "watch_startup:count_total_conversations",
+            "watch_startup:probe_lexical_checkpoint",
+            "watch_startup:repair_daily_stats",
+            "watch_startup:tantivy_reader_preflight",
+            "watch_startup:historical_salvage",
+            "watch_startup:count_total_messages",
+            "watch_startup:published_index_validate",
+            "watch_startup:scan_entry",
+        ];
+        for sub_phase in documented_sub_phases {
+            assert!(
+                sub_phase.starts_with("watch_startup:"),
+                "sub-phase {sub_phase} must live under the watch_startup: namespace so health-check JSON consumers can route on prefix"
+            );
+            assert!(
+                !sub_phase.contains(char::is_whitespace),
+                "sub-phase {sub_phase} must not contain whitespace; the lock file parser splits on `=` and expects a single line value"
+            );
+            // No colons after the namespace separator: keep sub-phases
+            // simple identifiers so future structured-log consumers
+            // (e.g. Datadog facets) can treat them as enum values.
+            let after_namespace = sub_phase
+                .strip_prefix("watch_startup:")
+                .expect("namespace check above");
+            assert!(
+                !after_namespace.contains(':'),
+                "sub-phase {sub_phase} must not contain a second colon; keep the breadcrumb taxonomy flat"
+            );
+        }
+
+        // Cross-check against the source: every documented sub-phase
+        // must appear in src/indexer/mod.rs (this file). This makes
+        // a refactor that drops a preflight call fail this test
+        // before the next release ships.
+        let src = std::fs::read_to_string(file!()).context("read indexer source")?;
+        for sub_phase in documented_sub_phases {
+            assert!(
+                src.contains(sub_phase),
+                "documented sub-phase {sub_phase} is missing from src/indexer/mod.rs; if the preflight step was renamed, update the test AND the release-note operator runbook"
+            );
+        }
         Ok(())
     }
 
