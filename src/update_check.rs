@@ -635,7 +635,7 @@ fn replace_update_state_file_from_temp(temp_path: &Path, final_path: &Path) -> s
         match std::fs::rename(temp_path, final_path) {
             Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
-                if final_path.exists()
+                if update_state_path_entry_exists(final_path)?
                     && matches!(
                         first_err.kind(),
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
@@ -685,6 +685,21 @@ fn replace_update_state_file_from_temp(temp_path: &Path, final_path: &Path) -> s
     {
         std::fs::rename(temp_path, final_path)?;
         sync_parent_directory(final_path)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn update_state_path_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed inspecting update state replacement target {}: {err}",
+                path.display()
+            ),
+        )),
     }
 }
 
@@ -1305,6 +1320,31 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
         assert!(loaded.is_skipped("0.1.51"));
         assert!(!loaded.is_skipped("0.1.50")); // Only latest skip is stored
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_state_replacement_path_entry_exists_detects_dangling_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::TempDir::new()?;
+        let state_file = temp_dir.path().join("update_state.json");
+        let missing_target = temp_dir.path().join("missing-update-state.json");
+        symlink(&missing_target, &state_file)?;
+
+        match std::fs::metadata(&state_file) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(anyhow::anyhow!("dangling update state symlink resolved")),
+            Err(err) => return Err(err.into()),
+        }
+        if !update_state_path_entry_exists(&state_file)? {
+            return Err(anyhow::anyhow!(
+                "update state replacement entry check missed dangling symlink {}",
+                state_file.display()
+            ));
+        }
+
+        Ok(())
     }
 
     #[cfg(unix)]
