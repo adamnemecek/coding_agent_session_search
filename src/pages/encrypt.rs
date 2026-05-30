@@ -635,6 +635,54 @@ fn ensure_replaceable_archive_file(path: &Path, label: &str) -> Result<()> {
     }
 }
 
+#[cfg(any(windows, test))]
+fn replacement_path_entry_exists(path: &Path, label: &str) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to inspect {label} {}", path.display()))
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn unique_replacement_backup_path(path: &Path, purpose: &str, label: &str) -> Result<PathBuf> {
+    static BACKUP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let parent = output_parent(path);
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{label} path must name a file"))?
+        .to_string_lossy();
+    let counter = BACKUP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_nanos();
+    let candidate = parent.join(format!(
+        ".{file_name}.{purpose}.{}.{}.{timestamp:x}",
+        std::process::id(),
+        counter
+    ));
+
+    match std::fs::symlink_metadata(&candidate) {
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => Ok(candidate),
+        Ok(_) => {
+            bail!(
+                "Replacement backup path for {label} already exists: {}",
+                candidate.display()
+            );
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to inspect replacement backup path {}",
+                candidate.display()
+            )
+        }),
+    }
+}
+
 struct PendingArchiveOutput {
     path: PathBuf,
     keep: bool,
@@ -736,7 +784,7 @@ fn replace_archive_file_from_temp_impl(
     label: &str,
 ) -> Result<()> {
     ensure_replaceable_archive_file(final_path, label)?;
-    if std::fs::symlink_metadata(final_path).is_err() {
+    if !replacement_path_entry_exists(final_path, label)? {
         return std::fs::rename(temp_path, final_path).with_context(|| {
             format!(
                 "Failed to install {label} {} from {}",
@@ -746,15 +794,16 @@ fn replace_archive_file_from_temp_impl(
         });
     }
 
-    let parent = output_parent(final_path);
-    let file_name = final_path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("{label} path must name a file"))?
-        .to_string_lossy();
-    let backup_path = parent.join(format!(
-        ".{file_name}.cass-encrypt-backup.{}",
-        std::process::id()
-    ));
+    replace_archive_file_from_temp_via_backup(temp_path, final_path, label)
+}
+
+#[cfg(any(windows, test))]
+fn replace_archive_file_from_temp_via_backup(
+    temp_path: &Path,
+    final_path: &Path,
+    label: &str,
+) -> Result<()> {
+    let backup_path = unique_replacement_backup_path(final_path, "cass-encrypt-backup", label)?;
 
     std::fs::rename(final_path, &backup_path).with_context(|| {
         format!(
@@ -1125,7 +1174,7 @@ fn replace_decrypt_output_from_temp_impl(temp_path: &Path, output_path: &Path) -
 
 #[cfg(windows)]
 fn replace_decrypt_output_from_temp_impl(temp_path: &Path, output_path: &Path) -> Result<()> {
-    if std::fs::symlink_metadata(output_path).is_err() {
+    if !replacement_path_entry_exists(output_path, "decrypted output")? {
         return std::fs::rename(temp_path, output_path).with_context(|| {
             format!(
                 "Failed to install decrypted output {} from {}",
@@ -1135,15 +1184,13 @@ fn replace_decrypt_output_from_temp_impl(temp_path: &Path, output_path: &Path) -
         });
     }
 
-    let parent = output_parent(output_path);
-    let file_name = output_path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("decryption output path must name a file"))?
-        .to_string_lossy();
-    let backup_path = parent.join(format!(
-        ".{file_name}.cass-decrypt-backup.{}",
-        std::process::id()
-    ));
+    replace_decrypt_output_from_temp_via_backup(temp_path, output_path)
+}
+
+#[cfg(any(windows, test))]
+fn replace_decrypt_output_from_temp_via_backup(temp_path: &Path, output_path: &Path) -> Result<()> {
+    let backup_path =
+        unique_replacement_backup_path(output_path, "cass-decrypt-backup", "decrypted output")?;
 
     std::fs::rename(output_path, &backup_path).with_context(|| {
         format!(
@@ -1412,6 +1459,14 @@ mod tests {
         );
     }
 
+    fn legacy_pid_backup_path(path: &Path, purpose: &str) -> Result<PathBuf> {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("test path must name a file"))?
+            .to_string_lossy();
+        Ok(output_parent(path).join(format!(".{file_name}.{purpose}.{}", std::process::id())))
+    }
+
     fn encrypt_test_file() -> (TempDir, std::path::PathBuf, EncryptionConfig) {
         let temp_dir = TempDir::new().unwrap();
         let input_path = temp_dir.path().join("input.txt");
@@ -1646,6 +1701,73 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert_file_bytes(&protected_target_path, b"protected config target");
+    }
+
+    #[test]
+    fn archive_backup_replace_does_not_collide_with_stale_pid_sidecar() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("config.json");
+        let temp_path = temp_dir.path().join(".config.json.tmp");
+        let stale_backup = legacy_pid_backup_path(&final_path, "cass-encrypt-backup")?;
+
+        std::fs::write(&final_path, b"old config")?;
+        std::fs::write(&temp_path, b"new config")?;
+        std::fs::write(&stale_backup, b"stale backup")?;
+
+        replace_archive_file_from_temp_via_backup(
+            &temp_path,
+            &final_path,
+            "test encryption config",
+        )?;
+
+        if !matches!(
+            std::fs::read(&final_path)?.as_slice().cmp(b"new config"),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err(anyhow::anyhow!(
+                "archive replacement did not publish temp bytes"
+            ));
+        }
+        if !matches!(
+            std::fs::read(&stale_backup)?
+                .as_slice()
+                .cmp(b"stale backup"),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err(anyhow::anyhow!(
+                "archive replacement clobbered stale backup"
+            ));
+        }
+        if temp_path.exists() {
+            return Err(anyhow::anyhow!("archive temp path was not consumed"));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_path_entry_exists_detects_dangling_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new()?;
+        let link_path = temp_dir.path().join("decrypted.txt");
+        let missing_target = temp_dir.path().join("missing-target.txt");
+
+        symlink(&missing_target, &link_path)?;
+
+        if link_path.exists() {
+            return Err(anyhow::anyhow!(
+                "Path::exists stopped following the missing target"
+            ));
+        }
+        if !replacement_path_entry_exists(&link_path, "test output")? {
+            return Err(anyhow::anyhow!(
+                "replacement path helper missed a dangling symlink entry"
+            ));
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -1919,6 +2041,46 @@ mod tests {
             "successful decrypt should replace the output symlink itself"
         );
         assert_file_bytes(&decrypted_path, test_data);
+    }
+
+    #[test]
+    fn decrypt_backup_replace_does_not_collide_with_stale_pid_sidecar() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let output_path = temp_dir.path().join("decrypted.txt");
+        let temp_path = temp_dir.path().join(".decrypted.txt.tmp");
+        let stale_backup = legacy_pid_backup_path(&output_path, "cass-decrypt-backup")?;
+
+        std::fs::write(&output_path, b"old plaintext")?;
+        std::fs::write(&temp_path, b"new plaintext")?;
+        std::fs::write(&stale_backup, b"stale decrypt backup")?;
+
+        replace_decrypt_output_from_temp_via_backup(&temp_path, &output_path)?;
+
+        if !matches!(
+            std::fs::read(&output_path)?
+                .as_slice()
+                .cmp(b"new plaintext"),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err(anyhow::anyhow!(
+                "decrypt replacement did not publish temp bytes"
+            ));
+        }
+        if !matches!(
+            std::fs::read(&stale_backup)?
+                .as_slice()
+                .cmp(b"stale decrypt backup"),
+            std::cmp::Ordering::Equal
+        ) {
+            return Err(anyhow::anyhow!(
+                "decrypt replacement clobbered stale backup"
+            ));
+        }
+        if temp_path.exists() {
+            return Err(anyhow::anyhow!("decrypt temp path was not consumed"));
+        }
+
+        Ok(())
     }
 
     #[test]
