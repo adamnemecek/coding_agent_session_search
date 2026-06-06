@@ -15849,6 +15849,9 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char(' ') if ctrl => CassMsg::PeekToggled,
 
                     // -- Navigation -----------------------------------------------
+                    KeyCode::BackTab => CassMsg::FocusDirectional {
+                        direction: FocusDirection::Left,
+                    },
                     KeyCode::Tab if shift => CassMsg::FocusDirectional {
                         direction: FocusDirection::Left,
                     },
@@ -16097,6 +16100,13 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     return ftui::Cmd::none();
                 }
+                CassMsg::QueryChanged(text) if text == " " => {
+                    if state.focused == ExportField::ExportButton {
+                        return self.update(CassMsg::ExportExecuted);
+                    }
+                    state.toggle_current();
+                    return ftui::Cmd::none();
+                }
                 CassMsg::QueryChanged(text) => {
                     // Non-editing mode: check for Ctrl+H (password visibility toggle).
                     if text == "\x08" {
@@ -16105,16 +16115,17 @@ impl super::ftui_adapter::Model for CassApp {
                     return ftui::Cmd::none();
                 }
                 CassMsg::QuerySubmitted | CassMsg::DetailOpened => {
-                    // Enter key: toggle text field editing, or execute export.
+                    // Enter key: commit an active text edit, advance from password
+                    // entry, or execute export when the form is valid.
                     // Note: Enter maps to DetailOpened in the key dispatch;
                     // QuerySubmitted is also handled for programmatic sends.
-                    if state.focused == ExportField::OutputDir {
+                    if state.focused == ExportField::OutputDir && state.output_dir_editing {
                         state.toggle_current();
-                    } else if state.focused == ExportField::ExportButton {
-                        return self.update(CassMsg::ExportExecuted);
                     } else if state.focused == ExportField::Password {
                         // Enter in password field = move to next.
                         state.next_field();
+                    } else if state.can_export() {
+                        return self.update(CassMsg::ExportExecuted);
                     } else {
                         state.toggle_current();
                     }
@@ -24379,6 +24390,78 @@ mod tests {
     }
 
     #[test]
+    fn export_modal_enter_exports_when_default_focus_is_valid() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut app = app_with_hits(1);
+        app.show_export_modal = true;
+        app.export_modal_state = Some(ExportModalState {
+            output_dir: tmp.path().to_path_buf(),
+            output_dir_buffer: tmp.path().display().to_string(),
+            filename_preview: "session.html".to_string(),
+            focused: ExportField::OutputDir,
+            ..Default::default()
+        });
+
+        let cmd = app.update(CassMsg::DetailOpened);
+
+        assert!(
+            matches!(cmd, ftui::Cmd::Task(..)),
+            "Enter should execute export from the default focused field when valid"
+        );
+        assert_eq!(app.status, "Exporting HTML...");
+        assert!(matches!(
+            app.export_modal_state
+                .as_ref()
+                .expect("export modal state")
+                .progress,
+            ExportProgress::Preparing
+        ));
+    }
+
+    #[test]
+    fn export_modal_plain_space_toggles_focused_control() {
+        let mut app = app_with_hits(1);
+        app.show_export_modal = true;
+        app.export_modal_state = Some(ExportModalState {
+            focused: ExportField::IncludeTools,
+            include_tools: true,
+            ..Default::default()
+        });
+
+        let _ = app.update(CassMsg::QueryChanged(" ".to_string()));
+
+        assert!(
+            !app.export_modal_state
+                .as_ref()
+                .expect("export modal state")
+                .include_tools,
+            "plain Space should toggle the focused checkbox while the modal is not editing text"
+        );
+    }
+
+    #[test]
+    fn export_modal_space_still_types_in_active_output_dir_edit() {
+        let mut app = app_with_hits(1);
+        app.show_export_modal = true;
+        app.export_modal_state = Some(ExportModalState {
+            focused: ExportField::OutputDir,
+            output_dir_editing: true,
+            output_dir_buffer: "/tmp/cass export".to_string(),
+            ..Default::default()
+        });
+
+        let _ = app.update(CassMsg::QueryChanged(" ".to_string()));
+
+        assert_eq!(
+            app.export_modal_state
+                .as_ref()
+                .expect("export modal state")
+                .output_dir_buffer,
+            "/tmp/cass export "
+        );
+    }
+
+    #[test]
     fn all_detail_tab_variants_constructible() {
         let _msgs = DetailTab::Messages;
         let _snip = DetailTab::Snippets;
@@ -24539,6 +24622,20 @@ mod tests {
         let event = Event::Key(KeyEvent::new(KeyCode::Char(' ')).with_modifiers(Modifiers::CTRL));
 
         assert!(matches!(CassMsg::from(event), CassMsg::PeekToggled));
+    }
+
+    #[test]
+    fn event_mapping_backtab_maps_to_previous_focus() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent};
+
+        let event = Event::Key(KeyEvent::new(KeyCode::BackTab));
+
+        assert!(matches!(
+            CassMsg::from(event),
+            CassMsg::FocusDirectional {
+                direction: FocusDirection::Left
+            }
+        ));
     }
 
     #[test]
