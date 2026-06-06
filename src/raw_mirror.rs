@@ -21,6 +21,12 @@ static BLOB_CAPTURE_CACHE: OnceLock<Mutex<HashMap<RawMirrorBlobCacheKey, RawMirr
     OnceLock::new();
 static MANIFEST_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+fn raw_mirror_fsync_enabled() -> bool {
+    dotenvy::var("CASS_RAW_MIRROR_FSYNC")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
 #[derive(Debug, Clone)]
 pub struct RawMirrorCaptureInput<'a> {
     pub data_dir: &'a Path,
@@ -689,8 +695,9 @@ fn append_prune_audit_log(root: &Path, report: &RawMirrorPruneReport) -> Result<
         writeln!(file, "{record}")
             .with_context(|| format!("write raw mirror prune audit {}", audit_path.display()))?;
     }
-    file.sync_all()
-        .with_context(|| format!("sync raw mirror prune audit {}", audit_path.display()))?;
+    sync_open_file_if_required(&file, || {
+        format!("sync raw mirror prune audit {}", audit_path.display())
+    })?;
     sync_parent(&audit_path)?;
     Ok(audit_path)
 }
@@ -995,8 +1002,9 @@ fn copy_source_to_private_temp(
         hasher.update(&buffer[..read]);
         bytes_copied = bytes_copied.saturating_add(read as u64);
     }
-    temp.sync_all()
-        .with_context(|| format!("sync raw mirror temp {}", temp_path.display()))?;
+    sync_open_file_if_required(&temp, || {
+        format!("sync raw mirror temp {}", temp_path.display())
+    })?;
 
     let final_source_metadata = source
         .metadata()
@@ -1159,8 +1167,9 @@ fn publish_manifest_bytes_create_new(
     let mut temp = private_create_new_file(&temp_path)?;
     temp.write_all(manifest_bytes)
         .with_context(|| format!("write raw mirror manifest temp {}", temp_path.display()))?;
-    temp.sync_all()
-        .with_context(|| format!("sync raw mirror manifest temp {}", temp_path.display()))?;
+    sync_open_file_if_required(&temp, || {
+        format!("sync raw mirror manifest temp {}", temp_path.display())
+    })?;
 
     match fs::hard_link(&temp_path, manifest_path) {
         Ok(()) => {
@@ -1241,7 +1250,7 @@ fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u
             temp_path.display()
         )
     })?;
-    temp.sync_all().with_context(|| {
+    sync_open_file_if_required(&temp, || {
         format!(
             "sync raw mirror manifest update temp {}",
             temp_path.display()
@@ -1673,7 +1682,17 @@ fn set_private_create_file_mode(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn set_private_create_file_mode(_options: &mut OpenOptions) {}
 
+fn sync_open_file_if_required(message_file: &File, context: impl FnOnce() -> String) -> Result<()> {
+    if !raw_mirror_fsync_enabled() {
+        return Ok(());
+    }
+    message_file.sync_all().with_context(context)
+}
+
 fn sync_file(path: &Path) -> Result<()> {
+    if !raw_mirror_fsync_enabled() {
+        return Ok(());
+    }
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
@@ -1686,6 +1705,9 @@ fn sync_file(path: &Path) -> Result<()> {
 
 #[cfg(not(windows))]
 fn sync_parent(path: &Path) -> Result<()> {
+    if !raw_mirror_fsync_enabled() {
+        return Ok(());
+    }
     let Some(parent) = path.parent() else {
         return Ok(());
     };

@@ -4,9 +4,8 @@ use frankensearch::lexical::{
     BooleanQuery, CASS_SCHEMA_HASH as FS_CASS_SCHEMA_HASH, CassFields as FsCassFields,
     CassQueryFilters as FsCassQueryFilters, CassQueryToken as FsCassQueryToken,
     CassSourceFilter as FsCassSourceFilter, CassWildcardPattern as FsCassWildcardPattern, Count,
-    IndexReader, IndexRecordOption, LexicalDocHit as FsLexicalDocHit,
-    LexicalSearchResult as FsLexicalSearchResult, Occur, Query, ReloadPolicy, Searcher,
-    SnippetConfig as FsSnippetConfig, TantivyDocument, Term, TermQuery, TopDocs, Value,
+    IndexReader, IndexRecordOption, LexicalDocHit as FsLexicalDocHit, Occur, Query, ReloadPolicy,
+    Searcher, SnippetConfig as FsSnippetConfig, TantivyDocument, Term, TermQuery, TopDocs, Value,
     cass_build_tantivy_query as fs_cass_build_tantivy_query,
     cass_has_boolean_operators as fs_cass_has_boolean_operators,
     cass_open_search_reader as fs_cass_open_search_reader,
@@ -488,6 +487,48 @@ const NO_LIMIT_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
 /// "no limit" search response. 1/16 leaves 93% of RAM for everything
 /// else on the box.
 const NO_LIMIT_RAM_DIVISOR: u64 = 16;
+
+/// Above this corpus size, exact Tantivy `Count` collection is not part of the
+/// default top-N path. Common-term counts on multi-million-document indexes can
+/// dominate the query and turn a five-hit search into a full corpus scan; robot
+/// output already reports lower-bound count precision when the exact total is
+/// not available.
+const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 50_000;
+const DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS: usize = 10_000;
+
+fn exact_total_count_max_docs() -> usize {
+    static MAX_DOCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_DOCS.get_or_init(|| {
+        dotenvy::var("CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS)
+    })
+}
+
+fn should_collect_exact_total_count(
+    index_doc_count: usize,
+    max_docs_for_exact_count: usize,
+) -> bool {
+    max_docs_for_exact_count > 0 && index_doc_count <= max_docs_for_exact_count
+}
+
+fn automatic_wildcard_fallback_max_docs() -> usize {
+    static MAX_DOCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_DOCS.get_or_init(|| {
+        dotenvy::var("CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS)
+    })
+}
+
+fn should_allow_automatic_wildcard_fallback(
+    index_doc_count: usize,
+    max_docs_for_automatic_wildcard: usize,
+) -> bool {
+    max_docs_for_automatic_wildcard > 0 && index_doc_count <= max_docs_for_automatic_wildcard
+}
 
 fn available_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -1316,12 +1357,17 @@ fn effective_field_mask(field_mask: FieldMask) -> FieldMask {
     }
 }
 
-fn execute_query_with_lazy_exact_count(
+struct CassLexicalSearchResult {
+    hits: Vec<FsLexicalDocHit>,
+    total_count: Option<usize>,
+}
+
+fn execute_query_with_bounded_exact_count(
     searcher: &Searcher,
     query: &dyn Query,
     limit: usize,
     offset: usize,
-) -> Result<FsLexicalSearchResult> {
+) -> Result<CassLexicalSearchResult> {
     let top_docs = searcher.search(
         query,
         &TopDocs::with_limit(limit)
@@ -1329,10 +1375,24 @@ fn execute_query_with_lazy_exact_count(
             .order_by_score(),
     )?;
     let page_saturated = top_docs.len() == limit;
+    let index_doc_count = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
     let total_count = if page_saturated {
-        searcher.search(query, &Count)?
+        if should_collect_exact_total_count(index_doc_count, exact_total_count_max_docs()) {
+            Some(searcher.search(query, &Count)?)
+        } else {
+            tracing::debug!(
+                index_doc_count,
+                exact_count_max_docs = exact_total_count_max_docs(),
+                limit,
+                offset,
+                "skipping exact Tantivy count on large saturated result page"
+            );
+            None
+        }
+    } else if offset > 0 && top_docs.is_empty() {
+        None
     } else {
-        offset.saturating_add(top_docs.len())
+        Some(offset.saturating_add(top_docs.len()))
     };
     let hits = top_docs
         .into_iter()
@@ -1344,7 +1404,7 @@ fn execute_query_with_lazy_exact_count(
         })
         .collect();
 
-    Ok(FsLexicalSearchResult { hits, total_count })
+    Ok(CassLexicalSearchResult { hits, total_count })
 }
 
 /// Result of a search operation with metadata about how matches were found
@@ -1360,11 +1420,10 @@ pub struct SearchResult {
     pub suggestions: Vec<QuerySuggestion>,
     /// ANN search statistics (present when --approximate was used)
     pub ann_stats: Option<crate::search::ann_index::AnnSearchStats>,
-    /// True total matching documents from the search engine (when available).
-    /// For lexical searches this comes from Tantivy's `Count` collector and
-    /// reflects the total number of documents matching the query, independent
-    /// of limit/offset pagination. `None` for semantic/hybrid/cached paths
-    /// where the true total is unknown.
+    /// True total matching documents from the search engine when that is cheap
+    /// and available. Large saturated lexical pages intentionally leave this as
+    /// `None`; robot output then reports `total_matches` as a lower bound
+    /// instead of forcing an expensive exact recount.
     pub total_count: Option<usize>,
 }
 
@@ -2479,9 +2538,10 @@ pub struct SearchClient {
     metrics: Metrics,
     cache_namespace: String,
     semantic: Mutex<Option<SemanticSearchState>>,
-    /// Total count from the most recent Tantivy query (via `Count` collector).
-    /// Populated by `search_tantivy`, read by `search_with_fallback` to report
-    /// the true total matching documents for `total_matches` in JSON output.
+    /// Exact total from the most recent Tantivy query when collecting it was
+    /// cheap enough. Large saturated pages leave this as `None` so robot output
+    /// can truthfully report lower-bound count precision without blocking the
+    /// top-N result path.
     last_tantivy_total_count: Mutex<Option<usize>>,
 }
 
@@ -3483,6 +3543,9 @@ impl SearchClient {
                     filtered.truncate(limit);
                     self.metrics.inc_cache_hits();
                     self.maybe_log_cache_metrics("hit");
+                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                        *tc = None;
+                    }
                     return Ok(filtered);
                 }
                 // Cache had entries but not enough to satisfy limit - shortfall, not miss
@@ -3536,7 +3599,7 @@ impl SearchClient {
                 field_mask,
             )?;
             if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                *tc = Some(tantivy_total_count);
+                *tc = tantivy_total_count;
             }
             if !hits.is_empty() {
                 let initial_hit_count = hits.len();
@@ -3571,7 +3634,7 @@ impl SearchClient {
                         field_mask,
                     )?;
                     if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = Some(retry_total_count);
+                        *tc = retry_total_count;
                     }
                     if !retry_hits.is_empty() {
                         (deduped_len, paged_hits) = page_hits(retry_hits);
@@ -3614,7 +3677,7 @@ impl SearchClient {
                 field_mask,
             )?;
             if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                *tc = Some(tantivy_total_count);
+                *tc = tantivy_total_count;
             }
             if !hits.is_empty() {
                 let initial_hit_count = hits.len();
@@ -3653,7 +3716,7 @@ impl SearchClient {
                         field_mask,
                     )?;
                     if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = Some(retry_total_count);
+                        *tc = retry_total_count;
                     }
                     if !retry_hits.is_empty() {
                         (deduped_len, paged_hits) = page_hits(retry_hits);
@@ -5557,7 +5620,7 @@ impl SearchClient {
         // First, try the normal search
         let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
-        // Capture the true total from Tantivy's Count collector (set during search_tantivy).
+        // Capture the exact Tantivy total when the query path could collect it cheaply.
         let tantivy_total = self
             .last_tantivy_total_count
             .lock()
@@ -5568,10 +5631,29 @@ impl SearchClient {
         let query_has_wildcards = query.contains('*');
         let has_boolean_or_phrase = fs_cass_has_boolean_operators(query);
         let is_sparse = should_try_wildcard_fallback(hits.len(), limit, offset, sparse_threshold);
+        let total_docs = self.total_docs();
+        let automatic_wildcard_allowed = should_allow_automatic_wildcard_fallback(
+            total_docs,
+            automatic_wildcard_fallback_max_docs(),
+        );
 
-        if !is_sparse || query_has_wildcards || has_boolean_or_phrase || query.trim().is_empty() {
+        if !is_sparse
+            || query_has_wildcards
+            || has_boolean_or_phrase
+            || query.trim().is_empty()
+            || !automatic_wildcard_allowed
+        {
             // Either we have enough results, query already has wildcards,
             // query uses boolean/phrases, or query is empty.
+            if is_sparse && !automatic_wildcard_allowed {
+                tracing::debug!(
+                    query,
+                    returned_hits = hits.len(),
+                    total_docs,
+                    automatic_wildcard_max_docs = automatic_wildcard_fallback_max_docs(),
+                    "skipping automatic wildcard fallback on large index"
+                );
+            }
             // Generate suggestions only if truly zero hits
             let suggestions = if hits.is_empty() && !query.trim().is_empty() {
                 self.generate_suggestions(query, &filters)
@@ -6087,7 +6169,7 @@ impl SearchClient {
         limit: usize,
         offset: usize,
         field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, usize)> {
+    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
         struct PendingTantivyHit {
             score: f32,
             doc: TantivyDocument,
@@ -6136,7 +6218,7 @@ impl SearchClient {
         let q: Box<dyn Query> = fs_cass_build_tantivy_query(raw_query, &fs_filters, fields);
 
         let prefix_only = is_prefix_only(sanitized_query);
-        let top_docs = execute_query_with_lazy_exact_count(&searcher, &*q, limit, offset)?;
+        let top_docs = execute_query_with_bounded_exact_count(&searcher, &*q, limit, offset)?;
         let tantivy_total_count = top_docs.total_count;
         let query_match_type = dominant_match_type(sanitized_query);
         let mut pending_hits = Vec::with_capacity(top_docs.hits.len());
@@ -6398,9 +6480,9 @@ impl SearchClient {
         filters: SearchFilters,
         limit: usize,
         field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, usize)> {
+    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
         let mut ranked_hits = Vec::new();
-        let mut total_count = 0usize;
+        let mut total_count = Some(0usize);
 
         for (shard_index, shard) in readers.iter().enumerate() {
             let (shard_hits, shard_total_count) = self.search_tantivy(
@@ -6413,7 +6495,10 @@ impl SearchClient {
                 0,
                 field_mask,
             )?;
-            total_count = total_count.saturating_add(shard_total_count);
+            total_count = match (total_count, shard_total_count) {
+                (Some(total), Some(shard_total)) => Some(total.saturating_add(shard_total)),
+                _ => None,
+            };
             for (shard_rank, hit) in shard_hits.into_iter().enumerate() {
                 ranked_hits.push(FederatedRankedHit {
                     hit,
@@ -14965,6 +15050,7 @@ mod tests {
 
         assert!(!result.wildcard_fallback);
         assert!(result.hits.len() >= 3); // has enough results
+        assert_eq!(result.total_count, Some(5));
 
         Ok(())
     }
@@ -18455,6 +18541,34 @@ mod tests {
         // Mirror case: an explicit override under the floor is lifted.
         let cap = compute_no_limit_result_cap_from(Some("1".to_string()), None, None);
         assert_eq!(cap, NO_LIMIT_RESULT_MIN);
+    }
+
+    #[test]
+    fn exact_total_count_policy_allows_small_indexes_only() {
+        assert!(should_collect_exact_total_count(49_999, 50_000));
+        assert!(should_collect_exact_total_count(50_000, 50_000));
+        assert!(!should_collect_exact_total_count(50_001, 50_000));
+    }
+
+    #[test]
+    fn exact_total_count_policy_zero_limit_disables_recount() {
+        assert!(!should_collect_exact_total_count(0, 0));
+        assert!(!should_collect_exact_total_count(1, 0));
+        assert!(!should_collect_exact_total_count(usize::MAX, 0));
+    }
+
+    #[test]
+    fn automatic_wildcard_fallback_policy_allows_small_indexes_only() {
+        assert!(should_allow_automatic_wildcard_fallback(9_999, 10_000));
+        assert!(should_allow_automatic_wildcard_fallback(10_000, 10_000));
+        assert!(!should_allow_automatic_wildcard_fallback(10_001, 10_000));
+    }
+
+    #[test]
+    fn automatic_wildcard_fallback_policy_zero_limit_disables_fallback() {
+        assert!(!should_allow_automatic_wildcard_fallback(0, 0));
+        assert!(!should_allow_automatic_wildcard_fallback(1, 0));
+        assert!(!should_allow_automatic_wildcard_fallback(usize::MAX, 0));
     }
 
     #[test]

@@ -15096,15 +15096,6 @@ fn probe_state_db(
     use frankensqlite::params;
 
     snapshot.opened = true;
-    if let Err(err) = crate::storage::sqlite::validate_fts_messages_integrity_for_connection(&conn)
-    {
-        snapshot.opened = false;
-        snapshot.open_error = Some(err.to_string());
-        snapshot.open_retryable = false;
-        snapshot.counts_skipped = true;
-        let _ = close_franken_cli_read_db(conn, db_path, reason);
-        return snapshot;
-    }
     snapshot.last_indexed_at = franken_query_row_map_retry(
         &conn,
         "SELECT value FROM meta WHERE key = 'last_indexed_at'",
@@ -15612,7 +15603,15 @@ fn state_meta_json_for_status(
     db_path: &Path,
     stale_threshold: u64,
 ) -> serde_json::Value {
-    state_meta_json_inner(data_dir, db_path, stale_threshold, true, None, false, true)
+    state_meta_json_full(
+        data_dir,
+        db_path,
+        stale_threshold,
+        true,
+        Some(false),
+        false,
+        true,
+    )
 }
 
 /// `coding_agent_session_search-d0rmo`: variant of `state_meta_json`
@@ -15622,8 +15621,10 @@ fn state_meta_json_for_status(
 /// budget on real corpora because COUNT(*) on conversations +
 /// messages is a full table scan. Health doesn't need exact
 /// counts to compute its readiness verdict (DB exists + opened +
-/// index fresh + not rebuilding); status keeps the size-based
-/// behavior because it explicitly surfaces totals to operators.
+/// index fresh + not rebuilding). Status still opens the DB to read cheap
+/// meta watermarks, but now uses a bounded no-count/no-fingerprint default;
+/// deep count/fingerprint probes belong to doctor/diag, not the routine
+/// readiness surface on multi-GB archives.
 ///
 /// `include_counts_override`:
 /// - `None`         → existing size-based logic (≤256 MB → counts).
@@ -18532,6 +18533,7 @@ impl SearchLexicalSelfHeal {
 struct SearchLexicalSelfHealDiagnosis {
     reason: String,
     checkpoint_refresh_allowed: bool,
+    existing_index_search_allowed: bool,
 }
 
 impl SearchLexicalSelfHealDiagnosis {
@@ -18539,6 +18541,15 @@ impl SearchLexicalSelfHealDiagnosis {
         Self {
             reason: reason.into(),
             checkpoint_refresh_allowed: false,
+            existing_index_search_allowed: false,
+        }
+    }
+
+    fn existing_index(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            checkpoint_refresh_allowed: false,
+            existing_index_search_allowed: true,
         }
     }
 
@@ -18546,11 +18557,12 @@ impl SearchLexicalSelfHealDiagnosis {
         Self {
             reason: reason.into(),
             checkpoint_refresh_allowed: true,
+            existing_index_search_allowed: false,
         }
     }
 
     fn permits_existing_index_during_active_rebuild(&self) -> bool {
-        self.reason == "lexical rebuild checkpoint missing"
+        self.existing_index_search_allowed
     }
 }
 
@@ -18582,7 +18594,7 @@ fn search_lexical_self_heal_diagnosis(
             retryable: true,
         })?;
     let Some(checkpoint) = checkpoint else {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
             "lexical rebuild checkpoint missing",
         )));
     };
@@ -18627,7 +18639,7 @@ fn search_lexical_self_heal_diagnosis(
         &current_storage_fingerprint,
         &checkpoint.storage_fingerprint,
     ) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
             "lexical checkpoint storage fingerprint no longer matches active database",
         )));
     }
@@ -18784,6 +18796,20 @@ fn ensure_lexical_assets_for_search(
                 );
             }
         }
+    }
+
+    if initial_index_exists && diagnosis.existing_index_search_allowed {
+        tracing::warn!(
+            reason = %reason,
+            data_dir = %data_dir.display(),
+            db_path = %db_path.display(),
+            "search detected stale lexical checkpoint metadata; using existing readable lexical index and deferring heavyweight repair to cass index"
+        );
+        return Ok(SearchLexicalSelfHeal {
+            action: "deferred-repair-searching-existing-index",
+            reason: Some(reason),
+            indexed_docs: None,
+        });
     }
 
     tracing::warn!(
@@ -19121,7 +19147,7 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
-    fn search_self_heal_rebuilds_when_same_db_content_changes_after_checkpoint() {
+    fn search_self_heal_defers_same_db_content_drift_to_index_run() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = data_dir.join("agent_search.db");
@@ -19153,6 +19179,10 @@ mod search_lexical_self_heal_tests {
             diagnosis.reason,
             "lexical checkpoint storage fingerprint no longer matches active database"
         );
+        assert!(
+            diagnosis.existing_index_search_allowed,
+            "same-db fingerprint drift should search the existing readable index and defer repair"
+        );
 
         let repair = ensure_lexical_assets_for_search(
             data_dir,
@@ -19162,14 +19192,24 @@ mod search_lexical_self_heal_tests {
             Instant::now(),
             false,
         )
-        .expect("search self-heal should rebuild after same-db content changes");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-        assert_eq!(repair.indexed_docs, Some(2));
+        .expect("search self-heal should not rebuild inline after same-db content changes");
+        assert_eq!(repair.action, "deferred-repair-searching-existing-index");
+        assert_eq!(repair.indexed_docs, None);
 
         let client = SearchClient::open(&index_path, Some(&db_path))
             .expect("open search client")
-            .expect("repaired index should open");
-        let hits = client
+            .expect("existing stale index should still open");
+        let old_hits = client
+            .search(
+                "oldsamepathneedle",
+                SearchFilters::default(),
+                5,
+                0,
+                FieldMask::FULL,
+            )
+            .expect("query existing lexical generation");
+        assert_eq!(old_hits.len(), 1);
+        let new_hits = client
             .search(
                 "newsamepathneedle",
                 SearchFilters::default(),
@@ -19177,9 +19217,8 @@ mod search_lexical_self_heal_tests {
                 0,
                 FieldMask::FULL,
             )
-            .expect("query repaired active-db index");
-        assert_eq!(hits.len(), 1);
-        assert!(hits[0].content.contains("newsamepathneedle"));
+            .expect("query content that still needs the next index run");
+        assert_eq!(new_hits.len(), 0);
     }
 
     #[test]
@@ -19296,7 +19335,7 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
-    fn search_self_heal_rebuilds_when_checkpoint_is_missing() {
+    fn search_self_heal_defers_missing_checkpoint_when_index_is_readable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         build_standalone_lexical_index_without_checkpoint(
@@ -19319,18 +19358,22 @@ mod search_lexical_self_heal_tests {
             Instant::now(),
             false,
         )
-        .expect("search self-heal should rebuild when checkpoint is missing");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-        assert_eq!(repair.indexed_docs, Some(1));
+        .expect(
+            "search self-heal should not rebuild inline when only checkpoint metadata is missing",
+        );
+        assert_eq!(repair.action, "deferred-repair-searching-existing-index");
+        assert_eq!(repair.indexed_docs, None);
 
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load rebuilt checkpoint")
-            .expect("checkpoint present");
-        assert!(stored_path_identity_matches(&checkpoint.db_path, &db_path));
+        assert!(
+            crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
+                .expect("load checkpoint")
+                .is_none(),
+            "foreground search should not synthesize unverifiable checkpoint metadata"
+        );
 
         let client = SearchClient::open(&index_path, Some(&db_path))
             .expect("open search client")
-            .expect("repaired index should open");
+            .expect("existing standalone index should still open");
         let active_hits = client
             .search(
                 "checkpointmissingautohealneedle",
@@ -19340,7 +19383,7 @@ mod search_lexical_self_heal_tests {
                 FieldMask::FULL,
             )
             .expect("query active-db term");
-        assert_eq!(active_hits.len(), 1);
+        assert_eq!(active_hits.len(), 0);
         let orphan_hits = client
             .search(
                 "orphanautohealneedle",
@@ -19350,7 +19393,7 @@ mod search_lexical_self_heal_tests {
                 FieldMask::FULL,
             )
             .expect("query standalone lexical term");
-        assert_eq!(orphan_hits.len(), 0);
+        assert_eq!(orphan_hits.len(), 1);
     }
 
     #[test]
@@ -36089,33 +36132,6 @@ fn doctor_coverage_risk_summary(
         sole_copy_warning_count,
         recommended_action: coverage_summary.recommended_action.clone(),
     }
-}
-
-fn collect_doctor_coverage_risk_summary(
-    data_dir: &Path,
-    db_path: &Path,
-) -> DoctorCoverageRiskSummary {
-    if !db_path.exists() {
-        return DoctorCoverageRiskSummary {
-            schema_version: 1,
-            status: "not_initialized".to_string(),
-            confidence_tier: "no_archive_rows".to_string(),
-            recommended_action: "Run 'cass index --full' once before coverage can be assessed."
-                .to_string(),
-            ..DoctorCoverageRiskSummary::default()
-        };
-    }
-    let source_inventory = collect_doctor_source_inventory(data_dir, db_path);
-    let raw_mirror = collect_doctor_raw_mirror_report(data_dir);
-    let backfill = collect_doctor_raw_mirror_backfill_report(data_dir, db_path, &raw_mirror, false);
-    let sole_copy_warnings = build_doctor_sole_copy_warnings(&backfill);
-    let coverage_summary = build_doctor_coverage_summary(
-        &source_inventory,
-        &raw_mirror,
-        &backfill,
-        &sole_copy_warnings,
-    );
-    doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len())
 }
 
 fn doctor_fast_coverage_risk_unchecked(db_exists: bool) -> DoctorCoverageRiskSummary {
@@ -64894,42 +64910,20 @@ fn run_status(
         let topology_budget =
             serde_json::to_value(crate::topology_budget::inspect_host_topology_budget())
                 .unwrap_or(serde_json::Value::Null);
-        // Commit fe3972dc deliberately dropped status_should_skip_db_open and
-        // its STATUS_COUNT_SCAN_MAX_DB_BYTES short-circuit; the policy is now
-        // "always probe via DB open" — see the commit message. This call site
-        // was missed in that cleanup; inlining the now-unconditional `true`.
-        let status_collects_coverage = db_exists;
-        let (coverage_risk, coverage_source, coverage_checked) = if status_collects_coverage {
-            (
-                collect_doctor_coverage_risk_summary(&data_dir, &db_path),
-                "status-inline-small-archive",
-                true,
-            )
-        } else {
-            (
-                doctor_fast_coverage_risk_unchecked(db_exists),
-                "status-fast-state",
-                false,
-            )
-        };
+        // Status is a readiness surface, not a doctor run. Deep coverage
+        // checks verify raw-mirror manifests and can hash very large archived
+        // blobs; doing that here made `cass status --json` CPU-bound on real
+        // archives. Keep the provenance explicit and route operators to doctor
+        // for sole-copy/source-coverage analysis.
+        let (coverage_risk, coverage_source, coverage_checked) = (
+            doctor_fast_coverage_risk_unchecked(db_exists),
+            "status-fast-state",
+            false,
+        );
         let sources_path = doctor_sources_config_path(&data_dir);
-        let (remote_source_sync_report, remote_source_archive_checked) = if status_collects_coverage
-        {
-            let source_inventory = collect_doctor_source_inventory(&data_dir, &db_path);
-            (
-                collect_doctor_remote_source_sync_report(
-                    &data_dir,
-                    &sources_path,
-                    &source_inventory,
-                ),
-                source_inventory.db_available && source_inventory.db_query_error.is_none(),
-            )
-        } else {
-            (
-                collect_doctor_remote_source_sync_fast_report(&data_dir, &sources_path),
-                false,
-            )
-        };
+        let remote_source_sync_report =
+            collect_doctor_remote_source_sync_fast_report(&data_dir, &sources_path);
+        let remote_source_archive_checked = false;
         let remote_source_sync_summary = doctor_remote_source_sync_runtime_summary(
             &remote_source_sync_report,
             "status-inline-local-config",

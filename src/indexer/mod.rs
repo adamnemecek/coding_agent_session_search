@@ -1393,6 +1393,21 @@ pub(crate) enum LexicalPopulationStrategy {
     DeferredAuthoritativeDbRebuild,
 }
 
+const DEFAULT_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON: &str = "large_populated_incremental_index_defers_authoritative_lexical_repair_until_explicit_full_or_force_rebuild";
+const BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON: &str =
+    "large_populated_incremental_index_bootstraps_missing_scan_watermark";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredIncrementalCanonicalLexicalRepair {
+    canonical_conversations: usize,
+    db_size_bytes: u64,
+    max_automatic_repair_db_size_bytes: u64,
+    observed_tantivy_docs: Option<usize>,
+    reason: &'static str,
+}
+
 impl LexicalPopulationStrategy {
     fn as_str(self) -> &'static str {
         match self {
@@ -1443,6 +1458,122 @@ fn lexical_population_strategy_requires_inline_tantivy(
         strategy,
         LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
     )
+}
+
+fn incremental_authoritative_lexical_repair_max_db_bytes() -> u64 {
+    dotenvy::var("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES)
+}
+
+fn force_incremental_authoritative_lexical_repair_enabled() -> bool {
+    dotenvy_truthy("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR")
+}
+
+fn incremental_missing_watermark_full_scan_max_db_bytes() -> u64 {
+    dotenvy::var("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES)
+}
+
+fn force_incremental_missing_watermark_full_scan_enabled() -> bool {
+    dotenvy_truthy("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN")
+}
+
+fn is_plain_populated_incremental_index_run(
+    opts: &IndexOptions,
+    canonical_conversations: usize,
+) -> bool {
+    canonical_conversations > 0
+        && !opts.full
+        && !opts.force_rebuild
+        && !opts.watch
+        && !opts.semantic
+        && !opts.build_hnsw
+        && opts
+            .watch_once_paths
+            .as_ref()
+            .is_none_or(|paths| paths.is_empty())
+}
+
+fn db_size_bytes_for_incremental_lexical_repair_policy(db_path: &Path) -> u64 {
+    std::fs::metadata(db_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrappedIncrementalScanWatermark {
+    canonical_conversations: usize,
+    db_size_bytes: u64,
+    max_automatic_full_scan_db_size_bytes: u64,
+    reason: &'static str,
+}
+
+fn should_bootstrap_missing_incremental_scan_watermark(
+    opts: &IndexOptions,
+    canonical_storage_rebuilt: bool,
+    canonical_conversations: usize,
+    needs_rebuild: bool,
+    retry_stale_index_ingest_quarantine: bool,
+    last_scan_ts: Option<i64>,
+) -> Option<BootstrappedIncrementalScanWatermark> {
+    if canonical_storage_rebuilt
+        || needs_rebuild
+        || retry_stale_index_ingest_quarantine
+        || last_scan_ts.is_some()
+        || !is_plain_populated_incremental_index_run(opts, canonical_conversations)
+        || force_incremental_missing_watermark_full_scan_enabled()
+    {
+        return None;
+    }
+
+    let db_size_bytes = db_size_bytes_for_incremental_lexical_repair_policy(&opts.db_path);
+    let max_automatic_full_scan_db_size_bytes =
+        incremental_missing_watermark_full_scan_max_db_bytes();
+    if db_size_bytes <= max_automatic_full_scan_db_size_bytes {
+        return None;
+    }
+
+    Some(BootstrappedIncrementalScanWatermark {
+        canonical_conversations,
+        db_size_bytes,
+        max_automatic_full_scan_db_size_bytes,
+        reason: BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON,
+    })
+}
+
+fn should_defer_incremental_authoritative_lexical_repair(
+    opts: &IndexOptions,
+    canonical_storage_rebuilt: bool,
+    canonical_conversations: usize,
+    authoritative_rebuild_required: bool,
+    observed_tantivy_docs: Option<usize>,
+) -> Option<DeferredIncrementalCanonicalLexicalRepair> {
+    if canonical_storage_rebuilt
+        || !authoritative_rebuild_required
+        || !is_plain_populated_incremental_index_run(opts, canonical_conversations)
+        || force_incremental_authoritative_lexical_repair_enabled()
+    {
+        return None;
+    }
+
+    let db_size_bytes = db_size_bytes_for_incremental_lexical_repair_policy(&opts.db_path);
+    let max_automatic_repair_db_size_bytes =
+        incremental_authoritative_lexical_repair_max_db_bytes();
+    if db_size_bytes <= max_automatic_repair_db_size_bytes {
+        return None;
+    }
+
+    Some(DeferredIncrementalCanonicalLexicalRepair {
+        canonical_conversations,
+        db_size_bytes,
+        max_automatic_repair_db_size_bytes,
+        observed_tantivy_docs,
+        reason: DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON,
+    })
 }
 
 fn record_lexical_population_strategy(
@@ -1503,6 +1634,25 @@ fn record_incremental_canonical_lexical_repair(
             canonical_messages: plan.canonical_messages,
             observed_tantivy_docs: plan.observed_tantivy_docs,
         });
+    }
+}
+
+fn record_deferred_incremental_canonical_lexical_repair(
+    progress: Option<&Arc<IndexingProgress>>,
+    deferred: &DeferredIncrementalCanonicalLexicalRepair,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut stats) = progress.stats.lock() {
+        stats.lexical_repair = Some(LexicalRepairStats {
+            kind: "deferred_authoritative_canonical_db_rebuild".to_string(),
+            reason: deferred.reason.to_string(),
+            canonical_conversations: deferred.canonical_conversations,
+            canonical_messages: 0,
+            observed_tantivy_docs: deferred.observed_tantivy_docs,
+        });
+        stats.lexical_update_deferred = true;
     }
 }
 
@@ -2156,6 +2306,7 @@ fn try_readonly_canonical_force_rebuild(
         "selected_lexical_population_strategy"
     );
 
+    ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
     let rebuild_start = Instant::now();
     let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
         &opts.db_path,
@@ -2985,6 +3136,24 @@ fn watch_startup_step_idx(sub_phase: &str) -> Option<u8> {
 /// can read as `if preflight_skip("watch_startup:cleanup_orphan_fk_rows") { ... }`.
 fn preflight_skip(sub_phase: &str) -> bool {
     watch_startup_preflight::should_skip(sub_phase)
+}
+
+fn dotenvy_truthy(var: &str) -> bool {
+    dotenvy::var(var)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn preflight_validate_fts_messages_enabled() -> bool {
+    dotenvy_truthy("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES")
+}
+
+fn preflight_cleanup_orphan_fk_rows_enabled() -> bool {
+    dotenvy_truthy("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS")
+}
+
+fn preflight_historical_salvage_discovery_enabled() -> bool {
+    dotenvy_truthy("CASS_PREFLIGHT_HISTORICAL_SALVAGE_DISCOVERY")
 }
 
 /// Per-batch / per-conversation / per-shard-flush atomic bump that the
@@ -8289,6 +8458,22 @@ fn should_salvage_historical_databases(
         || has_pending_historical_bundles
 }
 
+fn should_probe_pending_historical_bundles(
+    full_rebuild: bool,
+    canonical_storage_rebuilt: bool,
+    canonical_sessions_before_salvage: usize,
+    canonical_only_full_rebuild: bool,
+    operator_requested_discovery: bool,
+) -> bool {
+    if canonical_only_full_rebuild {
+        return false;
+    }
+    full_rebuild
+        || canonical_storage_rebuilt
+        || canonical_sessions_before_salvage == 0
+        || operator_requested_discovery
+}
+
 fn should_run_targeted_watch_once_only(
     has_watch_once_paths: bool,
     watch_enabled: bool,
@@ -12023,28 +12208,32 @@ fn connector_local_scan_since_ts_from_state(
     }
 }
 
-fn connector_local_scan_since_ts(
-    storage: &FrankenStorage,
-    connector_name: &str,
-    fallback_since_ts: Option<i64>,
-) -> Result<Option<i64>> {
-    Ok(connector_local_scan_since_ts_from_state(
-        fallback_since_ts,
-        storage.get_connector_last_scan_ts(connector_name)?,
-        storage.connector_has_conversations(connector_name)?,
-    ))
-}
-
 fn connector_local_scan_since_ts_map(
     storage: &FrankenStorage,
     fallback_since_ts: Option<i64>,
     connector_factories: &[(&'static str, ConnectorFactory)],
 ) -> Result<HashMap<&'static str, Option<i64>>> {
+    let connector_names = connector_factories
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+    let connector_states = storage.connector_scan_states(&connector_names)?;
+
     connector_factories
         .iter()
         .map(|(name, _)| {
-            connector_local_scan_since_ts(storage, name, fallback_since_ts)
-                .map(|since_ts| (*name, since_ts))
+            let (connector_last_scan_ts, connector_has_conversations) = connector_states
+                .get(*name)
+                .copied()
+                .unwrap_or((None, false));
+            Ok((
+                *name,
+                connector_local_scan_since_ts_from_state(
+                    fallback_since_ts,
+                    connector_last_scan_ts,
+                    connector_has_conversations,
+                ),
+            ))
         })
         .collect()
 }
@@ -12054,12 +12243,10 @@ fn explicit_scan_root_since_ts(
     built_in_local_root: &Path,
     fallback_since_ts: Option<i64>,
 ) -> Option<i64> {
-    if root.origin.is_local()
-        && matches!(
-            root.path.as_os_str().cmp(built_in_local_root.as_os_str()),
-            std::cmp::Ordering::Equal
-        )
-    {
+    // Configured local roots are local history, including opt-in backup
+    // directories. They must honor the incremental cutoff; otherwise a normal
+    // `cass index` can replay multi-GB backup archives on every run.
+    if root.origin.kind == SourceKind::Local || root.path == built_in_local_root {
         fallback_since_ts
     } else {
         None
@@ -12072,6 +12259,12 @@ pub fn run_index(
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
+    // flows. Keep routine indexing focused on the canonical conversation store
+    // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
+    // old inline analytics writes for targeted maintenance runs.
+    let _defer_analytics_guard =
+        crate::storage::sqlite::default_defer_analytics_updates_guard(true);
     set_progress_last_error(opts.progress.as_ref(), None);
     let initial_lock_mode = if opts.watch {
         SearchMaintenanceMode::WatchStartup
@@ -12193,7 +12386,7 @@ pub fn run_index(
     let index_path = index_dir(&opts.data_dir)?;
     complete_preflight_phase!();
     preflight_phase!("watch_startup:ensure_storage_headroom");
-    ensure_index_storage_headroom(&opts.data_dir, &opts.db_path)?;
+    ensure_index_startup_storage_headroom(&opts)?;
     complete_preflight_phase!();
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
         match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
@@ -12201,6 +12394,33 @@ pub fn run_index(
             &opts.db_path,
         ) {
             Ok(Some((_status, total_conversations))) => {
+                if let Some(deferred) = should_defer_incremental_authoritative_lexical_repair(
+                    &opts,
+                    false,
+                    total_conversations,
+                    true,
+                    None,
+                ) {
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        canonical_conversations = deferred.canonical_conversations,
+                        db_size_bytes = deferred.db_size_bytes,
+                        max_automatic_repair_db_size_bytes =
+                            deferred.max_automatic_repair_db_size_bytes,
+                        reason = deferred.reason,
+                        "deferring automatic resume of a large authoritative lexical rebuild during routine incremental index"
+                    );
+                    record_lexical_population_strategy(
+                        opts.progress.as_ref(),
+                        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                        deferred.reason,
+                    );
+                    record_deferred_incremental_canonical_lexical_repair(
+                        opts.progress.as_ref(),
+                        &deferred,
+                    );
+                    return Ok(());
+                }
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     total_conversations,
@@ -12216,6 +12436,10 @@ pub fn run_index(
                     reason = "readonly_fast_resume_incomplete_nonresumable_lexical_rebuild",
                     "selected_lexical_population_strategy"
                 );
+                ensure_authoritative_lexical_rebuild_storage_headroom(
+                    &opts.data_dir,
+                    &opts.db_path,
+                )?;
                 let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
@@ -12297,13 +12521,29 @@ pub fn run_index(
     complete_preflight_phase!();
 
     preflight_phase!("watch_startup:validate_fts_messages");
-    // cass#265: `CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES=1` short-
-    // circuits the FTS5 full-table integrity scan, which is one of
-    // the three most likely wedge candidates on multi-GB DBs. When
-    // skipped, any genuine FTS corruption surfaces later on the next
-    // real write.
-    let _validate_fts_skipped = preflight_skip("watch_startup:validate_fts_messages");
-    if !_validate_fts_skipped && let Err(err) = storage.validate_fts_messages_integrity() {
+    // cass#265/cass#272 follow-up: this derived fallback-FTS repair
+    // probe can be multi-minute on large databases before any real
+    // indexing work starts. Routine indexing now skips it by default;
+    // operators investigating fallback FTS corruption can restore the
+    // old preflight with CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES=1, and
+    // can still bypass that explicit probe with
+    // CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES=1.
+    let validate_fts_requested = preflight_validate_fts_messages_enabled();
+    let validate_fts_skipped =
+        validate_fts_requested && preflight_skip("watch_startup:validate_fts_messages");
+    if !validate_fts_requested {
+        tracing::debug!(
+            target: "cass::indexer::preflight",
+            db_path = %opts.db_path.display(),
+            "skipping opt-in derived fallback FTS preflight validation before indexing"
+        );
+    } else if validate_fts_skipped {
+        tracing::debug!(
+            target: "cass::indexer::preflight",
+            db_path = %opts.db_path.display(),
+            "operator skip suppressed opt-in derived fallback FTS preflight validation before indexing"
+        );
+    } else if let Err(err) = storage.validate_fts_messages_integrity() {
         let detail = format!("{err:#}");
         if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
             &detail,
@@ -12398,22 +12638,30 @@ pub fn run_index(
     }
 
     preflight_phase!("watch_startup:cleanup_orphan_fk_rows");
-    // cass#202 self-heal: a Connection dropped mid-transaction (the
-    // `drop_close` warning) can leave child rows persisted without a matching
-    // parent. Sweep before the indexer touches the DB so one bad commit cannot
-    // poison every future run. A failed sweep is now fatal for this run:
-    // continuing after OOM/corruption can reuse a poisoned connection and make
-    // the canonical archive worse.
+    // cass#202 self-heal: a Connection dropped mid-transaction can
+    // leave child rows persisted without a matching parent. The sweep
+    // remains available as an explicit maintenance preflight, but it
+    // is not a safe default on large archives: it walks broad message
+    // ranges before any real indexing work starts.
     //
-    // cass#265: the cass#265 reporter confirmed this is the wedging
-    // step on a 3.25 GB / 7,566-conversation / 417,234-message DB
-    // (v0.6.6 lock file `phase=watch_startup:cleanup_orphan_fk_rows`).
-    // `CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1` lets the operator
-    // bypass the sweep so cass can actually run while the underlying
-    // fsqlite B-tree descent bug is being root-caused. The skip is
-    // intentionally per-step so it doesn't disable the rest of the
-    // preflight (cass#202 OOM detection still fires for other paths).
-    if preflight_skip("watch_startup:cleanup_orphan_fk_rows") {
+    // cass#265/cass#272 follow-up: both external reports and the
+    // local profile of the production archive show this preflight can
+    // peg CPU inside `collect_orphan_message_ids` / fsqlite page-cache
+    // eviction for minutes. Routine indexing skips it by default; run
+    // with CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1 to force the old
+    // repair behavior, or combine that with
+    // CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1 to suppress an
+    // explicit operator opt-in.
+    let cleanup_orphans_requested = preflight_cleanup_orphan_fk_rows_enabled();
+    let cleanup_orphans_skipped =
+        cleanup_orphans_requested && preflight_skip("watch_startup:cleanup_orphan_fk_rows");
+    if !cleanup_orphans_requested {
+        tracing::debug!(
+            target: "cass::fk_repair",
+            db_path = %opts.db_path.display(),
+            "skipping opt-in orphan-FK cleanup preflight before indexing"
+        );
+    } else if cleanup_orphans_skipped {
         tracing::warn!(
             target: "cass::fk_repair",
             db_path = %opts.db_path.display(),
@@ -12486,8 +12734,34 @@ pub fn run_index(
             &opts.db_path,
             initial_canonical_sessions_before_salvage,
         )? {
-            initial_matching_lexical_checkpoint = status;
-            restart_pending_lexical_rebuild_from_zero = true;
+            if let Some(deferred) = should_defer_incremental_authoritative_lexical_repair(
+                &opts,
+                canonical_storage_rebuilt,
+                initial_canonical_sessions_before_salvage,
+                true,
+                None,
+            ) {
+                tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    canonical_conversations = deferred.canonical_conversations,
+                    db_size_bytes = deferred.db_size_bytes,
+                    max_automatic_repair_db_size_bytes =
+                        deferred.max_automatic_repair_db_size_bytes,
+                    reason = deferred.reason,
+                    "deferring pending lexical rebuild resume during routine incremental index"
+                );
+                initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus {
+                    has_pending_resume: false,
+                    ..status
+                };
+                record_deferred_incremental_canonical_lexical_repair(
+                    opts.progress.as_ref(),
+                    &deferred,
+                );
+            } else {
+                initial_matching_lexical_checkpoint = status;
+                restart_pending_lexical_rebuild_from_zero = true;
+            }
         } else if populated_explicit_watch_once_only {
             if let Some(status) =
                 matching_completed_lexical_rebuild_state_status_without_fingerprint(
@@ -12652,6 +12926,33 @@ pub fn run_index(
     complete_preflight_phase!();
     let mut needs_rebuild =
         should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
+    let large_incremental_authoritative_lexical_repair_probe_deferred =
+        should_defer_incremental_authoritative_lexical_repair(
+            &opts,
+            canonical_storage_rebuilt,
+            initial_canonical_sessions_before_salvage,
+            true,
+            observed_tantivy_docs,
+        );
+    let deferred_incremental_authoritative_lexical_repair = if tantivy_requires_rebuild {
+        large_incremental_authoritative_lexical_repair_probe_deferred
+    } else {
+        None
+    };
+    if let Some(deferred) = &deferred_incremental_authoritative_lexical_repair {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            canonical_conversations = deferred.canonical_conversations,
+            db_size_bytes = deferred.db_size_bytes,
+            max_automatic_repair_db_size_bytes =
+                deferred.max_automatic_repair_db_size_bytes,
+            observed_tantivy_docs = deferred.observed_tantivy_docs,
+            reason = deferred.reason,
+            "deferring heavyweight authoritative lexical repair during routine incremental index"
+        );
+        record_deferred_incremental_canonical_lexical_repair(opts.progress.as_ref(), deferred);
+        needs_rebuild = false;
+    }
     let initial_needs_rebuild = needs_rebuild;
 
     if needs_rebuild && let Some(p) = &opts.progress {
@@ -12722,6 +13023,7 @@ pub fn run_index(
             reason = "resume_incomplete_authoritative_db_rebuild_from_checkpoint",
             "selected_lexical_population_strategy"
         );
+        ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
         let rebuild = if restart_pending_lexical_rebuild_from_zero {
             rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                 &opts.db_path,
@@ -12776,10 +13078,33 @@ pub fn run_index(
         let canonical_sessions_before_salvage = initial_canonical_sessions_before_salvage;
         // See CASS #153: plain --full must always rescan the filesystem.
         // --force-rebuild with existing sessions skips rescan (fast path).
-        let mut has_pending_historical_bundles = if canonical_only_full_rebuild {
-            false
-        } else {
+        //
+        // cass#272 performance follow-up: routine incremental refreshes on a
+        // populated canonical archive should not probe historical bundles at
+        // startup. Discovery opens candidate backup/snapshot DBs and can wedge
+        // in fsqlite page-cache eviction before real indexing starts. Keep the
+        // automatic path for explicit full/rebuilt/empty recovery, and expose
+        // the old populated-incremental discovery behavior behind
+        // CASS_PREFLIGHT_HISTORICAL_SALVAGE_DISCOVERY=1.
+        let probe_pending_historical_bundles = should_probe_pending_historical_bundles(
+            opts.full,
+            canonical_storage_rebuilt,
+            canonical_sessions_before_salvage,
+            canonical_only_full_rebuild,
+            preflight_historical_salvage_discovery_enabled(),
+        );
+        let mut has_pending_historical_bundles = if probe_pending_historical_bundles {
             storage.has_pending_historical_bundles(&opts.db_path)?
+        } else {
+            tracing::debug!(
+                target: "cass::historical_salvage",
+                db_path = %opts.db_path.display(),
+                canonical_sessions_before_salvage,
+                canonical_storage_rebuilt,
+                canonical_only_full_rebuild,
+                "skipping opt-in historical bundle discovery during populated incremental index startup"
+            );
+            false
         };
         let targeted_watch_once_only = should_run_targeted_watch_once_only(
             has_explicit_watch_once_paths,
@@ -12803,6 +13128,7 @@ pub fn run_index(
             opened_fresh_for_full,
             canonical_sessions_before_salvage,
             has_pending_historical_bundles,
+            probe_pending_historical_bundles,
             canonical_only_full_rebuild,
             targeted_watch_once_only,
             should_salvage_historical,
@@ -12875,6 +13201,7 @@ pub fn run_index(
         };
         let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0
             && should_evaluate_incremental_canonical_lexical_repair(&repair_context)
+            && large_incremental_authoritative_lexical_repair_probe_deferred.is_none()
             // cass#265: `CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES=1`
             // short-circuits the entire incremental-canonical-lexical-
             // repair branch — `count_total_messages_exact` issues a
@@ -12949,6 +13276,7 @@ pub fn run_index(
 
         if rebuild_from_canonical_only {
             drop(t_index.take());
+            ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
             let rebuild_start = std::time::Instant::now();
             let rebuild_convs = canonical_sessions_before_salvage;
             let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
@@ -13010,6 +13338,10 @@ pub fn run_index(
                 );
 
                 drop(t_index.take());
+                ensure_authoritative_lexical_rebuild_storage_headroom(
+                    &opts.data_dir,
+                    &opts.db_path,
+                )?;
                 let rebuild_convs = count_total_conversations_exact(&storage)?;
                 let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
@@ -13047,11 +13379,18 @@ pub fn run_index(
                 );
             } else {
                 let (lexical_strategy, lexical_strategy_reason) =
-                    resolve_lexical_population_strategy(
-                        needs_rebuild,
-                        opts.full,
-                        historical_salvage.messages_imported,
-                    );
+                    if let Some(deferred) = &deferred_incremental_authoritative_lexical_repair {
+                        (
+                            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                            deferred.reason,
+                        )
+                    } else {
+                        resolve_lexical_population_strategy(
+                            needs_rebuild,
+                            opts.full,
+                            historical_salvage.messages_imported,
+                        )
+                    };
                 record_lexical_population_strategy_if_unset(
                     opts.progress.as_ref(),
                     lexical_strategy,
@@ -13095,12 +13434,35 @@ pub fn run_index(
                 // Get last scan timestamp for incremental indexing.
                 // If full rebuild or force_rebuild, scan everything (since_ts = None).
                 // Otherwise, only scan files modified since last successful scan.
-                let since_ts = non_watch_scan_since_ts(
-                    opts.full,
-                    needs_rebuild,
-                    stale_index_ingest_quarantine_retry.is_some(),
-                    storage.get_last_scan_ts().unwrap_or(None),
-                );
+                let last_scan_ts = storage.get_last_scan_ts().unwrap_or(None);
+                let bootstrap_missing_scan_watermark =
+                    should_bootstrap_missing_incremental_scan_watermark(
+                        &opts,
+                        canonical_storage_rebuilt,
+                        canonical_sessions_before_salvage,
+                        needs_rebuild,
+                        stale_index_ingest_quarantine_retry.is_some(),
+                        last_scan_ts,
+                    );
+                let since_ts = if let Some(bootstrap) = &bootstrap_missing_scan_watermark {
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        canonical_conversations = bootstrap.canonical_conversations,
+                        db_size_bytes = bootstrap.db_size_bytes,
+                        max_automatic_full_scan_db_size_bytes =
+                            bootstrap.max_automatic_full_scan_db_size_bytes,
+                        reason = bootstrap.reason,
+                        "bootstrapping missing incremental scan watermark on a large populated archive; use --full or CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN=1 for deliberate historical backfill"
+                    );
+                    Some(scan_start_ts.saturating_sub(1).max(0))
+                } else {
+                    non_watch_scan_since_ts(
+                        opts.full,
+                        needs_rebuild,
+                        stale_index_ingest_quarantine_retry.is_some(),
+                        last_scan_ts,
+                    )
+                };
 
                 if since_ts.is_some() {
                     tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
@@ -13179,6 +13541,10 @@ pub fn run_index(
                         "inline lexical updates were deferred during non-watch scan; rebuilding lexical assets from canonical SQLite"
                     );
                     drop(t_index.take());
+                    ensure_authoritative_lexical_rebuild_storage_headroom(
+                        &opts.data_dir,
+                        &opts.db_path,
+                    )?;
                     let rebuild_convs = count_total_conversations_exact(&storage)?;
                     let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                         &opts.db_path,
@@ -13250,6 +13616,10 @@ pub fn run_index(
                         skipped_noop_full_scan_authoritative_rebuild = true;
                     } else {
                         drop(t_index.take());
+                        ensure_authoritative_lexical_rebuild_storage_headroom(
+                            &opts.data_dir,
+                            &opts.db_path,
+                        )?;
                         let rebuild_convs = count_total_conversations_exact(&storage)?;
                         let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                             &opts.db_path,
@@ -13489,6 +13859,18 @@ pub fn run_index(
         tracing::info!(
             db_path = %opts.db_path.display(),
             "skipping final lexical checkpoint refresh because targeted watch-once startup does not need broad checkpoint maintenance"
+        );
+    } else if let Some(deferred) = &large_incremental_authoritative_lexical_repair_probe_deferred {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            canonical_conversations = deferred.canonical_conversations,
+            db_size_bytes = deferred.db_size_bytes,
+            max_automatic_repair_db_size_bytes =
+                deferred.max_automatic_repair_db_size_bytes,
+            reason = deferred.reason,
+            inserted_conversations = scan_canonical_mutations.inserted_conversations,
+            inserted_messages = scan_canonical_mutations.inserted_messages,
+            "skipping final lexical checkpoint refresh because this large incremental run deferred expensive lexical repair probes"
         );
     } else if should_skip_noop_final_lexical_checkpoint_refresh(
         opts.full,
@@ -14822,12 +15204,52 @@ fn orphan_fk_cleanup_failed_index_error(db_path: &Path, err: &anyhow::Error) -> 
 
 const INDEX_MIN_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
 
-fn ensure_index_storage_headroom(data_dir: &Path, db_path: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexStorageHeadroomRequirement {
+    IncrementalStartup,
+    AuthoritativeLexicalRebuild,
+}
+
+fn index_startup_storage_headroom_requirement(
+    full: bool,
+    force_rebuild: bool,
+) -> IndexStorageHeadroomRequirement {
+    if full || force_rebuild {
+        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+    } else {
+        IndexStorageHeadroomRequirement::IncrementalStartup
+    }
+}
+
+fn ensure_index_startup_storage_headroom(opts: &IndexOptions) -> Result<()> {
+    ensure_index_storage_headroom(
+        &opts.data_dir,
+        &opts.db_path,
+        index_startup_storage_headroom_requirement(opts.full, opts.force_rebuild),
+    )
+}
+
+fn ensure_authoritative_lexical_rebuild_storage_headroom(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    ensure_index_storage_headroom(
+        data_dir,
+        db_path,
+        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+    )
+}
+
+fn ensure_index_storage_headroom(
+    data_dir: &Path,
+    db_path: &Path,
+    requirement: IndexStorageHeadroomRequirement,
+) -> Result<()> {
     if index_disk_headroom_check_disabled() {
         return Ok(());
     }
 
-    let required = required_index_headroom_bytes(db_path);
+    let required = required_index_headroom_bytes(db_path, requirement);
     for probe_path in existing_headroom_probe_paths(data_dir, db_path) {
         let available = fs2::available_space(&probe_path).with_context(|| {
             format!(
@@ -14914,9 +15336,17 @@ fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn required_index_headroom_bytes(db_path: &Path) -> u64 {
-    let db_bundle_bytes = database_bundle_size_bytes(db_path);
-    INDEX_MIN_FREE_SPACE_BYTES.max(db_bundle_bytes.saturating_mul(2))
+fn required_index_headroom_bytes(
+    db_path: &Path,
+    requirement: IndexStorageHeadroomRequirement,
+) -> u64 {
+    match requirement {
+        IndexStorageHeadroomRequirement::IncrementalStartup => INDEX_MIN_FREE_SPACE_BYTES,
+        IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild => {
+            let db_bundle_bytes = database_bundle_size_bytes(db_path);
+            INDEX_MIN_FREE_SPACE_BYTES.max(db_bundle_bytes.saturating_mul(2))
+        }
+    }
 }
 
 fn database_bundle_size_bytes(db_path: &Path) -> u64 {
@@ -24981,6 +25411,318 @@ pub mod persist {
             );
         }
 
+        fn incremental_repair_policy_test_options(
+            data_dir: std::path::PathBuf,
+            db_path: std::path::PathBuf,
+        ) -> crate::indexer::IndexOptions {
+            crate::indexer::IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path,
+                data_dir,
+                semantic: false,
+                build_hnsw: false,
+                embedder: "fnv1a-384".to_string(),
+                progress: None,
+                watch_interval_secs: 30,
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn large_incremental_authoritative_lexical_repair_defers_by_default() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "8",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            let deferred = crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                &opts,
+                false,
+                42,
+                true,
+                Some(7),
+            )
+            .expect("large populated incremental repair should be deferred");
+
+            assert_eq!(deferred.canonical_conversations, 42);
+            assert_eq!(deferred.db_size_bytes, 16);
+            assert_eq!(deferred.max_automatic_repair_db_size_bytes, 8);
+            assert_eq!(deferred.observed_tantivy_docs, Some(7));
+            assert_eq!(
+                deferred.reason,
+                crate::indexer::DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn small_incremental_authoritative_lexical_repair_keeps_automatic_repair() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "1024",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"tiny").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &opts, false, 42, true, None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn explicit_incremental_authoritative_lexical_repair_override_keeps_automatic_repair() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "1",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR", "1");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &opts, false, 42, true, None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn non_plain_incremental_modes_keep_authoritative_lexical_repair_behavior() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES",
+                "1",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let base =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            let mut full = base.clone();
+            full.full = true;
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &full, false, 42, true, None,
+                ),
+                None
+            );
+
+            let mut force_rebuild = base.clone();
+            force_rebuild.force_rebuild = true;
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &force_rebuild,
+                    false,
+                    42,
+                    true,
+                    None,
+                ),
+                None
+            );
+
+            let mut watch_once = base;
+            watch_once.watch_once_paths = Some(vec![dir.path().join("session.jsonl")]);
+            assert_eq!(
+                crate::indexer::should_defer_incremental_authoritative_lexical_repair(
+                    &watch_once,
+                    false,
+                    42,
+                    true,
+                    None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn large_missing_incremental_scan_watermark_bootstraps_by_default() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
+                "8",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            let bootstrap = crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                &opts, false, 42, false, false, None,
+            )
+            .expect("large populated incremental run should bootstrap missing scan watermark");
+
+            assert_eq!(bootstrap.canonical_conversations, 42);
+            assert_eq!(bootstrap.db_size_bytes, 16);
+            assert_eq!(bootstrap.max_automatic_full_scan_db_size_bytes, 8);
+            assert_eq!(
+                bootstrap.reason,
+                crate::indexer::BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn existing_or_small_missing_incremental_scan_watermark_keeps_full_scan_behavior() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
+                "1024",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"tiny").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &opts, false, 42, false, false, None,
+                ),
+                None
+            );
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &opts,
+                    false,
+                    42,
+                    false,
+                    false,
+                    Some(1_700_000_000_000),
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn explicit_missing_watermark_full_scan_override_keeps_historical_rescan() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
+                "1",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "1");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let opts =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &opts, false, 42, false, false, None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn non_plain_missing_watermark_modes_keep_historical_scan_behavior() {
+            let _max_guard = set_env(
+                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
+                "1",
+            );
+            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
+            let base =
+                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
+
+            let mut full = base.clone();
+            full.full = true;
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &full, false, 42, false, false, None,
+                ),
+                None
+            );
+
+            let mut force_rebuild = base.clone();
+            force_rebuild.force_rebuild = true;
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &force_rebuild,
+                    false,
+                    42,
+                    false,
+                    false,
+                    None,
+                ),
+                None
+            );
+
+            let mut watch_once = base;
+            watch_once.watch_once_paths = Some(vec![dir.path().join("session.jsonl")]);
+            assert_eq!(
+                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
+                    &watch_once,
+                    false,
+                    42,
+                    false,
+                    false,
+                    None,
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn deferred_incremental_authoritative_lexical_repair_is_reported_in_progress_stats() {
+            let progress = std::sync::Arc::new(crate::indexer::IndexingProgress::default());
+            let deferred = crate::indexer::DeferredIncrementalCanonicalLexicalRepair {
+                canonical_conversations: 42,
+                db_size_bytes: 16,
+                max_automatic_repair_db_size_bytes: 8,
+                observed_tantivy_docs: Some(7),
+                reason: crate::indexer::DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON,
+            };
+
+            crate::indexer::record_deferred_incremental_canonical_lexical_repair(
+                Some(&progress),
+                &deferred,
+            );
+
+            let stats = progress.stats.lock().unwrap();
+            assert!(stats.lexical_update_deferred);
+            assert_eq!(
+                stats.lexical_repair,
+                Some(crate::indexer::LexicalRepairStats {
+                    kind: "deferred_authoritative_canonical_db_rebuild".to_string(),
+                    reason: crate::indexer::DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON
+                        .to_string(),
+                    canonical_conversations: 42,
+                    canonical_messages: 0,
+                    observed_tantivy_docs: Some(7),
+                })
+            );
+        }
+
         #[test]
         fn incremental_canonical_lexical_repair_short_circuits_when_full_or_force_paths_apply() {
             let base = crate::indexer::IncrementalCanonicalLexicalRepairContext {
@@ -28310,6 +29052,90 @@ mod tests {
                 "skip env var for {sub_phase} must strip the watch_startup: namespace; got {env_name}"
             );
         }
+    }
+
+    #[test]
+    fn validate_fts_messages_preflight_is_opt_in() {
+        {
+            let _guard = unset_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES");
+            assert!(
+                !super::preflight_validate_fts_messages_enabled(),
+                "routine indexing must not run the derived fallback FTS validation probe by default"
+            );
+        }
+
+        for value in ["1", "true", "TRUE", "yes", "YES"] {
+            let _guard = set_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES", value);
+            assert!(
+                super::preflight_validate_fts_messages_enabled(),
+                "{value:?} should enable the opt-in fallback FTS validation preflight"
+            );
+        }
+
+        for value in ["0", "false", "FALSE", "no", "NO", ""] {
+            let _guard = set_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES", value);
+            assert!(
+                !super::preflight_validate_fts_messages_enabled(),
+                "{value:?} should leave fallback FTS validation skipped for routine indexing"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_fts_messages_skip_does_not_imply_opt_in() {
+        let _validate_guard = unset_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES");
+        let _skip_guard = set_env_var("CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES", "1");
+
+        assert!(
+            !super::preflight_validate_fts_messages_enabled(),
+            "the legacy skip knob must not turn the expensive fallback FTS validation probe on"
+        );
+        assert!(
+            super::preflight_skip("watch_startup:validate_fts_messages"),
+            "the skip knob should still parse truthfully when an explicit opt-in path consults it"
+        );
+    }
+
+    #[test]
+    fn cleanup_orphan_fk_rows_preflight_is_opt_in() {
+        {
+            let _guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
+            assert!(
+                !super::preflight_cleanup_orphan_fk_rows_enabled(),
+                "routine indexing must not run the broad orphan-FK cleanup sweep by default"
+            );
+        }
+
+        for value in ["1", "true", "TRUE", "yes", "YES"] {
+            let _guard = set_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS", value);
+            assert!(
+                super::preflight_cleanup_orphan_fk_rows_enabled(),
+                "{value:?} should enable the opt-in orphan-FK cleanup preflight"
+            );
+        }
+
+        for value in ["0", "false", "FALSE", "no", "NO", ""] {
+            let _guard = set_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS", value);
+            assert!(
+                !super::preflight_cleanup_orphan_fk_rows_enabled(),
+                "{value:?} should leave orphan-FK cleanup skipped for routine indexing"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_orphan_fk_rows_skip_does_not_imply_opt_in() {
+        let _cleanup_guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
+        let _skip_guard = set_env_var("CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS", "1");
+
+        assert!(
+            !super::preflight_cleanup_orphan_fk_rows_enabled(),
+            "the legacy skip knob must not turn the expensive orphan-FK cleanup sweep on"
+        );
+        assert!(
+            super::preflight_skip("watch_startup:cleanup_orphan_fk_rows"),
+            "the skip knob should still parse truthfully when an explicit opt-in path consults it"
+        );
     }
 
     /// Regression for #258. The heartbeat thread must refresh
@@ -33442,6 +34268,17 @@ mod tests {
         Box::new(WatermarkSensitiveRemoteConnector)
     }
 
+    fn configured_local_scan_root(path: PathBuf) -> ScanRoot {
+        let mut root = ScanRoot::local(path);
+        root.origin = Origin {
+            source_id: "backup-local".to_string(),
+            kind: SourceKind::Local,
+            host: None,
+        };
+        root.platform = Some(Platform::Linux);
+        root
+    }
+
     fn ensure_since_ts_matches(
         actual: Option<i64>,
         expected: Option<i64>,
@@ -35164,7 +36001,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_scan_roots_force_scan_from_start() -> Result<()> {
+    fn configured_scan_root_watermark_policy_matches_source_kind() -> Result<()> {
         ensure_since_ts_matches(
             explicit_scan_root_since_ts(
                 &ScanRoot::remote(
@@ -35193,8 +36030,17 @@ mod tests {
                 Path::new("/tmp/cass-data"),
                 Some(1234),
             ),
+            Some(1234),
+            "configured local roots are local history sources and must honor the normal incremental watermark",
+        )?;
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(
+                &ScanRoot::local(PathBuf::from("/tmp/backup-root")),
+                Path::new("/tmp/cass-data"),
+                None,
+            ),
             None,
-            "configured local roots outside the built-in local data root need the same full-scan treatment as remote mirrors",
+            "full rebuilds still scan configured local roots from the beginning",
         )?;
         Ok(())
     }
@@ -35946,6 +36792,81 @@ mod tests {
     }
 
     #[test]
+    fn streaming_configured_local_scan_roots_honor_connector_watermark() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let local_root_path = tmp.path().join("backup-local").join("claude");
+        std::fs::create_dir_all(&local_root_path)?;
+        std::fs::write(
+            local_root_path.join("remote-watermark.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"local backup\"}\n",
+        )?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        storage.set_connector_last_scan_ts("claude", i64::MAX)?;
+        let local_since_by_connector = connector_local_scan_since_ts_map(
+            &storage,
+            Some(1234),
+            &[(
+                "claude",
+                watermark_sensitive_remote_connector_factory as ConnectorFactory,
+            )],
+        )?;
+        assert_eq!(
+            local_since_by_connector.get("claude").copied().flatten(),
+            Some(i64::MAX - 1),
+            "configured-root scan must see the connector-specific watermark"
+        );
+        assert_eq!(
+            explicit_scan_root_since_ts(
+                &configured_local_scan_root(local_root_path.clone()),
+                &data_dir,
+                local_since_by_connector.get("claude").copied().flatten(),
+            ),
+            Some(i64::MAX - 1),
+            "configured local roots must preserve the connector-specific cutoff"
+        );
+        let index_path = index_dir(&data_dir)?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: String::from("fastembed"),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_streaming_index_with_connector_factories(
+            &storage,
+            Some(&mut index),
+            &opts,
+            Some(i64::MAX),
+            LexicalPopulationStrategy::IncrementalInline,
+            vec![configured_local_scan_root(local_root_path)],
+            vec![("claude", watermark_sensitive_remote_connector_factory)],
+            FrankenStorage::now_millis(),
+        )
+        .context("configured local roots should keep the connector incremental watermark")?;
+
+        ensure_canonical_mutations(
+            mutations.canonical_mutations,
+            CanonicalMutationCounts::default(),
+            "streaming configured local scan roots",
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn streaming_index_fails_closed_when_producer_panics() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -36056,6 +36977,79 @@ mod tests {
                 inserted_messages: 1,
             },
             "batch configured scan roots",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn batch_configured_local_scan_roots_honor_connector_watermark() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let local_root_path = tmp.path().join("backup-local").join("claude");
+        std::fs::create_dir_all(&local_root_path)?;
+        std::fs::write(
+            local_root_path.join("remote-watermark.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"local backup\"}\n",
+        )?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        storage.set_connector_last_scan_ts("claude", i64::MAX)?;
+        let local_since_by_connector = connector_local_scan_since_ts_map(
+            &storage,
+            Some(1234),
+            &[(
+                "claude",
+                watermark_sensitive_remote_connector_factory as ConnectorFactory,
+            )],
+        )?;
+        assert_eq!(
+            local_since_by_connector.get("claude").copied().flatten(),
+            Some(i64::MAX - 1),
+            "configured-root scan must see the connector-specific watermark"
+        );
+        assert_eq!(
+            explicit_scan_root_since_ts(
+                &configured_local_scan_root(local_root_path.clone()),
+                &data_dir,
+                local_since_by_connector.get("claude").copied().flatten(),
+            ),
+            Some(i64::MAX - 1),
+            "configured local roots must preserve the connector-specific cutoff"
+        );
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: String::from("fastembed"),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            Some(i64::MAX),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            vec![configured_local_scan_root(local_root_path)],
+            vec![("claude", watermark_sensitive_remote_connector_factory)],
+            FrankenStorage::now_millis(),
+        )
+        .context("configured local roots should keep the connector incremental watermark")?;
+
+        ensure_canonical_mutations(
+            mutations.canonical_mutations,
+            CanonicalMutationCounts::default(),
+            "batch configured local scan roots",
         )?;
         Ok(())
     }
@@ -36357,6 +37351,63 @@ mod tests {
 
         assert_eq!(wal, PathBuf::from("/tmp/cass.db-wal"));
         assert_eq!(shm, PathBuf::from("/tmp/cass.db-shm"));
+    }
+
+    #[test]
+    fn incremental_index_startup_headroom_uses_safety_floor_not_archive_clone_size() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        std::fs::write(database_path_with_suffix(&db_path, "-wal"), b"wal").unwrap();
+        std::fs::write(database_path_with_suffix(&db_path, "-shm"), b"shm").unwrap();
+
+        assert_eq!(
+            index_startup_storage_headroom_requirement(false, false),
+            IndexStorageHeadroomRequirement::IncrementalStartup,
+            "plain cass index must not demand full-rebuild scratch space before it knows a full rebuild is needed"
+        );
+        assert_eq!(
+            required_index_headroom_bytes(
+                &db_path,
+                IndexStorageHeadroomRequirement::IncrementalStartup,
+            ),
+            INDEX_MIN_FREE_SPACE_BYTES,
+            "routine incremental startup should require only the safety floor"
+        );
+    }
+
+    #[test]
+    fn full_and_force_rebuild_startup_headroom_keep_archive_clone_requirement() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        std::fs::write(database_path_with_suffix(&db_path, "-wal"), vec![0_u8; 256]).unwrap();
+        std::fs::write(database_path_with_suffix(&db_path, "-shm"), vec![0_u8; 512]).unwrap();
+        let clone_requirement =
+            INDEX_MIN_FREE_SPACE_BYTES.max(database_bundle_size_bytes(&db_path).saturating_mul(2));
+
+        assert_eq!(
+            index_startup_storage_headroom_requirement(true, false),
+            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+        );
+        assert_eq!(
+            index_startup_storage_headroom_requirement(false, true),
+            IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild
+        );
+        assert_eq!(
+            required_index_headroom_bytes(
+                &db_path,
+                IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild,
+            ),
+            clone_requirement,
+            "full/force rebuilds still need enough scratch for atomic publish safety"
+        );
     }
 
     #[test]
@@ -37008,6 +38059,38 @@ mod tests {
         assert!(!should_salvage_historical_databases(
             false, 43_678, true, true
         ));
+    }
+
+    #[test]
+    fn pending_historical_bundle_probe_skips_populated_incremental_by_default() {
+        assert!(
+            !should_probe_pending_historical_bundles(false, false, 43_678, false, false),
+            "routine populated incremental index must not open historical backup bundles before indexing"
+        );
+    }
+
+    #[test]
+    fn pending_historical_bundle_probe_keeps_recovery_paths() {
+        assert!(
+            should_probe_pending_historical_bundles(true, false, 43_678, false, false),
+            "--full is an explicit heavy recovery/rebuild path and keeps historical discovery"
+        );
+        assert!(
+            should_probe_pending_historical_bundles(false, true, 43_678, false, false),
+            "freshly rebuilt canonical storage keeps historical discovery"
+        );
+        assert!(
+            should_probe_pending_historical_bundles(false, false, 0, false, false),
+            "empty canonical archives keep historical discovery so seed recovery still works"
+        );
+        assert!(
+            should_probe_pending_historical_bundles(false, false, 43_678, false, true),
+            "operators can explicitly request populated-incremental historical discovery"
+        );
+        assert!(
+            !should_probe_pending_historical_bundles(true, true, 0, true, true),
+            "canonical-only full rebuilds must not broaden into historical salvage"
+        );
     }
 
     #[test]
