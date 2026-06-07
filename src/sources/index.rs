@@ -100,14 +100,14 @@ impl IndexError {
     /// Get a user-friendly help message for this error.
     pub fn help_message(&self) -> &'static str {
         match self {
-            IndexError::DiskFull => "Free disk space on remote and retry.",
-            IndexError::Timeout(_) => {
+            Self::DiskFull => "Free disk space on remote and retry.",
+            Self::Timeout(_) => {
                 "Index timed out. Try running manually: ssh host 'cass index'"
             }
-            IndexError::PermissionDenied => "Check file permissions in agent data directories.",
-            IndexError::CassNotFound => "cass is not installed. Run installation first.",
-            IndexError::SshFailed(_) => "Check SSH connection and credentials.",
-            IndexError::HostPressure(_) => {
+            Self::PermissionDenied => "Check file permissions in agent data directories.",
+            Self::CassNotFound => "cass is not installed. Run installation first.",
+            Self::SshFailed(_) => "Check SSH connection and credentials.",
+            Self::HostPressure(_) => {
                 "Remote host is currently busy. Retry later or run indexing manually when idle."
             }
             _ => "See error details above.",
@@ -216,11 +216,11 @@ pub enum IndexStage {
 impl std::fmt::Display for IndexStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IndexStage::Starting => write!(f, "Starting"),
-            IndexStage::Scanning { agent } => write!(f, "Scanning {}", agent),
-            IndexStage::Building => write!(f, "Building index"),
-            IndexStage::Complete => write!(f, "Complete"),
-            IndexStage::Failed { error } => write!(f, "Failed: {}", error),
+            Self::Starting => write!(f, "Starting"),
+            Self::Scanning { agent } => write!(f, "Scanning {}", agent),
+            Self::Building => write!(f, "Building index"),
+            Self::Complete => write!(f, "Complete"),
+            Self::Failed { error } => write!(f, "Failed: {}", error),
         }
     }
 }

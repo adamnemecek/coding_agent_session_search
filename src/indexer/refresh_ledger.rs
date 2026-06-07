@@ -49,7 +49,7 @@ pub enum RefreshPhase {
 
 impl RefreshPhase {
     /// All phases in pipeline order.
-    pub const ALL: &'static [RefreshPhase] = &[
+    pub const ALL: &'static [Self] = &[
         Self::Scan,
         Self::Persist,
         Self::LexicalRebuild,

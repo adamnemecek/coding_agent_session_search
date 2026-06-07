@@ -83,11 +83,11 @@ impl HostState {
     /// Get the status badge for display (right-aligned).
     pub fn status_badge(&self) -> String {
         match self {
-            HostState::ReadyToSync => format!("{} Ready to sync", "✓".green()),
-            HostState::NeedsIndexing => format!("{} Needs indexing", "⚡".yellow()),
-            HostState::NeedsInstall => format!("{} Needs install", "⚠".yellow()),
-            HostState::Unreachable => format!("{} Unreachable", "✗".red()),
-            HostState::AlreadyConfigured => format!("{} Already setup", "═".cyan()),
+            Self::ReadyToSync => format!("{} Ready to sync", "✓".green()),
+            Self::NeedsIndexing => format!("{} Needs indexing", "⚡".yellow()),
+            Self::NeedsInstall => format!("{} Needs install", "⚠".yellow()),
+            Self::Unreachable => format!("{} Unreachable", "✗".red()),
+            Self::AlreadyConfigured => format!("{} Already setup", "═".cyan()),
         }
     }
 
@@ -95,14 +95,14 @@ impl HostState {
     pub fn is_selectable(&self) -> bool {
         matches!(
             self,
-            HostState::ReadyToSync | HostState::NeedsIndexing | HostState::NeedsInstall
+            Self::ReadyToSync | Self::NeedsIndexing | Self::NeedsInstall
         )
     }
 
     /// Check if this host should be pre-selected.
     pub fn should_preselect(&self) -> bool {
         // Pre-select ready and needs-indexing hosts; don't pre-select needs-install
-        matches!(self, HostState::ReadyToSync | HostState::NeedsIndexing)
+        matches!(self, Self::ReadyToSync | Self::NeedsIndexing)
     }
 }
 
@@ -616,15 +616,15 @@ pub enum InteractiveError {
 impl fmt::Display for InteractiveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InteractiveError::Cancelled => write!(f, "Operation cancelled by user"),
-            InteractiveError::NoHosts => write!(f, "No hosts available for selection"),
-            InteractiveError::NoSelectableHosts => {
+            Self::Cancelled => write!(f, "Operation cancelled by user"),
+            Self::NoHosts => write!(f, "No hosts available for selection"),
+            Self::NoSelectableHosts => {
                 write!(
                     f,
                     "No selectable hosts (all unreachable or already configured)"
                 )
             }
-            InteractiveError::NotATty => {
+            Self::NotATty => {
                 write!(
                     f,
                     "Interactive selection requires a terminal.\n\n\
@@ -633,7 +633,7 @@ impl fmt::Display for InteractiveError {
                      cass sources setup --non-interactive  # select all reachable"
                 )
             }
-            InteractiveError::IoError(msg) => write!(f, "IO error: {}", msg),
+            Self::IoError(msg) => write!(f, "IO error: {}", msg),
         }
     }
 }

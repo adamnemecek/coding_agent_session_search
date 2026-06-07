@@ -239,17 +239,17 @@ pub enum SizeLimitResult {
 impl SizeLimitResult {
     /// Returns true if export should proceed
     pub fn is_ok(&self) -> bool {
-        matches!(self, SizeLimitResult::Ok)
+        matches!(self, Self::Ok)
     }
 
     /// Returns true if there's a warning but export can proceed
     pub fn is_warning(&self) -> bool {
-        matches!(self, SizeLimitResult::Warning(_))
+        matches!(self, Self::Warning(_))
     }
 
     /// Returns true if export should be blocked
     pub fn is_error(&self) -> bool {
-        matches!(self, SizeLimitResult::ExceedsLimit(_))
+        matches!(self, Self::ExceedsLimit(_))
     }
 }
 
@@ -292,7 +292,7 @@ pub enum SizeWarning {
 impl std::fmt::Display for SizeWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SizeWarning::ApproachingLimit {
+            Self::ApproachingLimit {
                 actual,
                 limit,
                 percentage,
@@ -305,7 +305,7 @@ impl std::fmt::Display for SizeWarning {
                     format_bytes(*limit)
                 )
             }
-            SizeWarning::LargeFile { path, size } => {
+            Self::LargeFile { path, size } => {
                 write!(f, "Large file: {} ({})", path, format_bytes(*size))
             }
         }

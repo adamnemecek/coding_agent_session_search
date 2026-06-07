@@ -252,8 +252,8 @@ pub enum KeySlotType {
 impl From<SlotType> for KeySlotType {
     fn from(st: SlotType) -> Self {
         match st {
-            SlotType::Password => KeySlotType::Password,
-            SlotType::Recovery => KeySlotType::Recovery,
+            SlotType::Password => Self::Password,
+            SlotType::Recovery => Self::Recovery,
         }
     }
 }
@@ -262,9 +262,9 @@ impl KeySlotType {
     /// Display label for the slot type.
     pub fn label(self) -> &'static str {
         match self {
-            KeySlotType::Password => "Password",
-            KeySlotType::QrCode => "QR Code",
-            KeySlotType::Recovery => "Recovery Key",
+            Self::Password => "Password",
+            Self::QrCode => "QR Code",
+            Self::Recovery => "Recovery Key",
         }
     }
 }

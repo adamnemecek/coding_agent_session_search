@@ -705,7 +705,7 @@ impl ContrastLevel {
     }
 
     /// Check if this level meets the specified minimum requirement
-    pub fn meets(self, required: ContrastLevel) -> bool {
+    pub fn meets(self, required: Self) -> bool {
         match required {
             Self::Fail => true,
             Self::AALarge => !matches!(self, Self::Fail),

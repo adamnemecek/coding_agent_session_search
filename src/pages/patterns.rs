@@ -27,11 +27,11 @@ pub enum PatternCategory {
 impl PatternCategory {
     pub fn label(self) -> &'static str {
         match self {
-            PatternCategory::ApiKeys => "API Keys & Tokens",
-            PatternCategory::PrivateKeys => "Private Keys",
-            PatternCategory::ConnectionStrings => "Connection Strings",
-            PatternCategory::PersonalInfo => "Personal Information",
-            PatternCategory::InternalUrls => "Internal URLs",
+            Self::ApiKeys => "API Keys & Tokens",
+            Self::PrivateKeys => "Private Keys",
+            Self::ConnectionStrings => "Connection Strings",
+            Self::PersonalInfo => "Personal Information",
+            Self::InternalUrls => "Internal URLs",
         }
     }
 }

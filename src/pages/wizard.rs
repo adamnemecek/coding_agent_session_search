@@ -40,9 +40,9 @@ pub enum DeployTarget {
 impl std::fmt::Display for DeployTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DeployTarget::Local => write!(f, "Local export only"),
-            DeployTarget::GitHubPages => write!(f, "GitHub Pages"),
-            DeployTarget::CloudflarePages => write!(f, "Cloudflare Pages"),
+            Self::Local => write!(f, "Local export only"),
+            Self::GitHubPages => write!(f, "GitHub Pages"),
+            Self::CloudflarePages => write!(f, "Cloudflare Pages"),
         }
     }
 }

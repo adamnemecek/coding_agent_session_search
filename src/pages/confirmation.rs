@@ -42,12 +42,12 @@ impl ConfirmationStep {
     /// Get a human-readable label for the step.
     pub fn label(self) -> &'static str {
         match self {
-            ConfirmationStep::SecretScanAcknowledgment => "Secret Scan Acknowledgment",
-            ConfirmationStep::ContentReview => "Content Review",
-            ConfirmationStep::PublicPublishingWarning => "Public Publishing Warning",
-            ConfirmationStep::PasswordStrengthWarning => "Password Strength Warning",
-            ConfirmationStep::RecoveryKeyBackup => "Recovery Key Backup",
-            ConfirmationStep::FinalConfirmation => "Final Confirmation",
+            Self::SecretScanAcknowledgment => "Secret Scan Acknowledgment",
+            Self::ContentReview => "Content Review",
+            Self::PublicPublishingWarning => "Public Publishing Warning",
+            Self::PasswordStrengthWarning => "Password Strength Warning",
+            Self::RecoveryKeyBackup => "Recovery Key Backup",
+            Self::FinalConfirmation => "Final Confirmation",
         }
     }
 }

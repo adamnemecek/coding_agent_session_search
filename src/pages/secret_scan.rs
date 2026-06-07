@@ -30,28 +30,28 @@ pub enum SecretSeverity {
 impl SecretSeverity {
     fn rank(self) -> u8 {
         match self {
-            SecretSeverity::Critical => 0,
-            SecretSeverity::High => 1,
-            SecretSeverity::Medium => 2,
-            SecretSeverity::Low => 3,
+            Self::Critical => 0,
+            Self::High => 1,
+            Self::Medium => 2,
+            Self::Low => 3,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            SecretSeverity::Critical => "critical",
-            SecretSeverity::High => "high",
-            SecretSeverity::Medium => "medium",
-            SecretSeverity::Low => "low",
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
         }
     }
 
     fn styled(self, text: &str) -> String {
         match self {
-            SecretSeverity::Critical => style(text).red().bold().to_string(),
-            SecretSeverity::High => style(text).red().to_string(),
-            SecretSeverity::Medium => style(text).yellow().to_string(),
-            SecretSeverity::Low => style(text).blue().to_string(),
+            Self::Critical => style(text).red().bold().to_string(),
+            Self::High => style(text).red().to_string(),
+            Self::Medium => style(text).yellow().to_string(),
+            Self::Low => style(text).blue().to_string(),
         }
     }
 }
@@ -69,11 +69,11 @@ pub enum SecretLocation {
 impl SecretLocation {
     fn label(&self) -> &'static str {
         match self {
-            SecretLocation::ConversationTitle => "conversation.title",
-            SecretLocation::ConversationMetadata => "conversation.metadata",
-            SecretLocation::MessageContent => "message.content",
-            SecretLocation::MessageMetadata => "message.metadata",
-            SecretLocation::MessageSnippet => "message.snippet",
+            Self::ConversationTitle => "conversation.title",
+            Self::ConversationMetadata => "conversation.metadata",
+            Self::MessageContent => "message.content",
+            Self::MessageMetadata => "message.metadata",
+            Self::MessageSnippet => "message.snippet",
         }
     }
 }

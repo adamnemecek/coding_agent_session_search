@@ -15663,7 +15663,7 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                 // Ignore key-release events so toggle shortcuts (F1/F2, etc.)
                 // do not fire twice on terminals that report press+release.
                 if key.kind == ftui::KeyEventKind::Release {
-                    return CassMsg::Tick;
+                    return Self::Tick;
                 }
 
                 let ctrl = key.modifiers.contains(Modifiers::CTRL);
@@ -15672,236 +15672,236 @@ impl From<super::ftui_adapter::Event> for CassMsg {
 
                 match key.code {
                     // -- Force quit -----------------------------------------------
-                    KeyCode::Char('c') if ctrl => CassMsg::ForceQuit,
+                    KeyCode::Char('c') if ctrl => Self::ForceQuit,
 
                     // -- Escape / quit --------------------------------------------
-                    KeyCode::Escape => CassMsg::QuitRequested,
-                    KeyCode::F(10) => CassMsg::QuitRequested,
+                    KeyCode::Escape => Self::QuitRequested,
+                    KeyCode::F(10) => Self::QuitRequested,
 
                     // -- Help -----------------------------------------------------
-                    KeyCode::F(1) => CassMsg::HelpToggled,
-                    KeyCode::Char('?') if alt => CassMsg::HelpToggled,
+                    KeyCode::F(1) => Self::HelpToggled,
+                    KeyCode::Char('?') if alt => Self::HelpToggled,
 
                     // -- Theme ----------------------------------------------------
-                    KeyCode::F(2) if shift => CassMsg::ThemePreviousToggled,
-                    KeyCode::Char('t') if alt && shift => CassMsg::ThemePreviousToggled,
-                    KeyCode::Char('T') if alt && shift => CassMsg::ThemePreviousToggled,
-                    KeyCode::F(2) => CassMsg::ThemeToggled,
-                    KeyCode::Char('t') if alt && !shift => CassMsg::ThemeToggled,
-                    KeyCode::Char('T') if alt && !shift => CassMsg::ThemeToggled,
+                    KeyCode::F(2) if shift => Self::ThemePreviousToggled,
+                    KeyCode::Char('t') if alt && shift => Self::ThemePreviousToggled,
+                    KeyCode::Char('T') if alt && shift => Self::ThemePreviousToggled,
+                    KeyCode::F(2) => Self::ThemeToggled,
+                    KeyCode::Char('t') if alt && !shift => Self::ThemeToggled,
+                    KeyCode::Char('T') if alt && !shift => Self::ThemeToggled,
 
                     // -- Filters --------------------------------------------------
-                    KeyCode::F(3) if shift => CassMsg::FilterAgentSet(HashSet::new()),
-                    KeyCode::Char('g') if alt && shift => CassMsg::FilterAgentSet(HashSet::new()),
-                    KeyCode::Char('G') if alt && shift => CassMsg::FilterAgentSet(HashSet::new()),
-                    KeyCode::F(3) => CassMsg::InputModeEntered(InputMode::Agent),
+                    KeyCode::F(3) if shift => Self::FilterAgentSet(HashSet::new()),
+                    KeyCode::Char('g') if alt && shift => Self::FilterAgentSet(HashSet::new()),
+                    KeyCode::Char('G') if alt && shift => Self::FilterAgentSet(HashSet::new()),
+                    KeyCode::F(3) => Self::InputModeEntered(InputMode::Agent),
                     KeyCode::Char('g') if alt && !shift => {
-                        CassMsg::InputModeEntered(InputMode::Agent)
+                        Self::InputModeEntered(InputMode::Agent)
                     }
                     KeyCode::Char('G') if alt && !shift => {
-                        CassMsg::InputModeEntered(InputMode::Agent)
+                        Self::InputModeEntered(InputMode::Agent)
                     }
 
-                    KeyCode::F(4) if shift => CassMsg::FiltersClearAll,
-                    KeyCode::Char('w') if alt && shift => CassMsg::FiltersClearAll,
-                    KeyCode::Char('W') if alt && shift => CassMsg::FiltersClearAll,
-                    KeyCode::F(4) => CassMsg::InputModeEntered(InputMode::Workspace),
+                    KeyCode::F(4) if shift => Self::FiltersClearAll,
+                    KeyCode::Char('w') if alt && shift => Self::FiltersClearAll,
+                    KeyCode::Char('W') if alt && shift => Self::FiltersClearAll,
+                    KeyCode::F(4) => Self::InputModeEntered(InputMode::Workspace),
                     KeyCode::Char('w') if alt && !shift => {
-                        CassMsg::InputModeEntered(InputMode::Workspace)
+                        Self::InputModeEntered(InputMode::Workspace)
                     }
                     KeyCode::Char('W') if alt && !shift => {
-                        CassMsg::InputModeEntered(InputMode::Workspace)
+                        Self::InputModeEntered(InputMode::Workspace)
                     }
 
-                    KeyCode::F(5) if shift => CassMsg::TimePresetCycled,
-                    KeyCode::F(5) => CassMsg::InputModeEntered(InputMode::CreatedFrom),
-                    KeyCode::F(6) => CassMsg::InputModeEntered(InputMode::CreatedTo),
+                    KeyCode::F(5) if shift => Self::TimePresetCycled,
+                    KeyCode::F(5) => Self::InputModeEntered(InputMode::CreatedFrom),
+                    KeyCode::F(6) => Self::InputModeEntered(InputMode::CreatedTo),
 
                     // -- Context window -------------------------------------------
-                    KeyCode::F(7) => CassMsg::ContextWindowCycled,
-                    KeyCode::Char('c') if alt => CassMsg::ContextWindowCycled,
-                    KeyCode::Char('C') if alt => CassMsg::ContextWindowCycled,
+                    KeyCode::F(7) => Self::ContextWindowCycled,
+                    KeyCode::Char('c') if alt => Self::ContextWindowCycled,
+                    KeyCode::Char('C') if alt => Self::ContextWindowCycled,
 
                     // -- Editor ---------------------------------------------------
-                    KeyCode::F(8) => CassMsg::OpenInEditor,
-                    KeyCode::Char('o') if alt => CassMsg::OpenInEditor,
-                    KeyCode::Char('O') if alt => CassMsg::OpenInEditor,
+                    KeyCode::F(8) => Self::OpenInEditor,
+                    KeyCode::Char('o') if alt => Self::OpenInEditor,
+                    KeyCode::Char('O') if alt => Self::OpenInEditor,
 
                     // -- Match mode -----------------------------------------------
-                    KeyCode::F(9) => CassMsg::MatchModeCycled,
+                    KeyCode::F(9) => Self::MatchModeCycled,
 
                     // -- Source filter ---------------------------------------------
-                    KeyCode::F(11) if shift => CassMsg::SourceFilterMenuToggled,
-                    KeyCode::F(11) => CassMsg::SourceFilterCycled,
+                    KeyCode::F(11) if shift => Self::SourceFilterMenuToggled,
+                    KeyCode::F(11) => Self::SourceFilterCycled,
 
                     // -- Ranking --------------------------------------------------
-                    KeyCode::F(12) => CassMsg::RankingModeCycled,
-                    KeyCode::Char('r') if alt => CassMsg::RankingModeCycled,
-                    KeyCode::Char('R') if alt => CassMsg::RankingModeCycled,
+                    KeyCode::F(12) => Self::RankingModeCycled,
+                    KeyCode::Char('r') if alt => Self::RankingModeCycled,
+                    KeyCode::Char('R') if alt => Self::RankingModeCycled,
 
                     // -- Search mode (Alt+S) --------------------------------------
-                    KeyCode::Char('s') if ctrl && !shift => CassMsg::StatsBarToggled,
-                    KeyCode::Char('S') if ctrl && !shift => CassMsg::StatsBarToggled,
-                    KeyCode::Char('s') if alt => CassMsg::SearchModeCycled,
-                    KeyCode::Char('S') if alt => CassMsg::SearchModeCycled,
+                    KeyCode::Char('s') if ctrl && !shift => Self::StatsBarToggled,
+                    KeyCode::Char('S') if ctrl && !shift => Self::StatsBarToggled,
+                    KeyCode::Char('s') if alt => Self::SearchModeCycled,
+                    KeyCode::Char('S') if alt => Self::SearchModeCycled,
 
                     // -- Surface switch -------------------------------------------
-                    KeyCode::Char('a') if alt => CassMsg::AnalyticsEntered,
-                    KeyCode::Char('A') if alt => CassMsg::AnalyticsEntered,
+                    KeyCode::Char('a') if alt => Self::AnalyticsEntered,
+                    KeyCode::Char('A') if alt => Self::AnalyticsEntered,
 
                     // -- Macro recording (Alt+M) ----------------------------------
-                    KeyCode::Char('m') if alt => CassMsg::MacroRecordingToggled,
+                    KeyCode::Char('m') if alt => Self::MacroRecordingToggled,
 
                     // -- Command palette ------------------------------------------
-                    KeyCode::Char('p') if ctrl => CassMsg::PaletteOpened,
-                    KeyCode::Char('p') if alt => CassMsg::PaletteOpened,
+                    KeyCode::Char('p') if ctrl => Self::PaletteOpened,
+                    KeyCode::Char('p') if alt => Self::PaletteOpened,
 
                     // -- Result/action shortcuts (Alt+...) ------------------------
                     // Keep printable characters available for query editing.
-                    KeyCode::Char('/') if alt => CassMsg::PaneFilterOpened,
-                    KeyCode::Char('y') if alt => CassMsg::CopySnippet,
-                    KeyCode::Char('o') if alt => CassMsg::OpenInEditor,
-                    KeyCode::Char('v') if alt => CassMsg::ViewRaw,
-                    KeyCode::Char('J') if alt => CassMsg::ToggleJsonView,
-                    KeyCode::Char('r') if alt => CassMsg::ResultsRefreshed,
-                    KeyCode::Char('b') if alt => CassMsg::BulkActionsOpened,
-                    KeyCode::Char('g') if alt => CassMsg::GroupingCycled,
-                    KeyCode::Char('[') if alt => CassMsg::TimelineJumped { forward: false },
-                    KeyCode::Char(']') if alt => CassMsg::TimelineJumped { forward: true },
+                    KeyCode::Char('/') if alt => Self::PaneFilterOpened,
+                    KeyCode::Char('y') if alt => Self::CopySnippet,
+                    KeyCode::Char('o') if alt => Self::OpenInEditor,
+                    KeyCode::Char('v') if alt => Self::ViewRaw,
+                    KeyCode::Char('J') if alt => Self::ToggleJsonView,
+                    KeyCode::Char('r') if alt => Self::ResultsRefreshed,
+                    KeyCode::Char('b') if alt => Self::BulkActionsOpened,
+                    KeyCode::Char('g') if alt => Self::GroupingCycled,
+                    KeyCode::Char('[') if alt => Self::TimelineJumped { forward: false },
+                    KeyCode::Char(']') if alt => Self::TimelineJumped { forward: true },
 
                     // -- History ---------------------------------------------------
-                    KeyCode::Char('r') if ctrl && shift => CassMsg::IndexRefreshRequested,
-                    KeyCode::Char('r') if ctrl => CassMsg::HistoryCycled,
+                    KeyCode::Char('r') if ctrl && shift => Self::IndexRefreshRequested,
+                    KeyCode::Char('r') if ctrl => Self::HistoryCycled,
                     KeyCode::Char('n') if ctrl && shift => {
-                        CassMsg::HistoryNavigated { forward: false }
+                        Self::HistoryNavigated { forward: false }
                     }
-                    KeyCode::Char('N') if ctrl => CassMsg::HistoryNavigated { forward: false },
-                    KeyCode::Char('n') if ctrl => CassMsg::HistoryNavigated { forward: true },
+                    KeyCode::Char('N') if ctrl => Self::HistoryNavigated { forward: false },
+                    KeyCode::Char('n') if ctrl => Self::HistoryNavigated { forward: true },
 
                     // -- Saved views (Ctrl+1..9 save, Shift+1..9 load) -----------
-                    KeyCode::Char(c @ '1'..='9') if ctrl => CassMsg::ViewSaved(c as u8 - b'0'),
-                    KeyCode::Char(c @ '1'..='9') if shift => CassMsg::ViewLoaded(c as u8 - b'0'),
+                    KeyCode::Char(c @ '1'..='9') if ctrl => Self::ViewSaved(c as u8 - b'0'),
+                    KeyCode::Char(c @ '1'..='9') if shift => Self::ViewLoaded(c as u8 - b'0'),
 
                     // -- Clear / reset --------------------------------------------
-                    KeyCode::Delete if ctrl && shift => CassMsg::StateResetRequested,
-                    KeyCode::Delete if ctrl => CassMsg::FiltersClearAll,
+                    KeyCode::Delete if ctrl && shift => Self::StateResetRequested,
+                    KeyCode::Delete if ctrl => Self::FiltersClearAll,
 
                     // -- Update banner --------------------------------------------
                     KeyCode::Char('u') | KeyCode::Char('U') if alt => {
-                        CassMsg::UpdateUpgradeRequested
+                        Self::UpdateUpgradeRequested
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') if alt => {
-                        CassMsg::UpdateReleaseNotesRequested
+                        Self::UpdateReleaseNotesRequested
                     }
-                    KeyCode::Char('i') | KeyCode::Char('I') if alt => CassMsg::UpdateSkipped,
+                    KeyCode::Char('i') | KeyCode::Char('I') if alt => Self::UpdateSkipped,
 
                     // -- Swarm operations -----------------------------------------
-                    KeyCode::Char('w') if alt => CassMsg::SwarmEntered,
-                    KeyCode::Char('W') if alt => CassMsg::SwarmEntered,
+                    KeyCode::Char('w') if alt => Self::SwarmEntered,
+                    KeyCode::Char('W') if alt => Self::SwarmEntered,
 
                     // -- Sources management -----------------------------------------
-                    KeyCode::Char('s') if ctrl && shift => CassMsg::SourcesEntered,
-                    KeyCode::Char('S') if ctrl && shift => CassMsg::SourcesEntered,
+                    KeyCode::Char('s') if ctrl && shift => Self::SourcesEntered,
+                    KeyCode::Char('S') if ctrl && shift => Self::SourcesEntered,
 
                     // -- Inspector overlay -----------------------------------------
-                    KeyCode::Char('i') if ctrl && shift => CassMsg::InspectorToggled,
-                    KeyCode::Char('I') if ctrl => CassMsg::InspectorToggled,
+                    KeyCode::Char('i') if ctrl && shift => Self::InspectorToggled,
+                    KeyCode::Char('I') if ctrl => Self::InspectorToggled,
 
                     // -- Borders --------------------------------------------------
-                    KeyCode::Char('b') if ctrl => CassMsg::BordersToggled,
+                    KeyCode::Char('b') if ctrl => Self::BordersToggled,
 
                     // -- Undo/redo ------------------------------------------------
-                    KeyCode::Char('z') if ctrl && shift => CassMsg::Redo,
-                    KeyCode::Char('Z') if ctrl => CassMsg::Redo,
-                    KeyCode::Char('z') if ctrl => CassMsg::Undo,
+                    KeyCode::Char('z') if ctrl && shift => Self::Redo,
+                    KeyCode::Char('Z') if ctrl => Self::Redo,
+                    KeyCode::Char('z') if ctrl => Self::Undo,
 
                     // -- Line editing ---------------------------------------------
-                    KeyCode::Char('l') if ctrl => CassMsg::QueryCleared,
-                    KeyCode::Char('u') if ctrl => CassMsg::QueryLineKilled,
-                    KeyCode::Char('k') if ctrl => CassMsg::QueryForwardKilled,
-                    KeyCode::Char('w') if ctrl => CassMsg::QueryWordDeleted,
-                    KeyCode::Char('f') if ctrl => CassMsg::WildcardFallbackToggled,
+                    KeyCode::Char('l') if ctrl => Self::QueryCleared,
+                    KeyCode::Char('u') if ctrl => Self::QueryLineKilled,
+                    KeyCode::Char('k') if ctrl => Self::QueryForwardKilled,
+                    KeyCode::Char('w') if ctrl => Self::QueryWordDeleted,
+                    KeyCode::Char('f') if ctrl => Self::WildcardFallbackToggled,
 
                     // -- Density --------------------------------------------------
-                    KeyCode::Char('d') if ctrl => CassMsg::DensityModeCycled,
+                    KeyCode::Char('d') if ctrl => Self::DensityModeCycled,
 
                     // -- Multi-select ---------------------------------------------
-                    KeyCode::Char('x') if ctrl => CassMsg::SelectionToggled,
-                    KeyCode::Char('a') if ctrl => CassMsg::SelectAllToggled,
+                    KeyCode::Char('x') if ctrl => Self::SelectionToggled,
+                    KeyCode::Char('a') if ctrl => Self::SelectAllToggled,
                     // Compatibility path: many terminals encode Enter as Ctrl+M / Ctrl+J.
-                    KeyCode::Char('m') if ctrl && !alt && !shift => CassMsg::DetailOpened,
-                    KeyCode::Char('j') if ctrl && !alt && !shift => CassMsg::DetailOpened,
-                    KeyCode::Enter if ctrl => CassMsg::ItemEnqueued,
-                    KeyCode::Char('o') if ctrl => CassMsg::OpenAllQueued,
+                    KeyCode::Char('m') if ctrl && !alt && !shift => Self::DetailOpened,
+                    KeyCode::Char('j') if ctrl && !alt && !shift => Self::DetailOpened,
+                    KeyCode::Enter if ctrl => Self::ItemEnqueued,
+                    KeyCode::Char('o') if ctrl => Self::OpenAllQueued,
 
                     // -- Quick export ---------------------------------------------
-                    KeyCode::Char('e') if ctrl && shift => CassMsg::ExportMarkdownExecuted,
-                    KeyCode::Char('E') if ctrl && shift => CassMsg::ExportMarkdownExecuted,
-                    KeyCode::Char('e') if ctrl => CassMsg::ExportModalOpened,
+                    KeyCode::Char('e') if ctrl && shift => Self::ExportMarkdownExecuted,
+                    KeyCode::Char('E') if ctrl && shift => Self::ExportMarkdownExecuted,
+                    KeyCode::Char('e') if ctrl => Self::ExportModalOpened,
 
                     // -- Clipboard ------------------------------------------------
-                    KeyCode::Char('Y') if ctrl => CassMsg::CopyQuery,
-                    KeyCode::Char('y') if ctrl && shift => CassMsg::CopyQuery,
-                    KeyCode::Char('y') if ctrl => CassMsg::CopyPath,
-                    KeyCode::Char('c') if ctrl && shift => CassMsg::CopyContent,
+                    KeyCode::Char('Y') if ctrl => Self::CopyQuery,
+                    KeyCode::Char('y') if ctrl && shift => Self::CopyQuery,
+                    KeyCode::Char('y') if ctrl => Self::CopyPath,
+                    KeyCode::Char('c') if ctrl && shift => Self::CopyContent,
 
                     // -- Peek XL --------------------------------------------------
-                    KeyCode::Char(' ') if ctrl => CassMsg::PeekToggled,
+                    KeyCode::Char(' ') if ctrl => Self::PeekToggled,
 
                     // -- Navigation -----------------------------------------------
-                    KeyCode::BackTab => CassMsg::FocusDirectional {
+                    KeyCode::BackTab => Self::FocusDirectional {
                         direction: FocusDirection::Left,
                     },
-                    KeyCode::Tab if shift => CassMsg::FocusDirectional {
+                    KeyCode::Tab if shift => Self::FocusDirectional {
                         direction: FocusDirection::Left,
                     },
-                    KeyCode::Tab => CassMsg::FocusToggled,
-                    KeyCode::Up | KeyCode::Char('k') if alt => CassMsg::FocusDirectional {
+                    KeyCode::Tab => Self::FocusToggled,
+                    KeyCode::Up | KeyCode::Char('k') if alt => Self::FocusDirectional {
                         direction: FocusDirection::Up,
                     },
-                    KeyCode::Down | KeyCode::Char('j') if alt => CassMsg::FocusDirectional {
+                    KeyCode::Down | KeyCode::Char('j') if alt => Self::FocusDirectional {
                         direction: FocusDirection::Down,
                     },
-                    KeyCode::Left | KeyCode::Char('h') if alt => CassMsg::FocusDirectional {
+                    KeyCode::Left | KeyCode::Char('h') if alt => Self::FocusDirectional {
                         direction: FocusDirection::Left,
                     },
-                    KeyCode::Right | KeyCode::Char('l') if alt => CassMsg::FocusDirectional {
+                    KeyCode::Right | KeyCode::Char('l') if alt => Self::FocusDirectional {
                         direction: FocusDirection::Right,
                     },
                     // -- Cursor movement (query editing) --------------------------
-                    KeyCode::Left if ctrl => CassMsg::CursorWordMoved { forward: false },
-                    KeyCode::Right if ctrl => CassMsg::CursorWordMoved { forward: true },
-                    KeyCode::Left => CassMsg::CursorMoved { delta: -1 },
-                    KeyCode::Right => CassMsg::CursorMoved { delta: 1 },
-                    KeyCode::Delete => CassMsg::DeleteForward,
+                    KeyCode::Left if ctrl => Self::CursorWordMoved { forward: false },
+                    KeyCode::Right if ctrl => Self::CursorWordMoved { forward: true },
+                    KeyCode::Left => Self::CursorMoved { delta: -1 },
+                    KeyCode::Right => Self::CursorMoved { delta: 1 },
+                    KeyCode::Delete => Self::DeleteForward,
 
-                    KeyCode::Up => CassMsg::SelectionMoved { delta: -1 },
-                    KeyCode::Down => CassMsg::SelectionMoved { delta: 1 },
-                    KeyCode::Home => CassMsg::CursorJumped { to_end: false },
-                    KeyCode::End => CassMsg::CursorJumped { to_end: true },
-                    KeyCode::PageUp => CassMsg::PageScrolled { delta: -1 },
-                    KeyCode::PageDown => CassMsg::PageScrolled { delta: 1 },
-                    KeyCode::Enter => CassMsg::DetailOpened,
+                    KeyCode::Up => Self::SelectionMoved { delta: -1 },
+                    KeyCode::Down => Self::SelectionMoved { delta: 1 },
+                    KeyCode::Home => Self::CursorJumped { to_end: false },
+                    KeyCode::End => Self::CursorJumped { to_end: true },
+                    KeyCode::PageUp => Self::PageScrolled { delta: -1 },
+                    KeyCode::PageDown => Self::PageScrolled { delta: 1 },
+                    KeyCode::Enter => Self::DetailOpened,
 
                     // -- Pane sizing (Alt+=, Alt+-) -------------------------------
-                    KeyCode::Char('-') if alt => CassMsg::PaneShrunk,
-                    KeyCode::Char('=') if alt => CassMsg::PaneGrew,
-                    KeyCode::Char('+') if alt => CassMsg::PaneGrew,
+                    KeyCode::Char('-') if alt => Self::PaneShrunk,
+                    KeyCode::Char('=') if alt => Self::PaneGrew,
+                    KeyCode::Char('+') if alt => Self::PaneGrew,
 
                     // -- Detail pane toggle (Alt+D) -------------------------------
-                    KeyCode::Char('d') if alt => CassMsg::DetailPaneToggled,
-                    KeyCode::Char('D') if alt => CassMsg::DetailPaneToggled,
+                    KeyCode::Char('d') if alt => Self::DetailPaneToggled,
+                    KeyCode::Char('D') if alt => Self::DetailPaneToggled,
 
                     // -- Alt+digit pane switch ------------------------------------
-                    KeyCode::Char(c @ '1'..='9') if alt => CassMsg::ActivePaneChanged {
+                    KeyCode::Char(c @ '1'..='9') if alt => Self::ActivePaneChanged {
                         index: (c as u8 - b'1') as usize,
                     },
 
                     // -- Default: treat as query input ----------------------------
-                    KeyCode::Char(c) => CassMsg::QueryChanged(c.to_string()),
-                    KeyCode::Backspace => CassMsg::QueryChanged(String::new()),
+                    KeyCode::Char(c) => Self::QueryChanged(c.to_string()),
+                    KeyCode::Backspace => Self::QueryChanged(String::new()),
 
-                    _ => CassMsg::Tick, // Unhandled keys become no-op ticks
+                    _ => Self::Tick, // Unhandled keys become no-op ticks
                 }
             }
 
@@ -15909,58 +15909,58 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                 use ftui::core::event::MouseButton;
                 use ftui::core::event::MouseEventKind as Mek;
                 match mouse.kind {
-                    Mek::Down(MouseButton::Left) => CassMsg::MouseEvent {
+                    Mek::Down(MouseButton::Left) => Self::MouseEvent {
                         kind: MouseEventKind::LeftClick,
                         x: mouse.x,
                         y: mouse.y,
                     },
-                    Mek::Drag(MouseButton::Left) => CassMsg::MouseEvent {
+                    Mek::Drag(MouseButton::Left) => Self::MouseEvent {
                         kind: MouseEventKind::LeftDrag,
                         x: mouse.x,
                         y: mouse.y,
                     },
-                    Mek::Up(MouseButton::Left) => CassMsg::MouseEvent {
+                    Mek::Up(MouseButton::Left) => Self::MouseEvent {
                         kind: MouseEventKind::LeftRelease,
                         x: mouse.x,
                         y: mouse.y,
                     },
-                    Mek::Down(MouseButton::Right) => CassMsg::MouseEvent {
+                    Mek::Down(MouseButton::Right) => Self::MouseEvent {
                         kind: MouseEventKind::RightClick,
                         x: mouse.x,
                         y: mouse.y,
                     },
-                    Mek::Down(_) => CassMsg::Tick,
-                    Mek::ScrollUp => CassMsg::MouseEvent {
+                    Mek::Down(_) => Self::Tick,
+                    Mek::ScrollUp => Self::MouseEvent {
                         kind: MouseEventKind::ScrollUp,
                         x: mouse.x,
                         y: mouse.y,
                     },
-                    Mek::ScrollDown => CassMsg::MouseEvent {
+                    Mek::ScrollDown => Self::MouseEvent {
                         kind: MouseEventKind::ScrollDown,
                         x: mouse.x,
                         y: mouse.y,
                     },
-                    Mek::Moved => CassMsg::MouseEvent {
+                    Mek::Moved => Self::MouseEvent {
                         kind: MouseEventKind::Moved,
                         x: mouse.x,
                         y: mouse.y,
                     },
-                    _ => CassMsg::Tick,
+                    _ => Self::Tick,
                 }
             }
 
             Event::Paste(paste) => {
                 if paste.text.is_empty() {
-                    CassMsg::Tick
+                    Self::Tick
                 } else {
-                    CassMsg::QueryChanged(paste.text)
+                    Self::QueryChanged(paste.text)
                 }
             }
 
-            Event::Resize { width, height } => CassMsg::Resized { width, height },
-            Event::Focus(gained) => CassMsg::TerminalFocusChanged(gained),
-            Event::Tick => CassMsg::Tick,
-            _ => CassMsg::Tick,
+            Event::Resize { width, height } => Self::Resized { width, height },
+            Event::Focus(gained) => Self::TerminalFocusChanged(gained),
+            Event::Tick => Self::Tick,
+            _ => Self::Tick,
         }
     }
 }
@@ -19655,7 +19655,7 @@ impl super::ftui_adapter::Model for CassApp {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                let reset = CassApp {
+                let reset = Self {
                     data_dir,
                     db_path,
                     search_service,
@@ -19664,7 +19664,7 @@ impl super::ftui_adapter::Model for CassApp {
                     next_state_save_token,
                     state_file_io_epoch,
                     state_file_io_lock: state_file_io_lock_for_reset,
-                    ..CassApp::default()
+                    ..Self::default()
                 };
                 *self = reset;
                 // Re-resolve theme from the real data dir after reset so

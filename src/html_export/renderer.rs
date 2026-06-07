@@ -123,25 +123,25 @@ pub enum ToolStatus {
 impl ToolStatus {
     fn css_class(&self) -> &'static str {
         match self {
-            ToolStatus::Success => "tool-status-success",
-            ToolStatus::Error => "tool-status-error",
-            ToolStatus::Pending => "tool-status-pending",
+            Self::Success => "tool-status-success",
+            Self::Error => "tool-status-error",
+            Self::Pending => "tool-status-pending",
         }
     }
 
     fn icon_svg(&self) -> &'static str {
         match self {
-            ToolStatus::Success => ICON_CHECK,
-            ToolStatus::Error => ICON_X,
-            ToolStatus::Pending => ICON_LOADER,
+            Self::Success => ICON_CHECK,
+            Self::Error => ICON_X,
+            Self::Pending => ICON_LOADER,
         }
     }
 
     fn label(&self) -> &'static str {
         match self {
-            ToolStatus::Success => "success",
-            ToolStatus::Error => "error",
-            ToolStatus::Pending => "pending",
+            Self::Success => "success",
+            Self::Error => "error",
+            Self::Pending => "pending",
         }
     }
 }
@@ -168,10 +168,10 @@ impl MessageGroupType {
     /// Get the role icon for this group type.
     pub fn role_icon(&self) -> &'static str {
         match self {
-            MessageGroupType::User => "user",
-            MessageGroupType::Assistant => "assistant",
-            MessageGroupType::System => "system",
-            MessageGroupType::ToolOnly => "tool",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::System => "system",
+            Self::ToolOnly => "tool",
         }
     }
 }

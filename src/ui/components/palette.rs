@@ -136,14 +136,14 @@ impl PaletteGroup {
     }
 
     /// All groups in display order.
-    pub const ALL: &'static [PaletteGroup] = &[
-        PaletteGroup::Chrome,
-        PaletteGroup::Filter,
-        PaletteGroup::View,
-        PaletteGroup::Analytics,
-        PaletteGroup::Export,
-        PaletteGroup::Recording,
-        PaletteGroup::Sources,
+    pub const ALL: &'static [Self] = &[
+        Self::Chrome,
+        Self::Filter,
+        Self::View,
+        Self::Analytics,
+        Self::Export,
+        Self::Recording,
+        Self::Sources,
     ];
 }
 

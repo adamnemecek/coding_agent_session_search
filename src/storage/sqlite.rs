@@ -1083,7 +1083,7 @@ pub enum MigrationError {
 
 impl From<anyhow::Error> for MigrationError {
     fn from(e: anyhow::Error) -> Self {
-        MigrationError::Other(e.to_string())
+        Self::Other(e.to_string())
     }
 }
 
@@ -8930,7 +8930,7 @@ impl FrankenStorage {
         let mut pending_batch_first_row_id: Option<i64> = None;
         let mut pending_batch_last_row_id: Option<i64> = None;
 
-        let flush_batch = |storage: &FrankenStorage,
+        let flush_batch = |storage: &Self,
                            batch: &mut Vec<HistoricalBatchEntry>,
                            pending_messages: &mut usize,
                            pending_chars: &mut usize,
@@ -11297,7 +11297,7 @@ impl FrankenStorage {
 
                 let effective_started_at = conversation_effective_started_at(conv);
                 let day_id = effective_started_at
-                    .map(FrankenStorage::day_id_from_millis)
+                    .map(Self::day_id_from_millis)
                     .unwrap_or(0);
                 stats.record_delta(
                     &conv.agent_slug,
@@ -11335,7 +11335,7 @@ impl FrankenStorage {
                         .or(conversation_effective_started_at(conv))
                         .unwrap_or(0);
                     let msg_day_id = if msg_ts > 0 {
-                        FrankenStorage::day_id_from_millis(msg_ts)
+                        Self::day_id_from_millis(msg_ts)
                     } else {
                         conv_day_id
                     };
@@ -11394,7 +11394,7 @@ impl FrankenStorage {
 
                     let content_chars = msg.content.len() as i64;
                     let content_tokens_est = content_chars / 4;
-                    let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
+                    let msg_hour_id = Self::hour_id_from_millis(msg_ts);
                     let has_plan = has_plan_for_role(&role_s, &msg.content);
 
                     token_entries.push(TokenUsageEntry {
@@ -15491,7 +15491,7 @@ impl OutOfMemoryProbe for anyhow::Error {
 
 impl OutOfMemoryProbe for frankensqlite::FrankenError {
     fn is_out_of_memory(&self) -> bool {
-        matches!(self, frankensqlite::FrankenError::OutOfMemory)
+        matches!(self, Self::OutOfMemory)
     }
 }
 
@@ -15592,7 +15592,7 @@ pub struct FtsEntry {
 impl FtsEntry {
     /// Create an FTS entry from a message and conversation.
     pub fn from_message(message_id: i64, msg: &Message, conv: &Conversation) -> Self {
-        FtsEntry {
+        Self {
             content: msg.content.clone(),
             title: conv.title.clone().unwrap_or_default(),
             agent: conv.agent_slug.clone(),

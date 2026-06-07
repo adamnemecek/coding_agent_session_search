@@ -65,13 +65,13 @@ pub enum RedactionKind {
 impl RedactionKind {
     pub fn label(self) -> &'static str {
         match self {
-            RedactionKind::HomePath => "home_path",
-            RedactionKind::Username => "username",
-            RedactionKind::Email => "email",
-            RedactionKind::Hostname => "hostname",
-            RedactionKind::PathReplacement => "path_replace",
-            RedactionKind::CustomPattern => "custom_pattern",
-            RedactionKind::ProjectName => "project_name",
+            Self::HomePath => "home_path",
+            Self::Username => "username",
+            Self::Email => "email",
+            Self::Hostname => "hostname",
+            Self::PathReplacement => "path_replace",
+            Self::CustomPattern => "custom_pattern",
+            Self::ProjectName => "project_name",
         }
     }
 }

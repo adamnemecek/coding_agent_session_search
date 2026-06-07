@@ -22,10 +22,10 @@ enum Preset {
 impl Preset {
     fn message_target(self) -> usize {
         match self {
-            Preset::Small => 1_000,
-            Preset::Medium => 10_000,
-            Preset::Large => 50_000,
-            Preset::Xlarge => 100_000,
+            Self::Small => 1_000,
+            Self::Medium => 10_000,
+            Self::Large => 50_000,
+            Self::Xlarge => 100_000,
         }
     }
 }

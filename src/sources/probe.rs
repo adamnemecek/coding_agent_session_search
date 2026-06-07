@@ -125,14 +125,14 @@ impl CassStatus {
     pub fn is_installed(&self) -> bool {
         matches!(
             self,
-            CassStatus::Indexed { .. } | CassStatus::InstalledNotIndexed { .. }
+            Self::Indexed { .. } | Self::InstalledNotIndexed { .. }
         )
     }
 
     /// Get the installed version if available.
     pub fn version(&self) -> Option<&str> {
         match self {
-            CassStatus::Indexed { version, .. } | CassStatus::InstalledNotIndexed { version } => {
+            Self::Indexed { version, .. } | Self::InstalledNotIndexed { version } => {
                 Some(version)
             }
             _ => None,

@@ -16,11 +16,11 @@ pub enum MessageRole {
 impl std::fmt::Display for MessageRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MessageRole::User => write!(f, "User"),
-            MessageRole::Agent => write!(f, "Agent"),
-            MessageRole::Tool => write!(f, "Tool"),
-            MessageRole::System => write!(f, "System"),
-            MessageRole::Other(s) => write!(f, "{}", s),
+            Self::User => write!(f, "User"),
+            Self::Agent => write!(f, "Agent"),
+            Self::Tool => write!(f, "Tool"),
+            Self::System => write!(f, "System"),
+            Self::Other(s) => write!(f, "{}", s),
         }
     }
 }

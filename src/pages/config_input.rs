@@ -386,13 +386,13 @@ impl PagesConfig {
             std::fs::read_to_string(path)?
         };
 
-        let config: PagesConfig = serde_json::from_str(&content)?;
+        let config: Self = serde_json::from_str(&content)?;
         Ok(config)
     }
 
     /// Load configuration from a reader.
     pub fn from_reader<R: Read>(reader: R) -> Result<Self, ConfigError> {
-        let config: PagesConfig = serde_json::from_reader(reader)?;
+        let config: Self = serde_json::from_reader(reader)?;
         Ok(config)
     }
 

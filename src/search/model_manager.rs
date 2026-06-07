@@ -111,44 +111,44 @@ pub enum SemanticAvailability {
 impl SemanticAvailability {
     /// Check if semantic search is ready to use.
     pub fn is_ready(&self) -> bool {
-        matches!(self, SemanticAvailability::Ready { .. })
+        matches!(self, Self::Ready { .. })
     }
 
     /// Check if a model update is available.
     pub fn has_update(&self) -> bool {
-        matches!(self, SemanticAvailability::UpdateAvailable { .. })
+        matches!(self, Self::UpdateAvailable { .. })
     }
 
     /// Check if the index is being rebuilt.
     pub fn is_building(&self) -> bool {
-        matches!(self, SemanticAvailability::IndexBuilding { .. })
+        matches!(self, Self::IndexBuilding { .. })
     }
 
     /// Check if a download is in progress.
     pub fn is_downloading(&self) -> bool {
-        matches!(self, SemanticAvailability::Downloading { .. })
+        matches!(self, Self::Downloading { .. })
     }
 
     /// Check if user consent is needed.
     pub fn needs_consent(&self) -> bool {
-        matches!(self, SemanticAvailability::NeedsConsent)
+        matches!(self, Self::NeedsConsent)
     }
 
     /// Check if hash fallback is active.
     pub fn is_hash_fallback(&self) -> bool {
-        matches!(self, SemanticAvailability::HashFallback)
+        matches!(self, Self::HashFallback)
     }
 
     /// Check if semantic search is disabled.
     pub fn is_disabled(&self) -> bool {
-        matches!(self, SemanticAvailability::Disabled { .. })
+        matches!(self, Self::Disabled { .. })
     }
 
     /// Check if the model is not installed.
     pub fn is_not_installed(&self) -> bool {
         matches!(
             self,
-            SemanticAvailability::NotInstalled | SemanticAvailability::ModelMissing { .. }
+            Self::NotInstalled | Self::ModelMissing { .. }
         )
     }
 
@@ -156,8 +156,8 @@ impl SemanticAvailability {
     pub fn is_error(&self) -> bool {
         matches!(
             self,
-            SemanticAvailability::LoadFailed { .. }
-                | SemanticAvailability::DatabaseUnavailable { .. }
+            Self::LoadFailed { .. }
+                | Self::DatabaseUnavailable { .. }
         )
     }
 
@@ -165,14 +165,14 @@ impl SemanticAvailability {
     pub fn can_search(&self) -> bool {
         matches!(
             self,
-            SemanticAvailability::Ready { .. } | SemanticAvailability::HashFallback
+            Self::Ready { .. } | Self::HashFallback
         )
     }
 
     /// Get download progress if downloading.
     pub fn download_progress(&self) -> Option<(u8, u64, u64)> {
         match self {
-            SemanticAvailability::Downloading {
+            Self::Downloading {
                 progress_pct,
                 bytes_downloaded,
                 total_bytes,
@@ -184,7 +184,7 @@ impl SemanticAvailability {
     /// Get index building progress if building.
     pub fn index_progress(&self) -> Option<(Option<u8>, u64, u64)> {
         match self {
-            SemanticAvailability::IndexBuilding {
+            Self::IndexBuilding {
                 progress_pct,
                 items_indexed,
                 total_items,
@@ -197,31 +197,31 @@ impl SemanticAvailability {
     /// Get a short status label for display in status bar.
     pub fn status_label(&self) -> &'static str {
         match self {
-            SemanticAvailability::Ready { .. } => "SEM",
-            SemanticAvailability::HashFallback => "SEM*",
-            SemanticAvailability::NotInstalled => "LEX",
-            SemanticAvailability::NeedsConsent => "LEX",
-            SemanticAvailability::Downloading { .. } => "DL...",
-            SemanticAvailability::Verifying => "VFY...",
-            SemanticAvailability::IndexBuilding { .. } => "IDX...",
-            SemanticAvailability::Disabled { .. } => "OFF",
-            SemanticAvailability::ModelMissing { .. } => "NOMODEL",
-            SemanticAvailability::IndexMissing { .. } => "NOIDX",
-            SemanticAvailability::DatabaseUnavailable { .. } => "NODB",
-            SemanticAvailability::LoadFailed { .. } => "ERR",
-            SemanticAvailability::UpdateAvailable { .. } => "UPD",
+            Self::Ready { .. } => "SEM",
+            Self::HashFallback => "SEM*",
+            Self::NotInstalled => "LEX",
+            Self::NeedsConsent => "LEX",
+            Self::Downloading { .. } => "DL...",
+            Self::Verifying => "VFY...",
+            Self::IndexBuilding { .. } => "IDX...",
+            Self::Disabled { .. } => "OFF",
+            Self::ModelMissing { .. } => "NOMODEL",
+            Self::IndexMissing { .. } => "NOIDX",
+            Self::DatabaseUnavailable { .. } => "NODB",
+            Self::LoadFailed { .. } => "ERR",
+            Self::UpdateAvailable { .. } => "UPD",
         }
     }
 
     /// Get a detailed summary for display.
     pub fn summary(&self) -> String {
         match self {
-            SemanticAvailability::Ready { embedder_id } => {
+            Self::Ready { embedder_id } => {
                 format!("semantic ready ({embedder_id})")
             }
-            SemanticAvailability::NotInstalled => "model not installed".to_string(),
-            SemanticAvailability::NeedsConsent => "consent required for model download".to_string(),
-            SemanticAvailability::Downloading {
+            Self::NotInstalled => "model not installed".to_string(),
+            Self::NeedsConsent => "consent required for model download".to_string(),
+            Self::Downloading {
                 progress_pct,
                 bytes_downloaded,
                 total_bytes,
@@ -230,8 +230,8 @@ impl SemanticAvailability {
                 let mb_total = *total_bytes as f64 / 1_048_576.0;
                 format!("downloading model: {progress_pct}% ({mb_done:.1}/{mb_total:.1} MB)")
             }
-            SemanticAvailability::Verifying => "verifying model checksum".to_string(),
-            SemanticAvailability::IndexBuilding {
+            Self::Verifying => "verifying model checksum".to_string(),
+            Self::IndexBuilding {
                 items_indexed,
                 total_items,
                 progress_pct,
@@ -243,23 +243,23 @@ impl SemanticAvailability {
                     format!("building index: {items_indexed}/{total_items}")
                 }
             }
-            SemanticAvailability::HashFallback => "using hash-based fallback".to_string(),
-            SemanticAvailability::Disabled { reason } => {
+            Self::HashFallback => "using hash-based fallback".to_string(),
+            Self::Disabled { reason } => {
                 format!("semantic disabled: {reason}")
             }
-            SemanticAvailability::ModelMissing { model_dir, .. } => {
+            Self::ModelMissing { model_dir, .. } => {
                 format!("model missing at {}", model_dir.display())
             }
-            SemanticAvailability::IndexMissing { index_path } => {
+            Self::IndexMissing { index_path } => {
                 format!("vector index missing at {}", index_path.display())
             }
-            SemanticAvailability::DatabaseUnavailable { error, .. } => {
+            Self::DatabaseUnavailable { error, .. } => {
                 format!("db unavailable ({error})")
             }
-            SemanticAvailability::LoadFailed { context } => {
+            Self::LoadFailed { context } => {
                 format!("semantic load failed ({context})")
             }
-            SemanticAvailability::UpdateAvailable {
+            Self::UpdateAvailable {
                 current_revision,
                 latest_revision,
                 ..

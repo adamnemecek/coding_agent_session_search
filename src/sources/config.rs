@@ -480,7 +480,7 @@ impl SourcesConfig {
 
         self.validate()?;
         let content = toml::to_string_pretty(self)?;
-        let _: SourcesConfig = toml::from_str(&content)?;
+        let _: Self = toml::from_str(&content)?;
         let temp_path = write_sources_config_temp_file(&config_path, content.as_bytes())?;
         replace_file_from_temp(&temp_path, &config_path)?;
 
@@ -495,7 +495,7 @@ impl SourcesConfig {
 
         self.validate()?;
         let content = toml::to_string_pretty(self)?;
-        let _: SourcesConfig = toml::from_str(&content)?;
+        let _: Self = toml::from_str(&content)?;
         let temp_path = write_sources_config_temp_file(path, content.as_bytes())?;
         replace_file_from_temp(&temp_path, path)?;
 
@@ -1173,7 +1173,7 @@ impl SourcesConfig {
         // Validate config before writing (round-trip check included below)
         self.validate()?;
         let toml_str = toml::to_string_pretty(self)?;
-        let parsed: SourcesConfig = toml::from_str(&toml_str)?;
+        let parsed: Self = toml::from_str(&toml_str)?;
         parsed.validate()?;
 
         // Write atomically (temp file + rename)

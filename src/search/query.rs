@@ -392,9 +392,9 @@ pub enum SearchMode {
 impl SearchMode {
     pub fn next(self) -> Self {
         match self {
-            SearchMode::Lexical => SearchMode::Semantic,
-            SearchMode::Semantic => SearchMode::Hybrid,
-            SearchMode::Hybrid => SearchMode::Lexical,
+            Self::Lexical => Self::Semantic,
+            Self::Semantic => Self::Hybrid,
+            Self::Hybrid => Self::Lexical,
         }
     }
 }
@@ -1138,12 +1138,12 @@ impl MatchType {
     /// Returns a quality factor for ranking (1.0 = best, lower = less precise match)
     pub fn quality_factor(self) -> f32 {
         match self {
-            MatchType::Exact => 1.0,
-            MatchType::Prefix => 0.9,
-            MatchType::Suffix => 0.8,
-            MatchType::Substring => 0.7,
-            MatchType::Wildcard => 0.65,
-            MatchType::ImplicitWildcard => 0.6,
+            Self::Exact => 1.0,
+            Self::Prefix => 0.9,
+            Self::Suffix => 0.8,
+            Self::Substring => 0.7,
+            Self::Wildcard => 0.65,
+            Self::ImplicitWildcard => 0.6,
         }
     }
 }
@@ -2709,8 +2709,8 @@ enum CacheEvictionPolicy {
 impl CacheEvictionPolicy {
     fn label(self) -> &'static str {
         match self {
-            CacheEvictionPolicy::Lru => "lru",
-            CacheEvictionPolicy::S3Fifo => "s3-fifo",
+            Self::Lru => "lru",
+            Self::S3Fifo => "s3-fifo",
         }
     }
 }

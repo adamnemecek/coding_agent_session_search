@@ -264,7 +264,7 @@ pub struct UsageBucket {
 
 impl UsageBucket {
     /// Accumulate another bucket into this one (additive merge).
-    pub fn merge(&mut self, other: &UsageBucket) {
+    pub fn merge(&mut self, other: &Self) {
         self.message_count += other.message_count;
         self.user_message_count += other.user_message_count;
         self.assistant_message_count += other.assistant_message_count;

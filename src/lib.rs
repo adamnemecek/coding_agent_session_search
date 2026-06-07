@@ -2002,10 +2002,10 @@ pub struct AnalyticsCommon {
 impl From<AnalyticsBucketing> for analytics::GroupBy {
     fn from(b: AnalyticsBucketing) -> Self {
         match b {
-            AnalyticsBucketing::Hour => analytics::GroupBy::Hour,
-            AnalyticsBucketing::Day => analytics::GroupBy::Day,
-            AnalyticsBucketing::Week => analytics::GroupBy::Week,
-            AnalyticsBucketing::Month => analytics::GroupBy::Month,
+            AnalyticsBucketing::Hour => Self::Hour,
+            AnalyticsBucketing::Day => Self::Day,
+            AnalyticsBucketing::Week => Self::Week,
+            AnalyticsBucketing::Month => Self::Month,
         }
     }
 }
@@ -2045,7 +2045,7 @@ impl From<&AnalyticsCommon> for analytics::AnalyticsFilter {
 
         let until_ms: Option<i64> = common.until.as_deref().and_then(parse_datetime_str);
 
-        analytics::AnalyticsFilter {
+        Self {
             since_ms,
             until_ms,
             agents: common
@@ -2162,17 +2162,17 @@ pub enum PagesDeployTarget {
 impl PagesDeployTarget {
     fn to_wizard_target(self) -> crate::pages::wizard::DeployTarget {
         match self {
-            PagesDeployTarget::GitHub => crate::pages::wizard::DeployTarget::GitHubPages,
-            PagesDeployTarget::Cloudflare => crate::pages::wizard::DeployTarget::CloudflarePages,
-            PagesDeployTarget::Local => crate::pages::wizard::DeployTarget::Local,
+            Self::GitHub => crate::pages::wizard::DeployTarget::GitHubPages,
+            Self::Cloudflare => crate::pages::wizard::DeployTarget::CloudflarePages,
+            Self::Local => crate::pages::wizard::DeployTarget::Local,
         }
     }
 
     fn as_config_value(self) -> &'static str {
         match self {
-            PagesDeployTarget::GitHub => "github",
-            PagesDeployTarget::Cloudflare => "cloudflare",
-            PagesDeployTarget::Local => "local",
+            Self::GitHub => "github",
+            Self::Cloudflare => "cloudflare",
+            Self::Local => "local",
         }
     }
 }
@@ -2273,7 +2273,7 @@ impl std::error::Error for CliError {}
 
 impl CliError {
     pub fn already_reported(code: i32, kind: &'static str, retryable: bool) -> Self {
-        CliError {
+        Self {
             code,
             kind,
             message: CLI_ERROR_ALREADY_REPORTED_SENTINEL.to_string(),
@@ -2282,8 +2282,8 @@ impl CliError {
         }
     }
 
-    pub fn already_reported_from(err: &CliError) -> Self {
-        CliError {
+    pub fn already_reported_from(err: &Self) -> Self {
+        Self {
             code: err.code,
             kind: err.kind,
             message: CLI_ERROR_ALREADY_REPORTED_SENTINEL.to_string(),
@@ -2297,7 +2297,7 @@ impl CliError {
     }
 
     fn usage(message: impl Into<String>, hint: Option<String>) -> Self {
-        CliError {
+        Self {
             code: 2,
             kind: CliErrorKind::Usage.kind_str(),
             message: message.into(),
@@ -2307,7 +2307,7 @@ impl CliError {
     }
 
     fn unknown(message: impl Into<String>) -> Self {
-        CliError {
+        Self {
             code: 9,
             kind: CliErrorKind::Unknown.kind_str(),
             message: message.into(),
@@ -2332,7 +2332,7 @@ pub(crate) struct WrapConfig {
 
 impl WrapConfig {
     pub(crate) fn new(width: Option<usize>, nowrap: bool) -> Self {
-        WrapConfig { width, nowrap }
+        Self { width, nowrap }
     }
 
     fn effective_width(&self) -> Option<usize> {
@@ -18313,7 +18313,7 @@ impl TimeFilter {
         let since = since_str.and_then(parse_datetime_str).or(since);
         let until = until_str.and_then(parse_datetime_str).or(until);
 
-        TimeFilter { since, until }
+        Self { since, until }
     }
 }
 
@@ -50439,17 +50439,17 @@ enum DoctorFsMutationKind {
 impl DoctorFsMutationKind {
     fn asset_operation(self) -> DoctorAssetOperation {
         match self {
-            DoctorFsMutationKind::PruneCleanupTarget
-            | DoctorFsMutationKind::RemoveStaleLegacyIndexLock => {
+            Self::PruneCleanupTarget
+            | Self::RemoveStaleLegacyIndexLock => {
                 DoctorAssetOperation::PruneReclaim
             }
-            DoctorFsMutationKind::CopyFileToStaging => DoctorAssetOperation::Copy,
+            Self::CopyFileToStaging => DoctorAssetOperation::Copy,
             // In-memory staging writes materialize copy-like verified candidates. Live
             // replacement still requires a separate Promote or Restore operation.
-            DoctorFsMutationKind::WriteFileToStaging => DoctorAssetOperation::Copy,
-            DoctorFsMutationKind::PromoteStagedFile => DoctorAssetOperation::Promote,
-            DoctorFsMutationKind::RestoreStagedFile => DoctorAssetOperation::Restore,
-            DoctorFsMutationKind::MoveFileToQuarantine => DoctorAssetOperation::MoveQuarantine,
+            Self::WriteFileToStaging => DoctorAssetOperation::Copy,
+            Self::PromoteStagedFile => DoctorAssetOperation::Promote,
+            Self::RestoreStagedFile => DoctorAssetOperation::Restore,
+            Self::MoveFileToQuarantine => DoctorAssetOperation::MoveQuarantine,
         }
     }
 }

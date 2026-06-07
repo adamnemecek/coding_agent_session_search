@@ -56,8 +56,8 @@ pub enum ConfigSource {
 impl ConfigSource {
     pub fn as_str(self) -> &'static str {
         match self {
-            ConfigSource::Env => "env",
-            ConfigSource::Default => "default",
+            Self::Env => "env",
+            Self::Default => "default",
         }
     }
 }
@@ -188,7 +188,7 @@ impl RuntimeOptimizationsSnapshot {
         let par = parallel_search_enabled();
         let pre = preconvert_f16_enabled();
         let src = *CONFIG_SOURCE.get().unwrap_or(&ConfigSource::Default);
-        RuntimeOptimizationsSnapshot {
+        Self {
             simd_dot: simd,
             parallel_search: par,
             preconvert_f16: pre,

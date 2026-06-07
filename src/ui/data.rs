@@ -914,7 +914,7 @@ impl CockpitPanel {
     }
 
     /// All panels in display order.
-    pub const ALL: [CockpitPanel; 4] = [
+    pub const ALL: [Self; 4] = [
         Self::DiffStrategy,
         Self::ResizeRegime,
         Self::BudgetHealth,

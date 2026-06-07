@@ -82,38 +82,38 @@ pub enum ModelState {
 impl ModelState {
     /// Whether the model is ready for use.
     pub fn is_ready(&self) -> bool {
-        matches!(self, ModelState::Ready)
+        matches!(self, Self::Ready)
     }
 
     /// Whether a download is in progress.
     pub fn is_downloading(&self) -> bool {
-        matches!(self, ModelState::Downloading { .. })
+        matches!(self, Self::Downloading { .. })
     }
 
     /// Whether user consent is needed.
     pub fn needs_consent(&self) -> bool {
-        matches!(self, ModelState::NeedsConsent)
+        matches!(self, Self::NeedsConsent)
     }
 
     /// Human-readable summary of the state.
     pub fn summary(&self) -> String {
         match self {
-            ModelState::NotInstalled => "not installed".into(),
-            ModelState::NeedsConsent => "needs consent".into(),
-            ModelState::Downloading { progress_pct, .. } => {
+            Self::NotInstalled => "not installed".into(),
+            Self::NeedsConsent => "needs consent".into(),
+            Self::Downloading { progress_pct, .. } => {
                 format!("downloading ({progress_pct}%)")
             }
-            ModelState::Verifying => "verifying".into(),
-            ModelState::Ready => "ready".into(),
-            ModelState::Disabled { reason } => format!("disabled: {reason}"),
-            ModelState::VerificationFailed { reason } => format!("verification failed: {reason}"),
-            ModelState::UpdateAvailable {
+            Self::Verifying => "verifying".into(),
+            Self::Ready => "ready".into(),
+            Self::Disabled { reason } => format!("disabled: {reason}"),
+            Self::VerificationFailed { reason } => format!("verification failed: {reason}"),
+            Self::UpdateAvailable {
                 current_revision,
                 latest_revision,
             } => {
                 format!("update available: {current_revision} -> {latest_revision}")
             }
-            ModelState::Cancelled => "cancelled".into(),
+            Self::Cancelled => "cancelled".into(),
         }
     }
 }
@@ -968,21 +968,21 @@ pub enum DownloadError {
 impl DownloadError {
     fn is_retryable(&self) -> bool {
         match self {
-            DownloadError::NetworkError(_) | DownloadError::IoError(_) | DownloadError::Timeout => {
+            Self::NetworkError(_) | Self::IoError(_) | Self::Timeout => {
                 true
             }
-            DownloadError::HttpError { status, .. } => {
+            Self::HttpError { status, .. } => {
                 *status == 408 || *status == 429 || (500..=599).contains(status)
             }
-            DownloadError::VerificationFailed { .. }
-            | DownloadError::Cancelled
-            | DownloadError::ManifestNotVerified { .. }
-            | DownloadError::InvalidMirrorUrl { .. } => false,
+            Self::VerificationFailed { .. }
+            | Self::Cancelled
+            | Self::ManifestNotVerified { .. }
+            | Self::InvalidMirrorUrl { .. } => false,
         }
     }
 
     fn should_discard_temp(&self) -> bool {
-        matches!(self, DownloadError::VerificationFailed { .. })
+        matches!(self, Self::VerificationFailed { .. })
     }
 }
 

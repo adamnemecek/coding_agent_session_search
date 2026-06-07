@@ -19,22 +19,22 @@ pub enum ArchiveConfig {
 impl ArchiveConfig {
     /// Returns true if this config represents an encrypted bundle.
     pub fn is_encrypted(&self) -> bool {
-        matches!(self, ArchiveConfig::Encrypted(_))
+        matches!(self, Self::Encrypted(_))
     }
 
     /// Get the encrypted config if available.
     pub fn as_encrypted(&self) -> Option<&EncryptionConfig> {
         match self {
-            ArchiveConfig::Encrypted(cfg) => Some(cfg),
-            ArchiveConfig::Unencrypted(_) => None,
+            Self::Encrypted(cfg) => Some(cfg),
+            Self::Unencrypted(_) => None,
         }
     }
 
     /// Get the unencrypted config if available.
     pub fn as_unencrypted(&self) -> Option<&UnencryptedConfig> {
         match self {
-            ArchiveConfig::Encrypted(_) => None,
-            ArchiveConfig::Unencrypted(cfg) => Some(cfg),
+            Self::Encrypted(_) => None,
+            Self::Unencrypted(cfg) => Some(cfg),
         }
     }
 }

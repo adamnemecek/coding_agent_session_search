@@ -126,20 +126,20 @@ impl InstallMethod {
     /// Get display name for the method.
     pub fn display_name(&self) -> &'static str {
         match self {
-            InstallMethod::CargoBinstall => "cargo-binstall",
-            InstallMethod::PrebuiltBinary { .. } => "pre-built binary",
-            InstallMethod::CargoInstall => "cargo install",
-            InstallMethod::FullBootstrap => "full bootstrap (rustup + cargo)",
+            Self::CargoBinstall => "cargo-binstall",
+            Self::PrebuiltBinary { .. } => "pre-built binary",
+            Self::CargoInstall => "cargo install",
+            Self::FullBootstrap => "full bootstrap (rustup + cargo)",
         }
     }
 
     /// Estimated time for this method.
     pub fn estimated_time(&self) -> Duration {
         match self {
-            InstallMethod::CargoBinstall => Duration::from_secs(30),
-            InstallMethod::PrebuiltBinary { .. } => Duration::from_secs(10),
-            InstallMethod::CargoInstall => Duration::from_secs(300), // 5 minutes
-            InstallMethod::FullBootstrap => Duration::from_secs(600), // 10 minutes
+            Self::CargoBinstall => Duration::from_secs(30),
+            Self::PrebuiltBinary { .. } => Duration::from_secs(10),
+            Self::CargoInstall => Duration::from_secs(300), // 5 minutes
+            Self::FullBootstrap => Duration::from_secs(600), // 10 minutes
         }
     }
 
@@ -147,9 +147,9 @@ impl InstallMethod {
     pub fn requires_compilation(&self) -> bool {
         matches!(
             self,
-            InstallMethod::CargoBinstall
-                | InstallMethod::CargoInstall
-                | InstallMethod::FullBootstrap
+            Self::CargoBinstall
+                | Self::CargoInstall
+                | Self::FullBootstrap
         )
     }
 }
@@ -187,13 +187,13 @@ pub enum InstallStage {
 impl std::fmt::Display for InstallStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InstallStage::Preparing => write!(f, "Preparing"),
-            InstallStage::Downloading => write!(f, "Downloading"),
-            InstallStage::Compiling { crate_name } => write!(f, "Compiling {}", crate_name),
-            InstallStage::Installing => write!(f, "Installing"),
-            InstallStage::Verifying => write!(f, "Verifying"),
-            InstallStage::Complete => write!(f, "Complete"),
-            InstallStage::Failed { error } => write!(f, "Failed: {}", error),
+            Self::Preparing => write!(f, "Preparing"),
+            Self::Downloading => write!(f, "Downloading"),
+            Self::Compiling { crate_name } => write!(f, "Compiling {}", crate_name),
+            Self::Installing => write!(f, "Installing"),
+            Self::Verifying => write!(f, "Verifying"),
+            Self::Complete => write!(f, "Complete"),
+            Self::Failed { error } => write!(f, "Failed: {}", error),
         }
     }
 }

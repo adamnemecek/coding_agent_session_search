@@ -82,11 +82,11 @@ pub(crate) enum Op {
 impl Op {
     pub(crate) fn stable_kind(&self) -> &'static str {
         match self {
-            Op::Write { .. } => "write",
-            Op::CreateDir => "create-dir",
-            Op::Rename { .. } => "rename",
-            Op::Quarantine { .. } => "quarantine",
-            Op::AppendLine { .. } => "append-line",
+            Self::Write { .. } => "write",
+            Self::CreateDir => "create-dir",
+            Self::Rename { .. } => "rename",
+            Self::Quarantine { .. } => "quarantine",
+            Self::AppendLine { .. } => "append-line",
         }
     }
 }

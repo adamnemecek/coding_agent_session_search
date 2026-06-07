@@ -72,7 +72,7 @@ impl ValidationReport {
     }
 
     /// Check quality against a baseline report.
-    pub fn meets_quality_threshold(&self, baseline: &ValidationReport) -> bool {
+    pub fn meets_quality_threshold(&self, baseline: &Self) -> bool {
         if baseline.ndcg_at_10 == 0.0 {
             return true;
         }
