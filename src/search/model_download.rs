@@ -18,17 +18,12 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::future::{Future, poll_fn};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
-use asupersync::bytes::Buf;
-use asupersync::http::Body;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -991,47 +986,24 @@ impl DownloadError {
     }
 }
 
-fn run_download_with_cx<T, F, Fut>(f: F) -> Result<T, DownloadError>
-where
-    T: Send + 'static,
-    F: FnOnce(asupersync::Cx) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<T, DownloadError>> + Send + 'static,
-{
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .build()
-        .map_err(|e| {
-            DownloadError::NetworkError(format!("failed to build download runtime: {e}"))
-        })?;
-
-    runtime.block_on(async move {
-        let handle = asupersync::runtime::Runtime::current_handle().ok_or_else(|| {
-            DownloadError::NetworkError("download runtime handle unavailable".into())
-        })?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        handle
-            .try_spawn_with_cx(move |cx| async move {
-                let _ = tx.send(f(cx).await);
-            })
-            .map_err(|e| {
-                DownloadError::NetworkError(format!("failed to spawn download task: {e}"))
-            })?;
-
-        loop {
-            match rx.try_recv() {
-                Ok(result) => return result,
-                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
-                Err(TryRecvError::Disconnected) => {
-                    return Err(DownloadError::NetworkError(
-                        "download task exited before returning a result".into(),
-                    ));
-                }
-            }
-        }
-    })
-}
-
 const MODEL_HTTP_BODY_SIZE_FLOOR_BYTES: u64 = 500 * 1024 * 1024;
 const MODEL_HTTP_BODY_SIZE_MARGIN_BYTES: u64 = 32 * 1024 * 1024;
+
+fn map_reqwest_download_error(err: reqwest::Error) -> DownloadError {
+    if err.is_timeout() {
+        DownloadError::Timeout
+    } else {
+        DownloadError::NetworkError(err.to_string())
+    }
+}
+
+fn map_model_response_read_error(err: std::io::Error) -> DownloadError {
+    if err.kind() == std::io::ErrorKind::TimedOut {
+        DownloadError::Timeout
+    } else {
+        DownloadError::NetworkError(format!("reading model artifact response: {err}"))
+    }
+}
 
 fn model_http_max_body_size(expected_size: u64) -> usize {
     let size_with_margin = expected_size.saturating_add(MODEL_HTTP_BODY_SIZE_MARGIN_BYTES);
@@ -1307,139 +1279,129 @@ impl ModelDownloader {
         let bytes_downloaded = Arc::clone(bytes_downloaded);
         let cancelled = Arc::clone(&self.cancelled);
         let progress_callback = on_progress.cloned();
-        let connect_timeout = self.connect_timeout;
-        let file_timeout = self.file_timeout;
         let max_body_size = model_http_max_body_size(expected_size);
 
-        run_download_with_cx(move |cx| async move {
-            let client = asupersync::http::h1::HttpClient::builder()
-                .user_agent(concat!(
-                    "cass/",
-                    env!("CARGO_PKG_VERSION"),
-                    " (model-download)"
-                ))
-                .max_body_size(max_body_size)
-                .build();
-            let mut headers = vec![("Accept".to_string(), "application/octet-stream".to_string())];
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(concat!(
+                "cass/",
+                env!("CARGO_PKG_VERSION"),
+                " (model-download)"
+            ))
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.file_timeout)
+            .build()
+            .map_err(map_reqwest_download_error)?;
 
-            if existing_size > 0 {
-                headers.push(("Range".to_string(), format!("bytes={existing_size}-")));
-                bytes_downloaded.fetch_add(existing_size, Ordering::SeqCst);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/octet-stream"),
+        );
+
+        if existing_size > 0 {
+            let range_header =
+                reqwest::header::HeaderValue::from_str(&format!("bytes={existing_size}-"))
+                    .map_err(|err| {
+                        DownloadError::NetworkError(format!(
+                            "building model download Range header: {err}"
+                        ))
+                    })?;
+            headers.insert(reqwest::header::RANGE, range_header);
+            bytes_downloaded.fetch_add(existing_size, Ordering::SeqCst);
+        }
+
+        let mut response = client
+            .get(&url)
+            .headers(headers)
+            .send()
+            .map_err(map_reqwest_download_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DownloadError::HttpError {
+                status: status.as_u16(),
+                message: status
+                    .canonical_reason()
+                    .map_or_else(|| status.as_u16().to_string(), |reason| reason.to_string()),
+            });
+        }
+
+        let content_length = response.content_length().unwrap_or(0);
+        if content_length > max_body_size as u64 {
+            return Err(DownloadError::NetworkError(format!(
+                "model artifact response exceeds transport cap: {content_length} > {max_body_size}"
+            )));
+        }
+
+        // 206 = Partial Content (resume works), 200 = Full file (server ignored Range)
+        let actually_resuming = existing_size > 0 && status.as_u16() == 206;
+        if existing_size > 0 && status.as_u16() == 200 {
+            bytes_downloaded.fetch_sub(existing_size, Ordering::SeqCst);
+            existing_size = 0;
+        }
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(actually_resuming)
+            .write(true)
+            .truncate(!actually_resuming)
+            .open(&path)?;
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let start = Instant::now();
+        let mut file_bytes = if actually_resuming { existing_size } else { 0 };
+        let mut buffer = [0_u8; 8192];
+
+        loop {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(DownloadError::Cancelled);
+            }
+            if start.elapsed() >= self.file_timeout {
+                return Err(DownloadError::Timeout);
             }
 
-            let mut response = asupersync::time::timeout(
-                cx.now(),
-                connect_timeout,
-                client.request_streaming(
-                    &cx,
-                    asupersync::http::h1::Method::Get,
-                    &url,
-                    headers,
-                    Vec::new(),
-                ),
-            )
-            .await
-            .map_err(|_| DownloadError::Timeout)?
-            .map_err(|e| DownloadError::NetworkError(e.to_string()))?;
-
-            let status = response.head.status;
-            if status >= 400 {
-                return Err(DownloadError::HttpError {
-                    status,
-                    message: if response.head.reason.is_empty() {
-                        status.to_string()
-                    } else {
-                        format!("{} {}", status, response.head.reason)
-                    },
-                });
+            let read = response
+                .read(&mut buffer)
+                .map_err(map_model_response_read_error)?;
+            if read == 0 {
+                break;
             }
 
-            // 206 = Partial Content (resume works), 200 = Full file (server ignored Range)
-            let actually_resuming = existing_size > 0 && status == 206;
-            if existing_size > 0 && status == 200 {
-                bytes_downloaded.fetch_sub(existing_size, Ordering::SeqCst);
-                existing_size = 0;
+            file.write_all(&buffer[..read])?;
+            file_bytes = file_bytes.saturating_add(read as u64);
+            if file_bytes > max_body_size as u64 {
+                return Err(DownloadError::NetworkError(format!(
+                    "model artifact body exceeds transport cap: {file_bytes} > {max_body_size}"
+                )));
             }
+            bytes_downloaded.fetch_add(read as u64, Ordering::SeqCst);
 
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(actually_resuming)
-                .write(true)
-                .truncate(!actually_resuming)
-                .open(&path)?;
-
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let start = Instant::now();
-            let mut file_bytes = if actually_resuming { existing_size } else { 0 };
-
-            loop {
-                if cancelled.load(Ordering::SeqCst) {
-                    return Err(DownloadError::Cancelled);
-                }
-
-                let remaining = file_timeout.saturating_sub(start.elapsed());
-                if remaining.is_zero() {
-                    return Err(DownloadError::Timeout);
-                }
-
-                let frame = asupersync::time::timeout(
-                    cx.now(),
-                    remaining,
-                    poll_fn(|task_cx| Pin::new(&mut response.body).poll_frame(task_cx)),
-                )
-                .await
-                .map_err(|_| DownloadError::Timeout)?;
-
-                let Some(frame) = frame else {
-                    break;
+            if let Some(callback) = progress_callback.as_ref() {
+                let total_downloaded = bytes_downloaded.load(Ordering::SeqCst);
+                let progress_pct = if grand_total > 0 {
+                    ((total_downloaded as f64 / grand_total as f64) * 100.0).min(100.0) as u8
+                } else {
+                    0
                 };
 
-                match frame.map_err(|e| DownloadError::NetworkError(e.to_string()))? {
-                    asupersync::http::body::Frame::Data(mut buf) => {
-                        while buf.has_remaining() {
-                            let chunk = buf.chunk();
-                            if chunk.is_empty() {
-                                break;
-                            }
-                            file.write_all(chunk)?;
-                            let chunk_len = chunk.len();
-                            buf.advance(chunk_len);
-                            file_bytes = file_bytes.saturating_add(chunk_len as u64);
-                            bytes_downloaded.fetch_add(chunk_len as u64, Ordering::SeqCst);
-
-                            if let Some(callback) = progress_callback.as_ref() {
-                                let total_downloaded = bytes_downloaded.load(Ordering::SeqCst);
-                                let progress_pct = if grand_total > 0 {
-                                    ((total_downloaded as f64 / grand_total as f64) * 100.0)
-                                        .min(100.0) as u8
-                                } else {
-                                    0
-                                };
-
-                                callback(DownloadProgress {
-                                    current_file: file_name.clone(),
-                                    file_index: file_idx + 1,
-                                    total_files,
-                                    file_bytes,
-                                    file_total: expected_size,
-                                    total_bytes: total_downloaded,
-                                    grand_total,
-                                    progress_pct,
-                                });
-                            }
-                        }
-                    }
-                    asupersync::http::body::Frame::Trailers(_) => {}
-                }
+                callback(DownloadProgress {
+                    current_file: file_name.clone(),
+                    file_index: file_idx + 1,
+                    total_files,
+                    file_bytes,
+                    file_total: expected_size,
+                    total_bytes: total_downloaded,
+                    grand_total,
+                    progress_pct,
+                });
             }
+        }
 
-            file.sync_all()?;
-            Ok(())
-        })
+        file.sync_all()?;
+        Ok(())
     }
 
     /// Atomically install downloaded files.

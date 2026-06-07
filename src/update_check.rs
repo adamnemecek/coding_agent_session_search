@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -774,7 +773,12 @@ fn unique_update_state_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("update_state.json");
 
-    path.with_file_name(format!(".{file_name}.{suffix}.{timestamp}.{nonce}"))
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
 }
 
 /// Current unix timestamp
@@ -865,70 +869,33 @@ fn build_update_info(
     })
 }
 
-/// Fetch latest release using the native asupersync HTTP client.
+/// Fetch latest release without letting HTTP transport stalls block the async executor.
 async fn fetch_latest_release() -> Result<GitHubRelease> {
-    if let Some(handle) = asupersync::runtime::Runtime::current_handle() {
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        handle
-            .try_spawn_with_cx(move |cx| async move {
-                let _ = tx.send(fetch_latest_release_with_cx(&cx).await);
-            })
-            .context("spawning update check task")?;
-
-        loop {
-            match rx.try_recv() {
-                Ok(result) => return result,
-                Err(TryRecvError::Empty) => asupersync::runtime::yield_now().await,
-                Err(TryRecvError::Disconnected) => {
-                    anyhow::bail!("update check task exited before returning a result");
-                }
-            }
-        }
-    }
-
-    let cx = asupersync::Cx::current().context("update check requires an active asupersync Cx")?;
-    fetch_latest_release_with_cx(&cx).await
+    asupersync::runtime::spawn_blocking(fetch_latest_release_blocking).await
 }
 
-async fn fetch_latest_release_with_cx(cx: &asupersync::Cx) -> Result<GitHubRelease> {
+/// Fetch latest release using a short-timeout blocking HTTP client.
+fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
     let url = format!("{}/releases/latest", release_api_base_url());
-    let client = asupersync::http::h1::HttpClient::builder()
+    let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
-        .build();
-    let response = asupersync::time::timeout(
-        cx.now(),
-        Duration::from_secs(HTTP_TIMEOUT_SECS),
-        client.request(
-            cx,
-            asupersync::http::h1::Method::Get,
-            &url,
-            vec![(
-                "Accept".to_string(),
-                "application/vnd.github.v3+json".to_string(),
-            )],
-            Vec::new(),
-        ),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("timed out fetching release: {e}"))?
-    .context("fetching release")?;
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .build()
+        .context("building update-check HTTP client")?;
 
-    if !response.is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status);
+    let response = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
+        .send()
+        .with_context(|| format!("fetching release metadata from {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("GitHub API returned {}", status.as_u16());
     }
 
     response
         .json::<GitHubRelease>()
         .context("parsing release JSON")
-}
-
-/// Fetch latest release using a dedicated synchronous runtime.
-fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
-    asupersync::runtime::RuntimeBuilder::current_thread()
-        .build()
-        .context("building update-check runtime")?
-        .block_on(fetch_latest_release())
 }
 
 /// Start a background thread to check for updates.
@@ -1270,30 +1237,42 @@ mod tests {
     }
 
     #[test]
-    fn update_state_sidecar_paths_use_timestamp_and_nonce_namespace() {
+    fn update_state_sidecar_paths_use_pid_timestamp_and_nonce_namespace() -> anyhow::Result<()> {
         let sidecar = unique_update_state_temp_path(Path::new("/tmp/update_state.json"));
         let next_sidecar = unique_update_state_temp_path(Path::new("/tmp/update_state.json"));
         let file_name = sidecar
             .file_name()
             .and_then(|name| name.to_str())
-            .expect("sidecar path has UTF-8 file name");
+            .ok_or_else(|| anyhow::anyhow!("sidecar path has no UTF-8 file name"))?;
         let suffix = file_name
             .strip_prefix(".update_state.json.tmp.")
-            .expect("sidecar path uses the expected hidden temp prefix");
+            .ok_or_else(|| anyhow::anyhow!("sidecar path lacks expected hidden temp prefix"))?;
         let mut parts = suffix.split('.');
-        let timestamp = parts.next().expect("sidecar includes a timestamp");
-        let nonce = parts.next().expect("sidecar includes a nonce");
+        let pid = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("sidecar suffix lacks process id"))?;
+        let timestamp = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("sidecar suffix lacks timestamp"))?;
+        let nonce = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("sidecar suffix lacks nonce"))?;
 
-        assert!(
+        anyhow::ensure!(
             parts.next().is_none(),
             "unexpected sidecar suffix shape: {file_name:?}"
         );
-        timestamp.parse::<u128>().expect("timestamp is numeric");
-        nonce.parse::<u64>().expect("nonce is numeric");
-        assert_ne!(
-            sidecar, next_sidecar,
-            "successive sidecar names should differ"
+        anyhow::ensure!(
+            pid.parse::<u32>()? == std::process::id(),
+            "sidecar process id should match this process"
         );
+        let _timestamp = timestamp.parse::<u128>()?;
+        let _nonce = nonce.parse::<u64>()?;
+        anyhow::ensure!(
+            sidecar != next_sidecar,
+            "successive sidecar names should differ",
+        );
+        Ok(())
     }
 
     #[test]

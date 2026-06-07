@@ -116,8 +116,9 @@ jobs:
       - name: Clone sibling dependencies
         shell: bash
         run: |
-          # Path dependencies reference sibling directories (../repo)
-          # asupersync main transiently broken (trait-breaking API churn upstream); pin last SHA known-good for CASS builds.
+          # Path dependencies reference sibling directories (../repo).
+          # Keep the asupersync sibling checkout aligned with the crates.io
+          # version pinned in Cargo.toml.
           # Windows runners: enable long-path support. frankensqlite's default branch carries
           # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
           # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
@@ -127,7 +128,7 @@ jobs:
           # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
           # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
           # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f db186126b40d9d3028be731ff1bfea47614e2b1b
+          git -C ../asupersync checkout --quiet -f v0.3.4
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
@@ -322,7 +323,8 @@ jobs:
       - name: Clone sibling dependencies
         shell: bash
         run: |
-          # asupersync main transiently broken (trait-breaking API churn upstream); pin last SHA known-good for CASS builds.
+          # Keep the asupersync sibling checkout aligned with the crates.io
+          # version pinned in Cargo.toml.
           # Windows runners: enable long-path support. frankensqlite's default branch carries
           # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
           # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
@@ -332,7 +334,7 @@ jobs:
           # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
           # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
           # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f db186126b40d9d3028be731ff1bfea47614e2b1b
+          git -C ../asupersync checkout --quiet -f v0.3.4
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
@@ -516,7 +518,8 @@ jobs:
 
       - name: Clone sibling dependencies
         run: |
-          # asupersync main transiently broken (trait-breaking API churn upstream); pin last SHA known-good for CASS builds.
+          # Keep the asupersync sibling checkout aligned with the crates.io
+          # version pinned in Cargo.toml.
           # Windows runners: enable long-path support. frankensqlite's default branch carries
           # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
           # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
@@ -526,7 +529,7 @@ jobs:
           # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
           # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
           # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f db186126b40d9d3028be731ff1bfea47614e2b1b
+          git -C ../asupersync checkout --quiet -f v0.3.4
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
